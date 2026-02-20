@@ -3,6 +3,7 @@ package artifacts
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -301,5 +302,150 @@ func TestSMSTProofEncoding(t *testing.T) {
 		if decoded[i].SiblingCount != proof[i].SiblingCount {
 			t.Errorf("element %d: count mismatch: expected %d, got %d", i, proof[i].SiblingCount, decoded[i].SiblingCount)
 		}
+	}
+}
+
+func BenchmarkSMSTAdd(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := OpenSMST(dir)
+	defer store.Close()
+
+	vector := make([]byte, 24)
+	for i := range vector {
+		vector[i] = byte(i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Add(int32(i), vector)
+	}
+}
+
+func BenchmarkSMSTAddWithFlush(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := OpenSMST(dir)
+	defer store.Close()
+
+	vector := make([]byte, 24)
+	for i := range vector {
+		vector[i] = byte(i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Add(int32(i), vector)
+		if (i+1)%1000 == 0 {
+			store.Flush()
+		}
+	}
+	store.Flush()
+}
+
+func BenchmarkSMSTGetProof(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := OpenSMST(dir)
+	defer store.Close()
+
+	const treeSize = 100000
+	vector := make([]byte, 24)
+	for i := 0; i < treeSize; i++ {
+		store.Add(int32(i), vector)
+	}
+	store.Flush()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		leafIdx := uint32(i % treeSize)
+		store.GetProof(leafIdx, treeSize)
+	}
+}
+
+func BenchmarkSMSTVerifyProof(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := OpenSMST(dir)
+	defer store.Close()
+
+	const treeSize = 100000
+	vector := make([]byte, 24)
+	for i := 0; i < treeSize; i++ {
+		store.Add(int32(i), vector)
+	}
+	store.Flush()
+
+	root := store.GetRoot()
+	proofs := make([][][]byte, 100)
+	nonces := make([]int32, 100)
+	for i := 0; i < 100; i++ {
+		proofs[i], _ = store.GetProof(uint32(i), treeSize)
+		nonces[i], _, _ = store.GetArtifact(uint32(i))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		idx := i % 100
+		leafData := encodeLeaf(nonces[idx], vector)
+		elements := decodeProofFromTransport(proofs[idx])
+		VerifySMSTProofWithCounts(root, treeSize, nonces[idx], leafData, elements)
+	}
+}
+
+func BenchmarkSMSTRecovery(b *testing.B) {
+	sizes := []int{10000, 100000, 1000000}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
+			dir := b.TempDir()
+
+			store, _ := OpenSMST(dir)
+			vector := make([]byte, 24)
+			for i := 0; i < size; i++ {
+				store.Add(int32(i), vector)
+			}
+			store.Flush()
+			store.Close()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				s, _ := OpenSMST(dir)
+				s.Close()
+			}
+		})
+	}
+}
+
+func TestSMSTProofSizes(t *testing.T) {
+	sizes := []int{1000, 10000, 100000}
+
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
+			dir := t.TempDir()
+			store, _ := OpenSMST(dir)
+			defer store.Close()
+
+			vector := make([]byte, 24)
+			for i := 0; i < size; i++ {
+				store.Add(int32(i), vector)
+			}
+
+			var totalProofBytes int
+			sampleCount := 100
+			if size < sampleCount {
+				sampleCount = size
+			}
+
+			for i := 0; i < sampleCount; i++ {
+				leafIdx := uint32(i * size / sampleCount)
+				proof, err := store.GetProof(leafIdx, uint32(size))
+				if err != nil {
+					t.Fatalf("GetProof failed: %v", err)
+				}
+				for _, h := range proof {
+					totalProofBytes += len(h)
+				}
+			}
+
+			avgProofBytes := totalProofBytes / sampleCount
+			t.Logf("Tree size: %d, Average proof size: %d bytes (%d elements of 36 bytes)", size, avgProofBytes, avgProofBytes/36)
+		})
 	}
 }
