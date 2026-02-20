@@ -31,11 +31,10 @@ var (
 	ErrInvalidVectorData       = errors.New("invalid vector data detected")
 )
 
-// ProofClient fetches and verifies MMR/SMST proofs from participant APIs.
+// ProofClient fetches and verifies SMST proofs from participant APIs.
 type ProofClient struct {
 	httpClient *http.Client
 	recorder   cosmosclient.CosmosMessageClient
-	useSMST    bool
 }
 
 // ProofRequest contains the parameters for requesting proofs.
@@ -70,14 +69,12 @@ type VerifiedArtifact struct {
 // ProofClientConfig contains configuration for the proof client.
 type ProofClientConfig struct {
 	Timeout time.Duration
-	UseSMST bool
 }
 
 // DefaultProofClientConfig returns the default configuration.
 func DefaultProofClientConfig() ProofClientConfig {
 	return ProofClientConfig{
 		Timeout: 30 * time.Second,
-		UseSMST: true,
 	}
 }
 
@@ -86,7 +83,6 @@ func NewProofClient(recorder cosmosclient.CosmosMessageClient, config ProofClien
 	return &ProofClient{
 		httpClient: utils.NewHttpClient(config.Timeout),
 		recorder:   recorder,
-		useSMST:    config.UseSMST,
 	}
 }
 
@@ -207,20 +203,9 @@ func (c *ProofClient) FetchAndVerifyProofs(
 		// Build leaf data (same format as stored: nonce(LE32) || vector)
 		leafData := buildLeafData(item.NonceValue, vectorBytes)
 
-		// Verify proof (MMR or SMST based on config)
-		var proofValid bool
-		if c.useSMST {
-			proofValid = artifacts.VerifySMSTProofSlice(req.RootHash, req.Count, item.NonceValue, leafData, proofHashes)
-		} else {
-			proofValid = artifacts.VerifyProof(req.RootHash, req.Count, item.LeafIndex, leafData, proofHashes)
-		}
-
-		if !proofValid {
-			proofType := "MMR"
-			if c.useSMST {
-				proofType = "SMST"
-			}
-			logging.Warn(proofType+" proof verification failed", types.PoC,
+		// Verify SMST proof
+		if !artifacts.VerifySMSTProofSlice(req.RootHash, req.Count, item.NonceValue, leafData, proofHashes) {
+			logging.Warn("SMST proof verification failed", types.PoC,
 				"participant", req.ParticipantAddress, "leafIndex", item.LeafIndex)
 			return nil, fmt.Errorf("%w: leaf %d", ErrProofVerificationFailed, item.LeafIndex)
 		}
@@ -313,7 +298,7 @@ func buildProofSignPayload(
 	return []byte(hex.EncodeToString(hash[:]))
 }
 
-// buildLeafData builds the leaf data format used in MMR.
+// buildLeafData builds the leaf data format.
 // Format: nonce(LE32) || vector
 func buildLeafData(nonce int32, vector []byte) []byte {
 	buf := make([]byte, 4+len(vector))

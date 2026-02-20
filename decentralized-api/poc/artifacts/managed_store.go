@@ -29,26 +29,18 @@ type ManagedArtifactStore struct {
 	baseDir     string
 	stores      map[int64]ArtifactStore // poc_stage_start_block_height -> store
 	retainCount int                     // keep newest N stores
-	useSMST     bool                    // use SMST instead of MMR
 	cancel      context.CancelFunc      // cancels cleanup goroutine
 	flushCancel context.CancelFunc      // cancels periodic flush goroutine
 }
 
 // NewManagedArtifactStore creates a new managed store with automatic pruning.
 // retainCount specifies how many recent stores to keep (based on poc_stage_start_block_height).
-// Defaults to SMST mode (duplicate prevention enabled).
 func NewManagedArtifactStore(baseDir string, retainCount int) *ManagedArtifactStore {
-	return NewManagedArtifactStoreWithConfig(baseDir, retainCount, true)
-}
-
-// NewManagedArtifactStoreWithConfig creates a managed store with explicit SMST selection.
-func NewManagedArtifactStoreWithConfig(baseDir string, retainCount int, useSMST bool) *ManagedArtifactStore {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &ManagedArtifactStore{
 		baseDir:     baseDir,
 		stores:      make(map[int64]ArtifactStore),
 		retainCount: retainCount,
-		useSMST:     useSMST,
 		cancel:      cancel,
 	}
 	go m.cleanupLoop(ctx)
@@ -65,21 +57,13 @@ func (m *ManagedArtifactStore) GetOrCreateStore(pocStageStartHeight int64) (Arti
 	}
 
 	storeDir := filepath.Join(m.baseDir, strconv.FormatInt(pocStageStartHeight, 10))
-	store, err := m.openStore(storeDir)
+	store, err := OpenSMST(storeDir)
 	if err != nil {
 		return nil, fmt.Errorf("open store for stage %d: %w", pocStageStartHeight, err)
 	}
 
 	m.stores[pocStageStartHeight] = store
 	return store, nil
-}
-
-// openStore opens a store using the configured implementation (MMR or SMST).
-func (m *ManagedArtifactStore) openStore(storeDir string) (ArtifactStore, error) {
-	if m.useSMST {
-		return OpenSMST(storeDir)
-	}
-	return Open(storeDir)
 }
 
 // GetStore returns the store for the given PoC stage, or an error if it doesn't exist.
@@ -107,7 +91,7 @@ func (m *ManagedArtifactStore) GetStore(pocStageStartHeight int64) (ArtifactStor
 		return store, nil
 	}
 
-	store, err := m.openStore(storeDir)
+	store, err := OpenSMST(storeDir)
 	if err != nil {
 		return nil, fmt.Errorf("open store for stage %d: %w", pocStageStartHeight, err)
 	}

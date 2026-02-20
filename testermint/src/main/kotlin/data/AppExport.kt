@@ -269,8 +269,6 @@ data class PocParams(
     val validationSlots: Long = 2,
     @SerializedName("poc_normalization_enabled")
     val pocNormalizationEnabled: Boolean = false,  // Disabled by default in tests
-    @SerializedName("use_smst")
-    val useSmst: Boolean = true,  // Use SMST for duplicate prevention (default: true)
 )
 
 data class PoCStatTestParams(

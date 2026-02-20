@@ -151,9 +151,8 @@ Minimal changes. Keep existing messages and flows unchanged.
 
 **New/Modified**:
 - Extract `ArtifactStore` interface from current concrete type
-- Implement SMST store as alternative implementation
-- Add `use_smst` param (default: true) to `PocParams`
-- Config manager selects implementation based on param
+- Implement SMST store as the sole implementation
+- Remove MMR implementation (now obsolete)
 
 ### Interface
 
@@ -232,23 +231,11 @@ Recommendation: At upgrade block, all new commits use SMST. Old commits already 
 | `artifacts/smst.go` | New SMST tree + `VerifyProof()` |
 | `artifacts/smst_store.go` | New store using SMST |
 | `artifacts/interface.go` | Interface definition |
-| `artifacts/managed_store.go` | Use interface instead of concrete type |
-| `poc/proof_client.go` | Call SMST `VerifyProof()` based on config |
+| `artifacts/managed_store.go` | Use SMST directly |
+| `poc/proof_client.go` | Call SMST `VerifyProof()` |
 | `poc/commit_worker.go` | Trigger SMST prebuild in `submitWeightDistribution()` |
-| `apiconfig/config_manager.go` | Select implementation based on param |
 
-**Chain (inference-chain):**
-
-| File | Change |
-|:-----|:-------|
-| `proto/inference/inference/params.proto` | Add `bool use_smst = 13` to `PocParams` |
-
-**Testermint:**
-
-| File | Change |
-|:-----|:-------|
-| `src/main/kotlin/data/AppExport.kt` | Add `useSmst` field to `PocParams` data class |
-| `src/main/kotlin/Main.kt` | Set `useSmst = true` in test setup |
+No chain or testermint changes required - SMST is the sole implementation.
 
 ### Development Process
 
@@ -292,8 +279,7 @@ Expected proof sizes:
 
 **Phase 5: Integration**
 
-- Add `use_smst` param
-- Config manager implementation selection
+- Remove MMR implementation
 - Integration tests with testermint
 
 ### Expected Throughput
@@ -327,7 +313,7 @@ No migration needed. At upgrade:
 - Old epochs: already validated, data pruned
 - New epochs: use SMST from start
 
-The `use_smst` param could be compile-time constant rather than runtime config.
+SMST is now the sole implementation - no runtime switching needed.
 
 ### Stress Test Scope
 

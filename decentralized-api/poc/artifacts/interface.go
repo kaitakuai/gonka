@@ -45,7 +45,5 @@ type ArtifactStore interface {
 	Close() error
 
 	// PrebuildSnapshot builds and caches tree state at specified count for fast proofs.
-	// For SMST, this prebuilds the tree at the snapshot count.
-	// For MMR, this is a no-op (MMR has O(1) proof generation).
 	PrebuildSnapshot(count uint32) error
 }

@@ -13,6 +13,24 @@ import (
 	"sync"
 )
 
+const (
+	// MaxLeafCount caps artifacts to prevent overflow in size calculations.
+	MaxLeafCount = (1 << 30) - 1 // 1,073,741,823
+)
+
+var (
+	ErrDuplicateNonce      = errors.New("duplicate nonce")
+	ErrLeafIndexOutOfRange = errors.New("leaf index out of range")
+	ErrStoreClosed         = errors.New("store is closed")
+	ErrCapacityExceeded    = errors.New("store capacity exceeded")
+)
+
+type bufferedArtifact struct {
+	nonce  int32
+	vector []byte
+	nodeId string
+}
+
 // SMSTArtifactStore provides artifact storage with SMST commitments.
 // Nonce determines tree position, making duplicates impossible by design.
 type SMSTArtifactStore struct {
@@ -561,4 +579,66 @@ func (s *SMSTArtifactStore) Close() error {
 	}
 
 	return nil
+}
+
+func writeArtifact(w io.Writer, nonce int32, vector []byte) (int, error) {
+	totalLen := 4 + len(vector)
+	header := make([]byte, 8)
+	binary.LittleEndian.PutUint32(header[0:4], uint32(totalLen))
+	binary.LittleEndian.PutUint32(header[4:8], uint32(nonce))
+
+	n1, err := w.Write(header)
+	if err != nil {
+		return n1, err
+	}
+
+	n2, err := w.Write(vector)
+	if err != nil {
+		return n1 + n2, err
+	}
+
+	return n1 + n2, nil
+}
+
+func readArtifact(r io.Reader) (int32, []byte, int, error) {
+	var header [8]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, nil, 0, err
+	}
+
+	totalLen := binary.LittleEndian.Uint32(header[0:4])
+	nonce := int32(binary.LittleEndian.Uint32(header[4:8]))
+
+	vectorLen := totalLen - 4
+	vector := make([]byte, vectorLen)
+	if _, err := io.ReadFull(r, vector); err != nil {
+		return 0, nil, 0, err
+	}
+
+	return nonce, vector, 8 + int(vectorLen), nil
+}
+
+func readArtifactAt(r io.ReaderAt, offset int64) (int32, []byte, int, error) {
+	var header [8]byte
+	if _, err := r.ReadAt(header[:], offset); err != nil {
+		return 0, nil, 0, err
+	}
+
+	totalLen := binary.LittleEndian.Uint32(header[0:4])
+	nonce := int32(binary.LittleEndian.Uint32(header[4:8]))
+
+	vectorLen := totalLen - 4
+	vector := make([]byte, vectorLen)
+	if _, err := r.ReadAt(vector, offset+8); err != nil {
+		return 0, nil, 0, err
+	}
+
+	return nonce, vector, 8 + int(vectorLen), nil
+}
+
+func encodeLeaf(nonce int32, vector []byte) []byte {
+	buf := make([]byte, 4+len(vector))
+	binary.LittleEndian.PutUint32(buf[:4], uint32(nonce))
+	copy(buf[4:], vector)
+	return buf
 }

@@ -183,17 +183,8 @@ func main() {
 
 	// Shared managed artifact store for off-chain PoC (used by both mlnode and public servers)
 	// Manages per-height directories with automatic pruning (retains last 10)
-	// Check chain params for SMST mode (duplicate prevention)
-	// Default to SMST=true for duplicate attack prevention
-	useSMST := true
-	if params, err := getParams(ctx, *recorder); err == nil && params.Params.PocParams != nil {
-		useSMST = params.Params.PocParams.UseSmst
-	}
-	artifactStore := artifacts.NewManagedArtifactStoreWithConfig("/root/.dapi/data/poc-artifacts", 10, useSMST)
+	artifactStore := artifacts.NewManagedArtifactStore("/root/.dapi/data/poc-artifacts", 10)
 	defer artifactStore.Close()
-	if useSMST {
-		logging.Info("Artifact store using SMST (duplicate prevention enabled)", types.PoC)
-	}
 
 	// Create commit worker for time-based artifact commits and weight distribution
 	// Worker owns flush lifecycle, commits periodically (not per-request), and handles distribution

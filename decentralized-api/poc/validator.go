@@ -261,11 +261,9 @@ func (v *OffChainValidator) ValidateAll(pocStageStartBlockHeight int64, pocStart
 		workItems[i], workItems[j] = workItems[j], workItems[i]
 	})
 
-	// Create proof client with SMST config from chain params
-	useSMST := pocParams.UseSmst
+	// Create proof client
 	proofClient := NewProofClient(v.recorder, ProofClientConfig{
 		Timeout: v.config.RequestTimeout,
-		UseSMST: useSMST,
 	})
 
 	// Create work channel - buffered to allow re-queueing failed items
