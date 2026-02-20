@@ -502,3 +502,134 @@ func BenchmarkAdd(b *testing.B) {
 		store.Add(int32(i), vector)
 	}
 }
+
+func BenchmarkAddWithFlush(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := Open(dir)
+	defer store.Close()
+
+	vector := make([]byte, 24)
+	for i := range vector {
+		vector[i] = byte(i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.Add(int32(i), vector)
+		if (i+1)%1000 == 0 {
+			store.Flush()
+		}
+	}
+	store.Flush()
+}
+
+func BenchmarkGetProof(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := Open(dir)
+	defer store.Close()
+
+	const treeSize = 100000
+	vector := make([]byte, 24)
+	for i := 0; i < treeSize; i++ {
+		store.Add(int32(i), vector)
+	}
+	store.Flush()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		leafIdx := uint32(i % treeSize)
+		store.GetProof(leafIdx, treeSize)
+	}
+}
+
+func BenchmarkVerifyProof(b *testing.B) {
+	dir := b.TempDir()
+	store, _ := Open(dir)
+	defer store.Close()
+
+	const treeSize = 100000
+	vector := make([]byte, 24)
+	for i := 0; i < treeSize; i++ {
+		store.Add(int32(i), vector)
+	}
+	store.Flush()
+
+	root := store.GetRoot()
+	proofs := make([][][]byte, 100)
+	leafData := make([][]byte, 100)
+	for i := 0; i < 100; i++ {
+		proofs[i], _ = store.GetProof(uint32(i), treeSize)
+		leafData[i] = encodeLeaf(int32(i), vector)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		idx := i % 100
+		VerifyProof(root, treeSize, uint32(idx), leafData[idx], proofs[idx])
+	}
+}
+
+func BenchmarkRecovery(b *testing.B) {
+	sizes := []int{10000, 100000, 1000000}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
+			dir := b.TempDir()
+
+			store, _ := Open(dir)
+			vector := make([]byte, 24)
+			for i := 0; i < size; i++ {
+				store.Add(int32(i), vector)
+			}
+			store.Flush()
+			store.Close()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				s, _ := Open(dir)
+				s.Close()
+			}
+		})
+	}
+}
+
+func TestProofSizes(t *testing.T) {
+	sizes := []int{1000, 10000, 100000, 1000000, 5000000}
+
+	for _, size := range sizes {
+		t.Run(fmt.Sprintf("size_%d", size), func(t *testing.T) {
+			if size > 100000 && testing.Short() {
+				t.Skip("skipping large tree in short mode")
+			}
+
+			dir := t.TempDir()
+			store, _ := Open(dir)
+			defer store.Close()
+
+			vector := make([]byte, 24)
+			for i := 0; i < size; i++ {
+				store.Add(int32(i), vector)
+			}
+
+			var totalProofBytes int
+			sampleCount := 100
+			if size < sampleCount {
+				sampleCount = size
+			}
+
+			for i := 0; i < sampleCount; i++ {
+				leafIdx := uint32(i * size / sampleCount)
+				proof, err := store.GetProof(leafIdx, uint32(size))
+				if err != nil {
+					t.Fatalf("GetProof failed: %v", err)
+				}
+				for _, h := range proof {
+					totalProofBytes += len(h)
+				}
+			}
+
+			avgProofBytes := totalProofBytes / sampleCount
+			t.Logf("Tree size: %d, Average proof size: %d bytes (%d hashes)", size, avgProofBytes, avgProofBytes/32)
+		})
+	}
+}
