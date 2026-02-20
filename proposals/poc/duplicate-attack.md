@@ -224,6 +224,8 @@ Recommendation: At upgrade block, all new commits use SMST. Old commits already 
 
 ### Files
 
+**DAPI (decentralized-api):**
+
 | File | Change |
 |:-----|:-------|
 | `artifacts/store.go` | Extract interface, rename to `mmr_store.go` |
@@ -232,9 +234,21 @@ Recommendation: At upgrade block, all new commits use SMST. Old commits already 
 | `artifacts/interface.go` | Interface definition |
 | `artifacts/managed_store.go` | Use interface instead of concrete type |
 | `poc/proof_client.go` | Call SMST `VerifyProof()` based on config |
-| `params.proto` | Add `bool use_smst = 13` |
-| `apiconfig/config_manager.go` | Select implementation based on param |
 | `poc/commit_worker.go` | Trigger SMST prebuild in `submitWeightDistribution()` |
+| `apiconfig/config_manager.go` | Select implementation based on param |
+
+**Chain (inference-chain):**
+
+| File | Change |
+|:-----|:-------|
+| `proto/inference/inference/params.proto` | Add `bool use_smst = 13` to `PocParams` |
+
+**Testermint:**
+
+| File | Change |
+|:-----|:-------|
+| `src/main/kotlin/data/AppExport.kt` | Add `useSmst` field to `PocParams` data class |
+| `src/main/kotlin/Main.kt` | Set `useSmst = true` in test setup |
 
 ### Development Process
 
