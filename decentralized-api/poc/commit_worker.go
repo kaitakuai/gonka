@@ -225,7 +225,16 @@ func (w *CommitWorker) submitWeightDistribution(pocHeight int64) {
 		logging.Warn("CommitWorker: prebuild failed", types.PoC, "pocHeight", pocHeight, "count", resp.Count, "error", err)
 	}
 
-	distribution := store.GetNodeDistribution()
+	distribution, exact, err := store.GetNodeDistributionAt(resp.Count)
+	if err != nil {
+		logging.Error("CommitWorker: failed to get distribution", types.PoC,
+			"pocHeight", pocHeight, "count", resp.Count, "error", err)
+		return
+	}
+	if !exact {
+		logging.Warn("CommitWorker: using simulated distribution (history miss)", types.PoC,
+			"pocHeight", pocHeight, "count", resp.Count)
+	}
 	if len(distribution) == 0 {
 		logging.Debug("CommitWorker: empty distribution", types.PoC, "pocHeight", pocHeight)
 		return

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -125,6 +126,14 @@ func encodeTestProofForTransport(proof []SMSTProofElement) [][]byte {
 		result[i] = encoded
 	}
 	return result
+}
+
+func (s *SMSTArtifactStore) Add(nonce int32, vector []byte) error {
+	return s.AddWithNode(nonce, vector, "")
+}
+
+func (s *SMSTArtifactStore) GetRoot() []byte {
+	return s.getRoot()
 }
 
 func TestSMSTEmpty(t *testing.T) {
@@ -2038,5 +2047,400 @@ func TestSMSTGetArtifactAndProofErrorCases(t *testing.T) {
 	}
 	if nonce == 0 && vector == nil && proof == nil {
 		t.Error("Valid request returned empty data")
+	}
+}
+
+func TestDistributionHistory_NormalOperation(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+	defer store.Close()
+
+	store.AddWithNode(1, []byte{1}, "nodeA")
+	store.AddWithNode(2, []byte{2}, "nodeB")
+	store.AddWithNode(3, []byte{3}, "nodeA")
+	store.Flush()
+
+	dist1, exact1, err := store.GetNodeDistributionAt(3)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(3) failed: %v", err)
+	}
+	if !exact1 {
+		t.Error("expected exact=true for count=3")
+	}
+	if dist1["nodeA"] != 2 || dist1["nodeB"] != 1 {
+		t.Errorf("unexpected distribution at count=3: %v", dist1)
+	}
+
+	store.AddWithNode(4, []byte{4}, "nodeB")
+	store.AddWithNode(5, []byte{5}, "nodeB")
+	store.Flush()
+
+	dist2, exact2, err := store.GetNodeDistributionAt(5)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(5) failed: %v", err)
+	}
+	if !exact2 {
+		t.Error("expected exact=true for count=5")
+	}
+	if dist2["nodeA"] != 2 || dist2["nodeB"] != 3 {
+		t.Errorf("unexpected distribution at count=5: %v", dist2)
+	}
+
+	distOld, exactOld, err := store.GetNodeDistributionAt(3)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(3) after second flush failed: %v", err)
+	}
+	if !exactOld {
+		t.Error("expected exact=true for historical count=3")
+	}
+	if distOld["nodeA"] != 2 || distOld["nodeB"] != 1 {
+		t.Errorf("historical distribution at count=3 changed: %v", distOld)
+	}
+}
+
+func TestDistributionHistory_Recovery(t *testing.T) {
+	dir := t.TempDir()
+
+	store1, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+
+	store1.AddWithNode(1, []byte{1}, "nodeA")
+	store1.AddWithNode(2, []byte{2}, "nodeB")
+	store1.Flush()
+
+	store1.AddWithNode(3, []byte{3}, "nodeA")
+	store1.AddWithNode(4, []byte{4}, "nodeA")
+	store1.Flush()
+
+	store1.Close()
+
+	store2, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST (reopen) failed: %v", err)
+	}
+	defer store2.Close()
+
+	dist2, exact2, err := store2.GetNodeDistributionAt(2)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(2) failed: %v", err)
+	}
+	if !exact2 {
+		t.Error("expected exact=true for count=2 after recovery")
+	}
+	if dist2["nodeA"] != 1 || dist2["nodeB"] != 1 {
+		t.Errorf("distribution at count=2 after recovery: %v", dist2)
+	}
+
+	dist4, exact4, err := store2.GetNodeDistributionAt(4)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(4) failed: %v", err)
+	}
+	if !exact4 {
+		t.Error("expected exact=true for count=4 after recovery")
+	}
+	if dist4["nodeA"] != 3 || dist4["nodeB"] != 1 {
+		t.Errorf("distribution at count=4 after recovery: %v", dist4)
+	}
+}
+
+func TestDistributionHistory_CorruptedFile(t *testing.T) {
+	dir := t.TempDir()
+
+	store1, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+
+	store1.AddWithNode(1, []byte{1}, "nodeA")
+	store1.AddWithNode(2, []byte{2}, "nodeB")
+	store1.Flush()
+	store1.Close()
+
+	distPath := filepath.Join(dir, "distributions.jsonl")
+	f, err := os.OpenFile(distPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("open distributions.jsonl failed: %v", err)
+	}
+	f.WriteString("{invalid json line\n")
+	f.WriteString(`{"count":10,"dist":{"nodeC":5,"nodeD":5}}` + "\n")
+	f.Close()
+
+	store2, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST (reopen) failed: %v", err)
+	}
+	defer store2.Close()
+
+	dist2, exact2, err := store2.GetNodeDistributionAt(2)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(2) failed: %v", err)
+	}
+	if !exact2 {
+		t.Error("expected exact=true for valid count=2")
+	}
+	if dist2["nodeA"] != 1 || dist2["nodeB"] != 1 {
+		t.Errorf("distribution at count=2: %v", dist2)
+	}
+
+	dist10, exact10, err := store2.GetNodeDistributionAt(10)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(10) failed: %v", err)
+	}
+	if !exact10 {
+		t.Error("expected exact=true for count=10 (valid line after corrupt)")
+	}
+	if dist10["nodeC"] != 5 || dist10["nodeD"] != 5 {
+		t.Errorf("distribution at count=10: %v", dist10)
+	}
+}
+
+func TestDistributionHistory_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+
+	store1, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+	store1.AddWithNode(1, []byte{1}, "nodeA")
+	store1.AddWithNode(2, []byte{2}, "nodeB")
+	store1.Flush()
+	store1.Close()
+
+	distPath := filepath.Join(dir, "distributions.jsonl")
+	if err := os.Truncate(distPath, 0); err != nil {
+		t.Fatalf("truncate distributions.jsonl failed: %v", err)
+	}
+
+	store2, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST (reopen) failed: %v", err)
+	}
+	defer store2.Close()
+
+	dist, exact, err := store2.GetNodeDistributionAt(2)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(2) failed: %v", err)
+	}
+	if exact {
+		t.Error("expected exact=false when history is empty")
+	}
+	if len(dist) != 0 {
+		t.Errorf("expected empty distribution when history lost, got %v", dist)
+	}
+}
+
+func TestDistributionHistory_MissingFile(t *testing.T) {
+	dir := t.TempDir()
+
+	store1, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+	store1.AddWithNode(1, []byte{1}, "nodeA")
+	store1.AddWithNode(2, []byte{2}, "nodeA")
+	store1.AddWithNode(3, []byte{3}, "nodeB")
+	store1.Flush()
+	store1.Close()
+
+	distPath := filepath.Join(dir, "distributions.jsonl")
+	if err := os.Remove(distPath); err != nil {
+		t.Fatalf("remove distributions.jsonl failed: %v", err)
+	}
+
+	store2, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST (reopen) failed: %v", err)
+	}
+	defer store2.Close()
+
+	dist, exact, err := store2.GetNodeDistributionAt(3)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(3) failed: %v", err)
+	}
+	if exact {
+		t.Error("expected exact=false when file was missing")
+	}
+	if len(dist) != 0 {
+		t.Errorf("expected empty distribution when history lost, got %v", dist)
+	}
+}
+
+func TestDistributionHistory_TruncatedLine(t *testing.T) {
+	dir := t.TempDir()
+
+	store1, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+	store1.AddWithNode(1, []byte{1}, "nodeA")
+	store1.AddWithNode(2, []byte{2}, "nodeB")
+	store1.Flush()
+	store1.Close()
+
+	distPath := filepath.Join(dir, "distributions.jsonl")
+	f, err := os.OpenFile(distPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("open distributions.jsonl failed: %v", err)
+	}
+	f.WriteString(`{"count":5,"dist":{"nodeA":3,`)
+	f.Close()
+
+	store2, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST (reopen) failed: %v", err)
+	}
+	defer store2.Close()
+
+	dist2, exact2, err := store2.GetNodeDistributionAt(2)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(2) failed: %v", err)
+	}
+	if !exact2 {
+		t.Error("expected exact=true for valid count=2")
+	}
+	if dist2["nodeA"] != 1 || dist2["nodeB"] != 1 {
+		t.Errorf("distribution at count=2: %v", dist2)
+	}
+
+	_, exact5, err := store2.GetNodeDistributionAt(5)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(5) failed: %v", err)
+	}
+	if exact5 {
+		t.Error("expected exact=false for truncated count=5")
+	}
+}
+
+func TestDistributionHistory_SimulationAccuracy(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+	defer store.Close()
+
+	for i := int32(0); i < 100; i++ {
+		nodeId := "nodeA"
+		if i%3 == 0 {
+			nodeId = "nodeB"
+		}
+		if i%7 == 0 {
+			nodeId = "nodeC"
+		}
+		store.AddWithNode(i, []byte{byte(i)}, nodeId)
+	}
+	store.Flush()
+
+	for _, targetCount := range []uint32{10, 25, 50, 75, 99} {
+		dist, exact, err := store.GetNodeDistributionAt(targetCount)
+		if err != nil {
+			t.Fatalf("GetNodeDistributionAt(%d) failed: %v", targetCount, err)
+		}
+		if exact {
+			continue
+		}
+
+		var total uint32
+		for _, c := range dist {
+			total += c
+		}
+		if total != targetCount {
+			t.Errorf("simulation for count=%d: sum=%d (expected %d)", targetCount, total, targetCount)
+		}
+	}
+}
+
+func TestDistributionHistory_ZeroCount(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+	defer store.Close()
+
+	dist, exact, err := store.GetNodeDistributionAt(0)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(0) failed: %v", err)
+	}
+	if !exact {
+		t.Error("expected exact=true for count=0")
+	}
+	if len(dist) != 0 {
+		t.Errorf("expected empty distribution for count=0, got %v", dist)
+	}
+}
+
+func TestDistributionHistory_CrashRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	store1, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST failed: %v", err)
+	}
+
+	store1.AddWithNode(1, []byte{1}, "nodeA")
+	store1.AddWithNode(2, []byte{2}, "nodeB")
+	store1.AddWithNode(3, []byte{3}, "nodeA")
+	store1.Flush()
+
+	store1.AddWithNode(4, []byte{4}, "nodeA")
+	store1.AddWithNode(5, []byte{5}, "nodeB")
+	store1.Flush()
+
+	store1.Close()
+
+	distPath := filepath.Join(dir, "distributions.jsonl")
+	content, err := os.ReadFile(distPath)
+	if err != nil {
+		t.Fatalf("read distributions.jsonl failed: %v", err)
+	}
+	lines := bytes.Split(content, []byte("\n"))
+	if len(lines) < 2 {
+		t.Fatalf("expected at least 2 distribution entries, got %d", len(lines))
+	}
+	if err := os.WriteFile(distPath, lines[0], 0644); err != nil {
+		t.Fatalf("truncate to first entry failed: %v", err)
+	}
+
+	store2, err := OpenSMST(dir)
+	if err != nil {
+		t.Fatalf("OpenSMST (reopen) failed: %v", err)
+	}
+	defer store2.Close()
+
+	if store2.Count() != 5 {
+		t.Errorf("expected 5 artifacts recovered, got %d", store2.Count())
+	}
+
+	dist3, exact3, err := store2.GetNodeDistributionAt(3)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(3) failed: %v", err)
+	}
+	if !exact3 {
+		t.Error("expected exact=true for count=3 (was in truncated history)")
+	}
+	if dist3["nodeA"] != 2 || dist3["nodeB"] != 1 {
+		t.Errorf("distribution at count=3: %v", dist3)
+	}
+
+	dist5, exact5, err := store2.GetNodeDistributionAt(5)
+	if err != nil {
+		t.Fatalf("GetNodeDistributionAt(5) failed: %v", err)
+	}
+	if exact5 {
+		t.Error("expected exact=false for count=5 (was lost in crash)")
+	}
+
+	var total uint32
+	for _, c := range dist5 {
+		total += c
+	}
+	if total != 5 {
+		t.Errorf("simulated distribution should sum to 5, got %d", total)
 	}
 }

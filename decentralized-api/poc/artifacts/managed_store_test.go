@@ -67,7 +67,7 @@ func TestManagedArtifactStore_GetStore_ExistingDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateStore failed: %v", err)
 	}
-	if err := store.Add(1, []byte("test")); err != nil {
+	if err := store.AddWithNode(1, []byte("test"), ""); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 	if err := m1.Flush(); err != nil {
@@ -200,7 +200,7 @@ func TestManagedArtifactStore_Flush(t *testing.T) {
 		t.Fatalf("GetOrCreateStore failed: %v", err)
 	}
 
-	if err := store.Add(1, []byte("test")); err != nil {
+	if err := store.AddWithNode(1, []byte("test"), ""); err != nil {
 		t.Fatalf("Add failed: %v", err)
 	}
 

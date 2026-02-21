@@ -31,6 +31,12 @@ type bufferedArtifact struct {
 	nodeId string
 }
 
+// distributionEntry is a single line in distributions.jsonl
+type distributionEntry struct {
+	Count uint32            `json:"count"`
+	Dist  map[string]uint32 `json:"dist"`
+}
+
 // SMSTArtifactStore provides artifact storage with SMST commitments.
 // Nonce determines tree position, making duplicates impossible by design.
 type SMSTArtifactStore struct {
@@ -52,6 +58,9 @@ type SMSTArtifactStore struct {
 	nodeCounts        map[string]uint32
 	flushedNodeCounts map[string]uint32
 
+	distributionHistory map[uint32]map[string]uint32 // count -> distribution snapshot
+	distFile            *os.File                     // distributions.jsonl (append-only)
+
 	prebuiltSnapshot *SMST
 	prebuiltCount    uint32
 }
@@ -65,26 +74,36 @@ func OpenSMST(dir string) (*SMSTArtifactStore, error) {
 	}
 
 	dataPath := filepath.Join(dir, "artifacts.data")
+	distPath := filepath.Join(dir, "distributions.jsonl")
 
 	dataFile, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("open data file: %w", err)
 	}
 
+	distFile, err := os.OpenFile(distPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		dataFile.Close()
+		return nil, fmt.Errorf("open distributions file: %w", err)
+	}
+
 	s := &SMSTArtifactStore{
-		dir:               dir,
-		dataFile:          dataFile,
-		buffer:            make([]bufferedArtifact, 0, 1024),
-		offsets:           make([]uint64, 0, 1024),
-		nonceToOffset:     make(map[int32]uint64),
-		smst:              NewSMST(smstDefaultDepth),
-		flushedRoots:      make(map[uint32][]byte),
-		nodeCounts:        make(map[string]uint32),
-		flushedNodeCounts: make(map[string]uint32),
+		dir:                 dir,
+		dataFile:            dataFile,
+		distFile:            distFile,
+		buffer:              make([]bufferedArtifact, 0, 1024),
+		offsets:             make([]uint64, 0, 1024),
+		nonceToOffset:       make(map[int32]uint64),
+		smst:                NewSMST(smstDefaultDepth),
+		flushedRoots:        make(map[uint32][]byte),
+		nodeCounts:          make(map[string]uint32),
+		flushedNodeCounts:   make(map[string]uint32),
+		distributionHistory: make(map[uint32]map[string]uint32),
 	}
 
 	if err := s.recover(); err != nil {
 		s.dataFile.Close()
+		s.distFile.Close()
 		return nil, fmt.Errorf("recover: %w", err)
 	}
 
@@ -98,7 +117,7 @@ func (s *SMSTArtifactStore) recover() error {
 	}
 
 	if info.Size() == 0 {
-		return s.recoverNodeCounts()
+		return s.recoverDistributionHistory()
 	}
 
 	if _, err := s.dataFile.Seek(0, io.SeekStart); err != nil {
@@ -139,47 +158,60 @@ func (s *SMSTArtifactStore) recover() error {
 	rootHash, _ := s.smst.GetRoot()
 	s.flushedRoots[s.flushedLeafCount] = rootHash
 
-	if err := s.recoverNodeCounts(); err != nil {
-		return fmt.Errorf("recover node counts: %w", err)
+	if err := s.recoverDistributionHistory(); err != nil {
+		log.Printf("warning: failed to recover distribution history: %v", err)
 	}
 
 	return nil
 }
 
-func (s *SMSTArtifactStore) recoverNodeCounts() error {
-	nodesPath := filepath.Join(s.dir, "nodes.json")
-
-	f, err := os.Open(nodesPath)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("open nodes file: %w", err)
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat nodes file: %w", err)
-	}
-	if info.Size() == 0 {
-		return nil
+func (s *SMSTArtifactStore) recoverDistributionHistory() error {
+	if _, err := s.distFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek distributions file: %w", err)
 	}
 
-	decoder := json.NewDecoder(f)
-	if err := decoder.Decode(&s.flushedNodeCounts); err != nil {
-		return fmt.Errorf("decode nodes file: %w", err)
+	var latestCount uint32
+	var latestDist map[string]uint32
+
+	scanner := bufio.NewScanner(s.distFile)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var entry distributionEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			log.Printf("warning: skipping corrupted distribution entry at line %d: %v", lineNum, err)
+			continue
+		}
+
+		distCopy := make(map[string]uint32, len(entry.Dist))
+		for k, v := range entry.Dist {
+			distCopy[k] = v
+		}
+		s.distributionHistory[entry.Count] = distCopy
+
+		if entry.Count >= latestCount {
+			latestCount = entry.Count
+			latestDist = distCopy
+		}
 	}
 
-	for k, v := range s.flushedNodeCounts {
-		s.nodeCounts[k] = v
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan distributions file: %w", err)
+	}
+
+	if latestDist != nil {
+		for k, v := range latestDist {
+			s.flushedNodeCounts[k] = v
+			s.nodeCounts[k] = v
+		}
 	}
 
 	return nil
-}
-
-func (s *SMSTArtifactStore) Add(nonce int32, vector []byte) error {
-	return s.AddWithNode(nonce, vector, "")
 }
 
 func (s *SMSTArtifactStore) AddWithNode(nonce int32, vector []byte, nodeId string) error {
@@ -251,8 +283,8 @@ func (s *SMSTArtifactStore) flushLocked() error {
 		return fmt.Errorf("sync data file: %w", err)
 	}
 
-	if err := s.flushNodeCountsLocked(); err != nil {
-		return fmt.Errorf("flush node counts: %w", err)
+	for k, v := range s.nodeCounts {
+		s.flushedNodeCounts[k] = v
 	}
 
 	s.flushedLeafCount = s.smst.Count()
@@ -262,49 +294,48 @@ func (s *SMSTArtifactStore) flushLocked() error {
 	rootHash, _ := s.smst.GetRoot()
 	s.flushedRoots[s.flushedLeafCount] = rootHash
 
+	if err := s.appendDistributionSnapshot(); err != nil {
+		log.Printf("warning: distribution snapshot failed (will use simulation): %v", err)
+	}
+
 	return nil
 }
 
-func (s *SMSTArtifactStore) flushNodeCountsLocked() error {
-	for k, v := range s.nodeCounts {
-		s.flushedNodeCounts[k] = v
+func (s *SMSTArtifactStore) appendDistributionSnapshot() error {
+	if s.distFile == nil {
+		return nil
 	}
 
-	nodesPath := filepath.Join(s.dir, "nodes.json")
-	tmpPath := nodesPath + ".tmp"
+	distCopy := make(map[string]uint32, len(s.flushedNodeCounts))
+	for k, v := range s.flushedNodeCounts {
+		distCopy[k] = v
+	}
 
-	f, err := os.Create(tmpPath)
+	entry := distributionEntry{
+		Count: s.flushedLeafCount,
+		Dist:  distCopy,
+	}
+
+	data, err := json.Marshal(entry)
 	if err != nil {
-		return fmt.Errorf("create temp nodes file: %w", err)
+		return fmt.Errorf("marshal distribution entry: %w", err)
 	}
 
-	encoder := json.NewEncoder(f)
-	if err := encoder.Encode(s.flushedNodeCounts); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("encode nodes file: %w", err)
+	data = append(data, '\n')
+	if _, err := s.distFile.Write(data); err != nil {
+		return fmt.Errorf("write distribution entry: %w", err)
 	}
 
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("sync nodes file: %w", err)
+	if err := s.distFile.Sync(); err != nil {
+		return fmt.Errorf("sync distributions file: %w", err)
 	}
 
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("close temp nodes file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, nodesPath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename nodes file: %w", err)
-	}
+	s.distributionHistory[s.flushedLeafCount] = distCopy
 
 	return nil
 }
 
-func (s *SMSTArtifactStore) GetRoot() []byte {
+func (s *SMSTArtifactStore) getRoot() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -382,6 +413,62 @@ func (s *SMSTArtifactStore) GetNodeCounts() map[string]uint32 {
 	for k, v := range s.nodeCounts {
 		result[k] = v
 	}
+	return result
+}
+
+func (s *SMSTArtifactStore) GetNodeDistributionAt(count uint32) (map[string]uint32, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if count == 0 {
+		return make(map[string]uint32), true, nil
+	}
+
+	if dist, ok := s.distributionHistory[count]; ok {
+		result := make(map[string]uint32, len(dist))
+		for k, v := range dist {
+			result[k] = v
+		}
+		return result, true, nil
+	}
+
+	return s.simulateDistribution(count), false, nil
+}
+
+func (s *SMSTArtifactStore) simulateDistribution(targetCount uint32) map[string]uint32 {
+	if len(s.flushedNodeCounts) == 0 {
+		return make(map[string]uint32)
+	}
+
+	var totalFlushed uint32
+	for _, c := range s.flushedNodeCounts {
+		totalFlushed += c
+	}
+
+	if totalFlushed == 0 {
+		return make(map[string]uint32)
+	}
+
+	result := make(map[string]uint32, len(s.flushedNodeCounts))
+	var allocated uint32
+
+	nodes := make([]string, 0, len(s.flushedNodeCounts))
+	for k := range s.flushedNodeCounts {
+		nodes = append(nodes, k)
+	}
+
+	for _, nodeId := range nodes {
+		proportion := float64(s.flushedNodeCounts[nodeId]) / float64(totalFlushed)
+		scaled := uint32(proportion * float64(targetCount))
+		result[nodeId] = scaled
+		allocated += scaled
+	}
+
+	remainder := targetCount - allocated
+	if remainder > 0 && len(nodes) > 0 {
+		result[nodes[0]] += remainder
+	}
+
 	return result
 }
 
@@ -569,6 +656,12 @@ func (s *SMSTArtifactStore) Close() error {
 
 	if err := s.dataFile.Close(); err != nil {
 		return fmt.Errorf("close data file: %w", err)
+	}
+
+	if s.distFile != nil {
+		if err := s.distFile.Close(); err != nil {
+			return fmt.Errorf("close distributions file: %w", err)
+		}
 	}
 
 	return nil

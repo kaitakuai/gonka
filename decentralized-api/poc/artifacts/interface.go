@@ -7,16 +7,9 @@ package artifacts
 // This is critical for SMST correctness: the dense index to nonce mapping depends on tree state.
 // Unlike MMR where leaf positions were stable, SMST dense indices change as leaves are added.
 type ArtifactStore interface {
-	// Add appends an artifact if nonce is not already in the store.
-	// Deprecated: Use AddWithNode to track per-node distribution.
-	Add(nonce int32, vector []byte) error
-
 	// AddWithNode appends an artifact and tracks which node contributed it.
 	// Returns ErrDuplicateNonce if nonce already exists.
 	AddWithNode(nonce int32, vector []byte, nodeId string) error
-
-	// GetRoot returns the current root hash, or nil if empty.
-	GetRoot() []byte
 
 	// GetRootAt returns the root hash at a specific snapshot count.
 	// Returns nil if snapshotCount is 0, error if snapshotCount exceeds current count.
@@ -26,6 +19,14 @@ type ArtifactStore interface {
 	// Safe to report externally - survives process crashes.
 	GetFlushedRoot() (count uint32, root []byte)
 
+	// GetNodeDistributionAt returns node distribution at a specific count.
+	// Returns exact=true if found in history, exact=false if simulated.
+	// Simulated distribution is scaled proportionally and sums to count.
+	GetNodeDistributionAt(count uint32) (distribution map[string]uint32, exact bool, err error)
+
+	// GetNodeCounts returns current (unflushed) node distribution.
+	GetNodeCounts() map[string]uint32
+
 	// Count returns the total number of artifacts (including unflushed).
 	Count() uint32
 
@@ -33,12 +34,6 @@ type ArtifactStore interface {
 	// This is the ONLY way to retrieve artifacts - snapshot awareness is mandatory for SMST.
 	// Dense index is the sequential position [0, snapshotCount) computed from sibling counts.
 	GetArtifactAndProof(denseIndex uint32, snapshotCount uint32) (nonce int32, vector []byte, proof [][]byte, err error)
-
-	// GetNodeDistribution returns a copy of the flushed node distribution.
-	GetNodeDistribution() map[string]uint32
-
-	// GetNodeCounts returns a copy of the current (unflushed) node distribution.
-	GetNodeCounts() map[string]uint32
 
 	// Flush persists buffered artifacts to disk.
 	Flush() error
