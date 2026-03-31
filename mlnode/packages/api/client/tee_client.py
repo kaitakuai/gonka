@@ -42,18 +42,21 @@ def verify_attestation(att: dict) -> bool:
     - Debug mode is disabled
     """
     v = att.get("verification", {})
-    report = att.get("snp_report", {})
-    policy = report.get("policy", {})
+    tee_type = att.get("tee_type", "unknown")
+    report = att.get("report", {})
+    parsed = report.get("parsed", {})
+    policy = parsed.get("policy", {})
 
     print("\n=== Attestation Verification ===")
+    print(f"  TEE type: {tee_type}")
 
     # Check cert chain was validated
     certs_ok = v.get("certs_valid", False)
-    print(f"  AMD cert chain (ARK→ASK→VCEK): {'PASS' if certs_ok else 'FAIL'}")
+    print(f"  Certificate chain:              {'PASS' if certs_ok else 'FAIL'}")
 
     # Check report signature
     report_ok = v.get("report_valid", False)
-    print(f"  SNP report signature:           {'PASS' if report_ok else 'FAIL'}")
+    print(f"  Report signature:               {'PASS' if report_ok else 'FAIL'}")
 
     # Check keys bound to report
     enc_pub = att.get("encryption_pubkey", "")
@@ -65,19 +68,26 @@ def verify_attestation(att: dict) -> bool:
     keys_ok = expected_rd == actual_rd
     print(f"  Keys bound to TEE:              {'PASS' if keys_ok else 'FAIL'}")
 
-    # Check debug mode
-    debug = policy.get("debug_allowed", True)
-    print(f"  Debug disabled:                 {'PASS' if not debug else 'FAIL (INSECURE!)'}")
-
-    # Check SNP version
-    snp_v = report.get("version", 0)
-    print(f"  SNP report version:             {snp_v} {'(v3 = SEV-SNP)' if snp_v == 3 else 'UNEXPECTED'}")
+    # Platform-specific checks
+    if tee_type == "amd-sev-snp":
+        debug = policy.get("debug_allowed", True)
+        print(f"  Debug disabled:                 {'PASS' if not debug else 'FAIL (INSECURE!)'}")
+        report_v = parsed.get("version", 0)
+        print(f"  SNP report version:             {report_v} {'(v3 = SEV-SNP)' if report_v == 3 else 'UNEXPECTED'}")
+    elif tee_type == "intel-tdx":
+        report_v = parsed.get("version", 0)
+        print(f"  TDX Quote version:              {report_v} {'(v4 = TDX)' if report_v == 4 else 'UNEXPECTED'}")
 
     # Show hardware
     hw = att.get("hardware", {})
-    print(f"\n  CPU: family {hw.get('cpu_family')}, model {hw.get('cpu_model')}")
-    print(f"  Chip ID: {hw.get('chip_id', 'unknown')[:32]}...")
-    print(f"  SEV API: {hw.get('sev_version', {}).get('current', 'unknown')}")
+    print(f"\n  Hardware TEE: {hw.get('tee_type', 'unknown')}")
+    if tee_type == "amd-sev-snp":
+        print(f"  CPU: family {hw.get('cpu_family')}, model {hw.get('cpu_model')}")
+        print(f"  Chip ID: {hw.get('chip_id', 'unknown')[:32]}...")
+        print(f"  SEV API: {hw.get('sev_version', {}).get('current', 'unknown')}")
+    elif tee_type == "intel-tdx":
+        print(f"  MR_SEAM: {(hw.get('mr_seam') or 'unknown')[:32]}...")
+        print(f"  TEE TCB SVN: {hw.get('tee_tcb_svn', 'unknown')[:32]}...")
 
     # Show VM image
     vm = att.get("vm_image", {})
@@ -91,11 +101,17 @@ def verify_attestation(att: dict) -> bool:
     # GPU
     gpu = att.get("gpu")
     if gpu:
-        print(f"\n  GPU: {gpu.get('model')} CC={gpu.get('cc_enabled')}")
+        print(f"\n  GPU: {gpu.get('gpu_name')} mode={gpu.get('mode')}")
     else:
         print(f"\n  GPU CC: not available")
 
-    all_ok = certs_ok and report_ok and keys_ok and not debug and snp_v == 3
+    # Determine overall trust
+    if tee_type == "amd-sev-snp":
+        debug = policy.get("debug_allowed", True)
+        all_ok = certs_ok and report_ok and keys_ok and not debug
+    else:
+        all_ok = certs_ok and report_ok and keys_ok
+
     print(f"\n  OVERALL: {'TRUSTED' if all_ok else 'NOT TRUSTED'}")
     return all_ok
 
