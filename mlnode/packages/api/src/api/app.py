@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from fastapi import FastAPI, Depends
 from contextlib import asynccontextmanager
@@ -30,6 +31,10 @@ from api.routes import router as api_router
 from api.watcher import watch_managers
 from api.proxy import ProxyMiddleware, start_vllm_proxy, stop_vllm_proxy, setup_vllm_proxy, start_backward_compatibility, stop_backward_compatibility
 
+# TEE support (Confidential MLNode — proposal #951)
+TEE_ENABLED = os.getenv("TEE_ENABLED", "0") == "1"
+if TEE_ENABLED:
+    from api.tee.routes import router as tee_router
 
 WATCH_INTERVAL = 2
 
@@ -42,6 +47,27 @@ async def lifespan(app: FastAPI):
     app.state.train_manager = TrainManager()
     app.state.model_manager = ModelManager()
     app.state.gpu_manager = GPUManager()
+
+    # --- TEE initialization (proposal #951) ---
+    if TEE_ENABLED:
+        from api.tee.detect import detect_tee
+        from api.tee.crypto import TEEKeyManager
+        from api.tee.attestation import generate_attestation
+        from common.logger import create_logger
+        tee_logger = create_logger("tee")
+        tee_logger.info("TEE mode enabled — detecting environment")
+
+        # Step 1: Detect TEE hardware (exits if no CPU TEE found)
+        tee_info = detect_tee()
+        app.state.tee_info = tee_info
+
+        # Step 2: Generate keys (only after TEE confirmed)
+        keys = TEEKeyManager()
+        image_hash = os.getenv("TEE_IMAGE_HASH", None)
+        attestation = generate_attestation(keys, image_hash=image_hash)
+        app.state.tee_keys = keys
+        app.state.tee_attestation = attestation
+        tee_logger.info("TEE attestation ready")
 
     await start_vllm_proxy()
 
@@ -69,6 +95,11 @@ async def lifespan(app: FastAPI):
 
     app.state.gpu_manager._shutdown_nvml()
 
+    # Close TEE httpx client
+    if TEE_ENABLED:
+        from api.tee.routes import close_vllm_client
+        await close_vllm_client()
+
     await stop_vllm_proxy()
     await stop_backward_compatibility()
 
@@ -83,7 +114,9 @@ app = FastAPI(lifespan=lifespan)
 
 app.include_router(health_router)
 
-app.add_middleware(ProxyMiddleware)
+# TEE mode: disable plain /v1 proxy — all inference must be encrypted
+if not TEE_ENABLED:
+    app.add_middleware(ProxyMiddleware)
 
 app.include_router(
     pow_router,
@@ -118,6 +151,13 @@ app.include_router(
     prefix=API_PREFIX,
     tags=["API"],
 )
+
+# TEE routes (proposal #951)
+if TEE_ENABLED:
+    app.include_router(
+        tee_router,
+        tags=["TEE"],
+    )
 
 app.include_router(
     models_router,
