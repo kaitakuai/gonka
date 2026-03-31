@@ -186,9 +186,7 @@ async def encrypted_chat_completions(req: EncryptedRequest, request: Request):
         "completion_tokens": usage.get("completion_tokens", 0),
         "total_tokens": usage.get("total_tokens", 0),
         "timestamp": int(time.time()),
-        "tee_type": getattr(request.app.state, "tee_info", None).cpu_tee.value
-                    if getattr(request.app.state, "tee_info", None)
-                    else "unknown",
+        "tee_type": getattr(request.app.state, "tee_attestation", {}).get("tee_type", "unknown"),
         "response_hash": hashlib.sha256(enc_resp).hexdigest(),
     }
 
