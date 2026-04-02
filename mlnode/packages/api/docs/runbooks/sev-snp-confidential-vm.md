@@ -362,103 +362,103 @@ snpguest verify attestation -p milan ./certs report.bin
 
 ---
 
-## Step 7: Install MLNode Stack (Stages 1-3)
+## Step 7: Install MLNode Stack
 
-### Install Miniconda
-
-```bash
-curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-py312_24.11.1-0-Linux-x86_64.sh -o /tmp/miniconda.sh
-bash /tmp/miniconda.sh -b -p /root/miniconda3
-rm /tmp/miniconda.sh
-export PATH="/root/miniconda3/bin:$PATH"
-```
-
-### Install CUDA Toolkit
-
-```bash
-curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb
-dpkg -i /tmp/cuda-keyring.deb
-apt-get update -qq
-apt-get install -y --no-install-recommends cuda-toolkit-12-8
-```
-
-### Install vLLM 0.15.1 (CPU Build)
-
-```bash
-export PATH="/root/miniconda3/bin:/usr/local/cuda/bin:$PATH"
-pip install --no-cache-dir uv
-uv pip install --python /root/miniconda3/bin/python3.12 'vllm==0.15.1'
-
-# Uninstall GPU vLLM, install CPU PyTorch
-pip uninstall -y vllm
-pip install --no-cache-dir torch==2.9.1+cpu torchvision==0.24.1+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
-
-# Build vLLM CPU from source
-cd /tmp
-git clone https://github.com/vllm-project/vllm.git vllm-build --branch v0.15.1 --depth 1
-cd vllm-build
-sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
-apt-get install -y libnuma-dev
-
-VLLM_TARGET_DEVICE=cpu python3.12 setup.py build_ext --inplace
-VLLM_TARGET_DEVICE=cpu pip wheel --no-deps --no-build-isolation -w /tmp/vllm-wheels .
-pip install --no-deps /tmp/vllm-wheels/vllm-*.whl
-
-# Verify
-python3.12 -c "from vllm.platforms import current_platform; print(f'Platform: {current_platform.device_type}')"
-# Platform: cpu
-```
-
-### Clone gonka MLNode and Run Stages 2-3
+### Clone gonka repo
 
 ```bash
 cd /root
 git clone https://github.com/kaitakuai/gonka.git --branch tee --depth 1
+```
 
-# Stage 2: PoC v2 overlay
-cd /root/gonka/mlnode/packages/api
-dos2unix stage2_poc_patch.sh stage3_mlnode.sh stage3_tee.sh 2>/dev/null
-dos2unix patches/*.sh patches/*.patch 2>/dev/null
-bash stage2_poc_patch.sh
+### Create Python venv and install dependencies
 
-# Stage 3: MLNode API
-bash stage3_mlnode.sh
+> **Important:** Do NOT use `pip install --break-system-packages`. Ubuntu 24.04 has
+> debian-managed packages (typing-extensions, jsonschema, packaging) that cannot be
+> uninstalled via pip. Always use a venv.
 
-# Fix flash-attn (not needed on CPU)
-pip uninstall -y flash-attn
+```bash
+python3 -m venv /opt/mlnode --system-site-packages
+/opt/mlnode/bin/pip install --upgrade pip
+
+# Install MLNode dependencies
+/opt/mlnode/bin/pip install \
+    fastapi uvicorn httpx huggingface-hub \
+    scipy fire toml tenacity \
+    pynacl accelerate h2 nvidia-ml-py
+
+# Install CPU PyTorch
+/opt/mlnode/bin/pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install vLLM build deps + build from source (pip vLLM doesn't support CPU)
+/opt/mlnode/bin/pip install setuptools-scm cmake ninja
+cd /tmp
+git clone https://github.com/vllm-project/vllm.git vllm-build --branch v0.15.1 --depth 1
+cd vllm-build
+sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
+VLLM_TARGET_DEVICE=cpu /opt/mlnode/bin/python3 setup.py build_ext --inplace
+/opt/mlnode/bin/pip wheel --no-deps --no-build-isolation -w /tmp/vllm-wheels .
+/opt/mlnode/bin/pip install --no-deps /tmp/vllm-wheels/vllm-*.whl
+
+# Verify
+/opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; print(current_platform.device_type)"
+# cpu
+/opt/mlnode/bin/python3 -c "from nacl.public import PrivateKey; print('PyNaCl OK')"
+```
+
+> **Note:** On production nodes with GPU, use `pip install vllm==0.15.1` directly
+> (no source build needed) and skip the CPU torch step.
+
+### Set up app directory structure
+
+```bash
+# Create /app layout matching the Dockerfile
+mkdir -p /app/packages
+ln -sf /root/gonka/mlnode/packages/api /app/packages/api
+ln -sf /root/gonka/mlnode/packages/pow /app/packages/pow
+ln -sf /root/gonka/mlnode/packages/train /app/packages/train
+ln -sf /root/gonka/mlnode/packages/common /app/packages/common
 ```
 
 ---
 
-## Step 8: Install TEE Layer (Stage 3.5)
+## Step 8: Verify TEE dependencies
 
 ```bash
-cd /root/gonka/mlnode/packages/api
-bash stage3_tee.sh
+# snpguest should already be installed from Step 6
+source ~/.cargo/env
+snpguest --version
+
+# Make snpguest available system-wide (MLNode runs as root)
+sudo ln -sf $(which snpguest) /usr/local/bin/snpguest
+
+# sev-guest module should already be loaded from Step 6
+ls /dev/sev-guest
+
+# Verify all TEE components
+/opt/mlnode/bin/python3 -c "from nacl.public import PrivateKey; print('PyNaCl OK')"
+/opt/mlnode/bin/python3 -c "import vllm; print(vllm.__version__)"
+snpguest --version
 ```
-
-This installs:
-- PyNaCl for encryption
-- Verifies snpguest is available
-- Loads `sev-guest` kernel module
-
-TEE module (`tee/`) and `app.py` changes are already in the repo.
 
 ---
 
 ## Step 9: Start Confidential MLNode
 
 ```bash
-export PATH="/root/miniconda3/bin:/root/.cargo/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export PYTHONPATH="/app:/app/packages/api/src:/app/packages/pow/src:/app/packages/train/src:/app/packages/common/src"
+export PYTHONPATH="/app/packages/api/src:/app/packages/pow/src:/app/packages/train/src:/app/packages/common/src"
 export VLLM_TARGET_DEVICE=cpu
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_ATTENTION_BACKEND=TORCH_SDPA
 export TEE_ENABLED=1
+export SNPGUEST_PATH=/usr/local/bin/snpguest
+
+# Activate venv
+source /opt/mlnode/bin/activate
 
 # Start vLLM backend
-nohup python3.12 -m vllm.entrypoints.openai.api_server \
+nohup python3 -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-0.5B-Instruct \
     --dtype float32 \
     --max-model-len 512 \
@@ -473,7 +473,7 @@ echo "vLLM ready"
 
 # Start MLNode API with TEE
 cd /app/packages/api/src
-nohup python3.12 -m uvicorn api.app:app \
+nohup python3 -m uvicorn api.app:app \
     --host 0.0.0.0 \
     --port 8080 \
     --log-level warning \
