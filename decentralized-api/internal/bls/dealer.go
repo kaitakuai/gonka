@@ -127,6 +127,11 @@ func (bm *BlsManager) ProcessKeyGenerationInitiated(event *chainevents.JSONRPCRe
 	// Submit dealer part to chain
 	err = bm.cosmosClient.SubmitDealerPart(dealerPart)
 	if err != nil {
+		if isQueuedForRetry(err) {
+			logging.Warn("Dealer part queued for retry", inferenceTypes.BLS,
+				"epochID", epochID, "dealer", bm.cosmosClient.GetAddress(), "error", err)
+			return queuedForRetryError("submit dealer part", err)
+		}
 		return fmt.Errorf("failed to submit dealer part: %w", err)
 	}
 
@@ -201,6 +206,7 @@ func (bm *BlsManager) generateDealerPart(epochID uint64, totalSlots, tDegree uin
 
 	// Create encrypted shares for participants using deterministic array indexing.
 	encryptedSharesForParticipants := make([]types.EncryptedSharesForParticipant, len(participants))
+	openingRecords := make([]dealerOpeningPersistRecord, 0)
 	for i, participant := range participants {
 		// Build encryption key set from on-chain participant snapshot (primary + additional).
 		allowedPubKeys, err := participantAllowedPubKeys(participant)
@@ -242,7 +248,14 @@ func (bm *BlsManager) generateDealerPart(epochID uint64, totalSlots, tDegree uin
 				}
 
 				encryptedShares[int(ciphertextIndex)] = encryptedShare
-				bm.storeDealerOpeningRecord(epochID, uint32(i), ciphertextIndex, slotIndex, shareBytes, seed)
+				openingRecords = append(openingRecords, dealerOpeningPersistRecord{
+					epochID:         epochID,
+					recipientIndex:  uint32(i),
+					ciphertextIndex: ciphertextIndex,
+					slotIndex:       slotIndex,
+					shareBytes:      shareBytes,
+					seed:            seed,
+				})
 				ciphertextIndex++
 			}
 		}
@@ -256,6 +269,10 @@ func (bm *BlsManager) generateDealerPart(epochID uint64, totalSlots, tDegree uin
 			"slotStart", participant.SlotStartIndex, "slotEnd", participant.SlotEndIndex,
 			"numSlots", numSlots, "allowedKeys", len(allowedPubKeys),
 			"totalCiphertexts", len(encryptedShares))
+	}
+
+	if err := bm.storeDealerOpeningRecordsBatch(openingRecords); err != nil {
+		return nil, fmt.Errorf("failed to persist dealer openings for epoch %d: %w", epochID, err)
 	}
 
 	dealerPart := &types.MsgSubmitDealerPart{

@@ -83,14 +83,37 @@ func (bm *BlsManager) ProcessDisputePhaseStarted(event *chainevents.JSONRPCRespo
 		Responses:   responses,
 	}
 	if err := bm.cosmosClient.RespondDealerComplaints(msg); err != nil {
-		logging.Warn(blsLogTag+"Failed to submit dealer complaint responses on dispute start", inferenceTypes.BLS,
+		if isQueuedForRetry(err) {
+			logging.Warn(blsLogTag+"Dealer complaint responses queued for retry", inferenceTypes.BLS,
+				"epochID", epochID, "dealerIndex", dealerIndex, "responses", len(responses), "error", err)
+			return queuedForRetryError("respond dealer complaints", err)
+		}
+		logging.Error(blsLogTag+"Failed to submit dealer complaint responses on dispute start", inferenceTypes.BLS,
 			"epochID", epochID, "dealerIndex", dealerIndex, "responses", len(responses), "error", err)
-		return nil
+		return fmt.Errorf("failed to submit dealer complaint responses for epoch %d dealer %d: %w", epochID, dealerIndex, err)
 	}
 
 	logging.Info(blsLogTag+"Submitted dealer complaint responses on dispute start", inferenceTypes.BLS,
 		"epochID", epochID, "dealerIndex", dealerIndex, "submittedResponses", len(responses))
 
+	return nil
+}
+
+func (bm *BlsManager) ProcessDKGFailed(event *chainevents.JSONRPCResponse) error {
+	epochIDStr, err := bm.extractEventString(event, "inference.bls.EventDKGFailed.epoch_id")
+	if err != nil {
+		return fmt.Errorf("failed to extract failed DKG epoch id: %w", err)
+	}
+	epochID, err := strconv.ParseUint(epochIDStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse failed DKG epoch id %q: %w", epochIDStr, err)
+	}
+
+	if err := bm.deleteDealerOpeningsForEpoch(epochID); err != nil {
+		return fmt.Errorf("failed to delete dealer openings for failed epoch %d: %w", epochID, err)
+	}
+	bm.cache.Delete(epochID)
+	logging.Info(blsLogTag+"Cleaned dealer openings after DKG failure", inferenceTypes.BLS, "epochID", epochID)
 	return nil
 }
 

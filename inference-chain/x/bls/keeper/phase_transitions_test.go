@@ -429,15 +429,10 @@ func TestDetermineValidDealersWithConsensus(t *testing.T) {
 	validDealers, err := k.DetermineValidDealersWithConsensus(&epochBLSData)
 	require.NoError(t, err)
 
-	// Expected results:
-	// Majority is measured against all participants (5), not just submitters (3):
-	// required approvals = floor(5/2)+1 = 3.
-	// Dealer 0: 3 approvals -> VALID
-	// Dealer 1: 2 approvals -> INVALID
-	// Dealer 2: 2 approvals -> INVALID
-	// Dealer 3: 1 approval -> INVALID
-	// Dealer 4: 0 approvals -> INVALID
-	expectedValidDealers := []bool{true, false, false, false, false}
+	// Expected results under slot-weighted quorum excluding dealer self.
+	// With only participants 0..2 submitting, dealer 0 only gets votes from 1 and 2.
+	// That covers 40/100 slots, which is below >50%.
+	expectedValidDealers := []bool{false, false, false, false, false}
 	require.Equal(t, expectedValidDealers, validDealers)
 }
 
@@ -465,6 +460,28 @@ func TestDetermineValidDealersWithConsensus_TieVotes(t *testing.T) {
 	require.Equal(t, expectedValidDealers, validDealers)
 }
 
+func TestDetermineValidDealersWithConsensus_DealerOwnsExactlyHalfSlots(t *testing.T) {
+	k, _ := keepertest.BlsKeeper(t)
+
+	// 2 participants -> each gets exactly 50/100 slots in the fixture.
+	epochBLSData := createTestEpochBLSData(uint64(30), 2)
+
+	// Both participants submitted dealer parts.
+	epochBLSData.DealerParts[0].DealerAddress = "participant1"
+	epochBLSData.DealerParts[0].Commitments = [][]byte{createTestG2Commitment()}
+	epochBLSData.DealerParts[1].DealerAddress = "participant2"
+	epochBLSData.DealerParts[1].Commitments = [][]byte{createTestG2Commitment()}
+
+	// Everyone votes "true" for dealer 0 (including dealer 0 itself).
+	// Because self vote is excluded, dealer 0 can only get 50 non-self slots, while quorum is 51.
+	epochBLSData.VerificationSubmissions[0].DealerValidity = []bool{true, false}
+	epochBLSData.VerificationSubmissions[1].DealerValidity = []bool{true, true}
+
+	validDealers, err := k.DetermineValidDealersWithConsensus(&epochBLSData)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false, false}, validDealers)
+}
+
 func TestDetermineValidDealersWithConsensus_ShortVectorsCountAsNo(t *testing.T) {
 	k, _ := keepertest.BlsKeeper(t)
 
@@ -484,10 +501,8 @@ func TestDetermineValidDealersWithConsensus_ShortVectorsCountAsNo(t *testing.T) 
 	validDealers, err := k.DetermineValidDealersWithConsensus(&epochBLSData)
 	require.NoError(t, err)
 
-	// Need 2 of 3 approvals:
-	// Dealer 0 gets approvals from verifiers 0 and 1 => VALID
-	// Dealers 1 and 2 only have verifier 0 approval => INVALID
-	expectedValidDealers := []bool{true, false, false}
+	// Under slot-weighted quorum excluding dealer self, dealer 0 only gets 33/100 slots.
+	expectedValidDealers := []bool{false, false, false}
 	require.Equal(t, expectedValidDealers, validDealers)
 }
 
@@ -526,9 +541,10 @@ func TestProcessDKGPhaseTransitionForEpoch_VerifyingToCompleted(t *testing.T) {
 	epochBLSData.DealerParts[1].DealerAddress = "participant2"
 	epochBLSData.DealerParts[1].Commitments = [][]byte{testCommitment}
 
-	// Set up verification submissions for first 2 participants (sufficient)
+	// Set up verification submissions so both dealers pass slot-weighted quorum
 	epochBLSData.VerificationSubmissions[0].DealerValidity = []bool{true, true, false}
 	epochBLSData.VerificationSubmissions[1].DealerValidity = []bool{true, true, false}
+	epochBLSData.VerificationSubmissions[2].DealerValidity = []bool{true, true, false}
 
 	k.SetEpochBLSData(ctx, epochBLSData)
 	k.SetActiveEpochID(ctx, epochID)

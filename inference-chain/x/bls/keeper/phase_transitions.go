@@ -336,7 +336,7 @@ func (k Keeper) CalculateSlotsWithVerificationVectors(epochBLSData *types.EpochB
 	return totalSlots
 }
 
-// DetermineValidDealersWithConsensus determines which dealers are valid based on majority consensus from verification vectors
+// DetermineValidDealersWithConsensus determines which dealers are valid under weighted slot quorum
 func (k Keeper) DetermineValidDealersWithConsensus(epochBLSData *types.EpochBLSData) ([]bool, error) {
 	participantCount := len(epochBLSData.Participants)
 	if participantCount == 0 {
@@ -344,32 +344,62 @@ func (k Keeper) DetermineValidDealersWithConsensus(epochBLSData *types.EpochBLSD
 	}
 
 	validDealers := make([]bool, participantCount)
-	requiredApprovals := participantCount/2 + 1
+	totalSlots := uint64(epochBLSData.ITotalSlots)
+	quorumSlots := totalSlots/2 + 1
 
-	// For each dealer, count approvals against a fixed denominator of all participants.
-	// Missing verification submissions or short DealerValidity vectors are treated as "no" votes.
 	for dealerIndex := 0; dealerIndex < participantCount; dealerIndex++ {
-		validVotes := 0
-
-		// Count approvals from all participants.
-		for verifierIndex := 0; verifierIndex < participantCount; verifierIndex++ {
-			if verifierIndex >= len(epochBLSData.VerificationSubmissions) {
-				continue
-			}
-			verification := epochBLSData.VerificationSubmissions[verifierIndex]
-			if verification == nil || dealerIndex >= len(verification.DealerValidity) {
-				continue
-			}
-			if verification.DealerValidity[dealerIndex] {
-				validVotes++
-			}
+		dealerParticipant := epochBLSData.Participants[dealerIndex]
+		if dealerParticipant.SlotEndIndex < dealerParticipant.SlotStartIndex {
+			return nil, fmt.Errorf("invalid slot range for dealer %d in epoch %d", dealerIndex, epochBLSData.EpochId)
+		}
+		dealerOwnSlots := uint64(dealerParticipant.SlotEndIndex-dealerParticipant.SlotStartIndex) + 1
+		dealerOwnSlotsAtLeastHalf := totalSlots > 0 && dealerOwnSlots*2 >= totalSlots
+		maxPossibleNonSelfVotingSlots := uint64(0)
+		if dealerOwnSlots <= totalSlots {
+			maxPossibleNonSelfVotingSlots = totalSlots - dealerOwnSlots
 		}
 
-		// Dealer is valid if strict majority of all participants approve.
-		dealerIsValid := validVotes >= requiredApprovals
+		var validVotingSlotsExcludingDealer uint64
+
+		for verifierIndex, verification := range epochBLSData.VerificationSubmissions {
+			if verification == nil || len(verification.DealerValidity) == 0 {
+				continue
+			}
+			if verifierIndex >= participantCount {
+				continue
+			}
+			if verifierIndex == dealerIndex {
+				continue
+			}
+			if dealerIndex >= len(verification.DealerValidity) || !verification.DealerValidity[dealerIndex] {
+				continue
+			}
+
+			participant := epochBLSData.Participants[verifierIndex]
+			if participant.SlotEndIndex < participant.SlotStartIndex {
+				return nil, fmt.Errorf("invalid slot range for participant %d in epoch %d", verifierIndex, epochBLSData.EpochId)
+			}
+			verifierSlots := uint64(participant.SlotEndIndex-participant.SlotStartIndex) + 1
+			validVotingSlotsExcludingDealer += verifierSlots
+		}
+
+		dealerIsValid := totalSlots > 0 && validVotingSlotsExcludingDealer >= quorumSlots
 		dealerSubmittedParts := dealerIndex < len(epochBLSData.DealerParts) &&
 			epochBLSData.DealerParts[dealerIndex] != nil &&
-			epochBLSData.DealerParts[dealerIndex].DealerAddress != ""
+			epochBLSData.DealerParts[dealerIndex].DealerAddress != "" &&
+			len(epochBLSData.DealerParts[dealerIndex].Commitments) > 0
+
+		if dealerSubmittedParts && totalSlots > 0 && maxPossibleNonSelfVotingSlots < quorumSlots {
+			k.Logger().Warn("Dealer cannot reach weighted quorum with self-vote excluded",
+				"epochId", epochBLSData.EpochId,
+				"dealerIndex", dealerIndex,
+				"dealerOwnSlots", dealerOwnSlots,
+				"dealerOwnSlotsAtLeastHalf", dealerOwnSlotsAtLeastHalf,
+				"maxNonSelfVotingSlots", maxPossibleNonSelfVotingSlots,
+				"quorumSlots", quorumSlots,
+				"totalSlots", totalSlots,
+				"receivedVotingSlotsExcludingDealer", validVotingSlotsExcludingDealer)
+		}
 
 		validDealers[dealerIndex] = dealerIsValid && dealerSubmittedParts
 	}

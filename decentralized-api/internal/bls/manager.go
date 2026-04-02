@@ -2,6 +2,8 @@ package bls
 
 import (
 	"context"
+	"database/sql"
+	"decentralized-api/apiconfig"
 	"decentralized-api/cosmosclient"
 	"decentralized-api/internal/event_listener/chainevents"
 	"decentralized-api/logging"
@@ -13,10 +15,13 @@ import (
 	"github.com/productscience/inference/x/bls/types"
 	inferenceTypes "github.com/productscience/inference/x/inference/types"
 	"golang.org/x/sync/singleflight"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
-	blsLogTag = "BLS Manager: "
+	blsLogTag           = "BLS Manager: "
+	blsQueryMaxAttempts = 4
 )
 
 // BlsManager handles all BLS operations including DKG dealing, verification, and group key validation
@@ -28,6 +33,7 @@ type BlsManager struct {
 	maxCacheSize     uint64
 	dealerOpeningsMu sync.RWMutex
 	dealerOpenings   map[dealerOpeningKey]dealerOpeningRecord
+	dealerOpeningsDB *sql.DB
 }
 
 // VerificationResult holds the results of DKG verification for an epoch
@@ -35,6 +41,7 @@ type VerificationResult struct {
 	EpochID           uint64
 	DkgPhase          types.DKGPhase // The DKG phase when verification was performed
 	IsParticipant     bool
+	ParticipantIndex  int            // our index in the participants list (-1 if not a participant)
 	SlotRange         [2]uint32      // [start_index, end_index]
 	DealerShares      [][]fr.Element // dealer_index -> [slot_shares...]
 	DealerValidity    []bool         // dealer_index -> validity
@@ -59,6 +66,15 @@ type dealerOpeningRecord struct {
 	slotIndex  uint32
 	shareBytes []byte
 	seed       []byte
+}
+
+type dealerOpeningPersistRecord struct {
+	epochID         uint64
+	recipientIndex  uint32
+	ciphertextIndex uint32
+	slotIndex       uint32
+	shareBytes      []byte
+	seed            []byte
 }
 
 // VerificationCache manages verification results for multiple epochs
@@ -102,6 +118,12 @@ func (vc *VerificationCache) Get(epochID uint64) *VerificationResult {
 	vc.RLock()
 	defer vc.RUnlock()
 	return vc.results[epochID]
+}
+
+func (vc *VerificationCache) Delete(epochID uint64) {
+	vc.Lock()
+	defer vc.Unlock()
+	delete(vc.results, epochID)
 }
 
 func (vc *VerificationCache) GetCurrent() *VerificationResult {
@@ -155,6 +177,32 @@ func NewBlsManager(cosmosClient cosmosclient.InferenceCosmosClient) *BlsManager 
 		cache:          NewVerificationCache(),
 		dealerOpenings: make(map[dealerOpeningKey]dealerOpeningRecord),
 	}
+}
+
+func (bm *BlsManager) SetDealerOpeningsDB(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	openings, err := apiconfig.ReadBLSDealerOpenings(context.Background(), db)
+	if err != nil {
+		return err
+	}
+	bm.dealerOpeningsMu.Lock()
+	bm.dealerOpeningsDB = db
+	for _, opening := range openings {
+		key := dealerOpeningKey{
+			epochID:         opening.EpochID,
+			recipientIndex:  opening.RecipientIndex,
+			ciphertextIndex: opening.CiphertextIndex,
+		}
+		bm.dealerOpenings[key] = dealerOpeningRecord{
+			slotIndex:  opening.SlotIndex,
+			shareBytes: append([]byte(nil), opening.ShareBytes...),
+			seed:       append([]byte(nil), opening.Seed...),
+		}
+	}
+	bm.dealerOpeningsMu.Unlock()
+	return nil
 }
 
 // ensureConsensusSharesComplete enforces fail-closed signing semantics:
@@ -217,10 +265,7 @@ func (bm *BlsManager) GetOrRecoverVerificationResult(epochID uint64) (*Verificat
 		ctx, cancel := context.WithTimeout(bm.ctx, 60*time.Second)
 		defer cancel()
 
-		blsQueryClient := bm.cosmosClient.NewBLSQueryClient()
-		res, err := blsQueryClient.EpochBLSData(ctx, &types.QueryEpochBLSDataRequest{
-			EpochId: epochID,
-		})
+		res, err := bm.queryEpochBLSDataWithRetry(ctx, epochID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query epoch data: %w", err)
 		}
@@ -240,6 +285,29 @@ func (bm *BlsManager) GetOrRecoverVerificationResult(epochID uint64) (*Verificat
 		return nil, err
 	}
 	return bm.cache.Get(epochID), nil
+}
+
+func (bm *BlsManager) queryEpochBLSDataWithRetry(parentCtx context.Context, epochID uint64) (*types.QueryEpochBLSDataResponse, error) {
+	blsQueryClient := bm.cosmosClient.NewBLSQueryClient()
+	var lastErr error
+	for attempt := 1; attempt <= blsQueryMaxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(parentCtx, 20*time.Second)
+		res, err := blsQueryClient.EpochBLSData(callCtx, &types.QueryEpochBLSDataRequest{EpochId: epochID})
+		cancel()
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		code := status.Code(err)
+		if code == codes.NotFound || code == codes.InvalidArgument || code == codes.PermissionDenied || code == codes.Unimplemented {
+			return nil, err
+		}
+		if attempt == blsQueryMaxAttempts {
+			break
+		}
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+	}
+	return nil, lastErr
 }
 
 // storeVerificationResult stores a verification result in the cache
@@ -276,20 +344,62 @@ func (bm *BlsManager) ProcessGroupPublicKeyGenerated(event *chainevents.JSONRPCR
 	return nil
 }
 
-func (bm *BlsManager) storeDealerOpeningRecord(epochID uint64, recipientIndex, ciphertextIndex, slotIndex uint32, shareBytes, seed []byte) {
-	bm.dealerOpeningsMu.Lock()
-	defer bm.dealerOpeningsMu.Unlock()
+func (bm *BlsManager) storeDealerOpeningRecord(epochID uint64, recipientIndex, ciphertextIndex, slotIndex uint32, shareBytes, seed []byte) error {
+	return bm.storeDealerOpeningRecordsBatch([]dealerOpeningPersistRecord{
+		{
+			epochID:         epochID,
+			recipientIndex:  recipientIndex,
+			ciphertextIndex: ciphertextIndex,
+			slotIndex:       slotIndex,
+			shareBytes:      shareBytes,
+			seed:            seed,
+		},
+	})
+}
 
-	key := dealerOpeningKey{
-		epochID:         epochID,
-		recipientIndex:  recipientIndex,
-		ciphertextIndex: ciphertextIndex,
+func (bm *BlsManager) storeDealerOpeningRecordsBatch(records []dealerOpeningPersistRecord) error {
+	if len(records) == 0 {
+		return nil
 	}
-	bm.dealerOpenings[key] = dealerOpeningRecord{
-		slotIndex:  slotIndex,
-		shareBytes: append([]byte(nil), shareBytes...),
-		seed:       append([]byte(nil), seed...),
+
+	openings := make([]apiconfig.BLSDealerOpening, 0, len(records))
+	for _, record := range records {
+		openings = append(openings, apiconfig.BLSDealerOpening{
+			EpochID:         record.epochID,
+			RecipientIndex:  record.recipientIndex,
+			CiphertextIndex: record.ciphertextIndex,
+			SlotIndex:       record.slotIndex,
+			ShareBytes:      append([]byte(nil), record.shareBytes...),
+			Seed:            append([]byte(nil), record.seed...),
+		})
 	}
+
+	bm.dealerOpeningsMu.RLock()
+	db := bm.dealerOpeningsDB
+	bm.dealerOpeningsMu.RUnlock()
+
+	// Persist first to keep SQLite and in-memory cache consistent.
+	if db != nil {
+		if err := apiconfig.UpsertBLSDealerOpenings(context.Background(), db, openings); err != nil {
+			return err
+		}
+	}
+
+	bm.dealerOpeningsMu.Lock()
+	for _, opening := range openings {
+		key := dealerOpeningKey{
+			epochID:         opening.EpochID,
+			recipientIndex:  opening.RecipientIndex,
+			ciphertextIndex: opening.CiphertextIndex,
+		}
+		bm.dealerOpenings[key] = dealerOpeningRecord{
+			slotIndex:  opening.SlotIndex,
+			shareBytes: append([]byte(nil), opening.ShareBytes...),
+			seed:       append([]byte(nil), opening.Seed...),
+		}
+	}
+	bm.dealerOpeningsMu.Unlock()
+	return nil
 }
 
 func (bm *BlsManager) getDealerOpeningRecord(epochID uint64, recipientIndex, ciphertextIndex uint32) (dealerOpeningRecord, bool) {
@@ -304,12 +414,22 @@ func (bm *BlsManager) getDealerOpeningRecord(epochID uint64, recipientIndex, cip
 	return record, ok
 }
 
-func (bm *BlsManager) deleteDealerOpeningsForEpoch(epochID uint64) {
+func (bm *BlsManager) deleteDealerOpeningsForEpoch(epochID uint64) error {
+	bm.dealerOpeningsMu.RLock()
+	db := bm.dealerOpeningsDB
+	bm.dealerOpeningsMu.RUnlock()
+	if db != nil {
+		if err := apiconfig.DeleteBLSDealerOpeningsByEpoch(context.Background(), db, epochID); err != nil {
+			return err
+		}
+	}
+
 	bm.dealerOpeningsMu.Lock()
-	defer bm.dealerOpeningsMu.Unlock()
 	for key := range bm.dealerOpenings {
 		if key.epochID == epochID {
 			delete(bm.dealerOpenings, key)
 		}
 	}
+	bm.dealerOpeningsMu.Unlock()
+	return nil
 }

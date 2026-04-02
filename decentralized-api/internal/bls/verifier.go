@@ -101,7 +101,8 @@ func (bm *BlsManager) ProcessVerifyingPhaseStarted(event *chainevents.JSONRPCRes
 func (bm *BlsManager) setupAndPerformVerification(epochID uint64, epochData *types.EpochBLSData) (bool, error) {
 	// Create new verification result for this epoch
 	verificationResult := &VerificationResult{
-		EpochID: epochID,
+		EpochID:          epochID,
+		ParticipantIndex: -1,
 	}
 
 	verificationResult.DkgPhase = epochData.DkgPhase
@@ -141,6 +142,7 @@ func (bm *BlsManager) setupAndPerformVerification(epochID uint64, epochData *typ
 
 	// Set participant info in verification result
 	verificationResult.IsParticipant = true
+	verificationResult.ParticipantIndex = myParticipantIndex
 	verificationResult.SlotRange = [2]uint32{myParticipant.SlotStartIndex, myParticipant.SlotEndIndex}
 
 	logging.Debug(verifierLogTag+"Found participant info from epoch data", inferenceTypes.BLS,
@@ -608,16 +610,28 @@ func (bm *BlsManager) submitVerificationVectorSimplified(epochID uint64) error {
 
 	logging.Debug(verifierLogTag+"Submitting verification vector", inferenceTypes.BLS, "epochID", epochID)
 
-	// Submit the verification vector using the dealer validity we already determined
-	msg := &types.MsgSubmitVerificationVector{
-		Creator:          bm.cosmosClient.GetAccountAddress(),
-		EpochId:          epochID,
-		DealerValidity:   verificationResult.DealerValidity,
-		DealerComplaints: bm.buildDealerComplaintsFromEvidence(verificationResult),
+	dealerValidityProofs, err := bm.buildDealerValidityProofs(epochID, verificationResult)
+	if err != nil {
+		return fmt.Errorf("failed to build dealer validity proofs: %w", err)
 	}
 
-	_, err := bm.cosmosClient.SubmitVerificationVector(msg)
+	// Submit the verification vector using the dealer validity we already determined
+	msg := &types.MsgSubmitVerificationVector{
+		Creator:              bm.cosmosClient.GetAccountAddress(),
+		EpochId:              epochID,
+		DealerValidity:       verificationResult.DealerValidity,
+		DealerComplaints:     bm.buildDealerComplaintsFromEvidence(verificationResult),
+		DealerValidityProofs: dealerValidityProofs,
+	}
+
+	_, err = bm.cosmosClient.SubmitVerificationVector(msg)
 	if err != nil {
+		if isQueuedForRetry(err) {
+			logging.Warn(verifierLogTag+"Verification vector queued for retry", inferenceTypes.BLS,
+				"epochID", epochID,
+				"error", err)
+			return queuedForRetryError("submit verification vector", err)
+		}
 		return fmt.Errorf("failed to submit verification vector: %w", err)
 	}
 
@@ -649,6 +663,49 @@ func (bm *BlsManager) buildDealerComplaintsFromEvidence(result *VerificationResu
 		})
 	}
 	return complaints
+}
+
+func (bm *BlsManager) buildDealerValidityProofs(epochID uint64, verificationResult *VerificationResult) ([]types.DealerValidityProof, error) {
+	if verificationResult.SlotRange[1] < verificationResult.SlotRange[0] {
+		return nil, fmt.Errorf("invalid slot range: %d-%d", verificationResult.SlotRange[0], verificationResult.SlotRange[1])
+	}
+
+	expectedSlots := int(verificationResult.SlotRange[1]-verificationResult.SlotRange[0]) + 1
+	proofs := make([]types.DealerValidityProof, 0, countTrueValues(verificationResult.DealerValidity))
+
+	for dealerIndex, isValid := range verificationResult.DealerValidity {
+		if !isValid {
+			continue
+		}
+		// Self-vote is excluded from weighted quorum on-chain, so skip proof generation for ourselves
+		if dealerIndex == verificationResult.ParticipantIndex {
+			continue
+		}
+
+		if dealerIndex >= len(verificationResult.DealerShares) {
+			return nil, fmt.Errorf("missing dealer shares for dealer %d", dealerIndex)
+		}
+
+		dealerShares := verificationResult.DealerShares[dealerIndex]
+		if len(dealerShares) != expectedSlots {
+			return nil, fmt.Errorf("dealer %d shares count mismatch: got %d expected %d", dealerIndex, len(dealerShares), expectedSlots)
+		}
+
+		proofHash := types.BuildDealerValidityProofHash(epochID, uint32(dealerIndex))
+		proofSignature, err := bm.computePartialSignatureBlst(proofHash, &VerificationResult{
+			AggregatedShares: dealerShares,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to compute proof signature for dealer %d: %w", dealerIndex, err)
+		}
+
+		proofs = append(proofs, types.DealerValidityProof{
+			DealerIndex:    uint32(dealerIndex),
+			ProofSignature: proofSignature,
+		})
+	}
+
+	return proofs, nil
 }
 
 // countTrueValues counts the number of true values in a boolean slice
@@ -774,7 +831,9 @@ func (bm *BlsManager) ProcessGroupPublicKeyGeneratedToVerify(event *chainevents.
 		"phase", completedResult.DkgPhase)
 
 	// Opening material is only needed through disputing phase.
-	bm.deleteDealerOpeningsForEpoch(epochID)
+	if err := bm.deleteDealerOpeningsForEpoch(epochID); err != nil {
+		return fmt.Errorf("failed to clean dealer openings for epoch %d: %w", epochID, err)
+	}
 
 	return nil
 }
