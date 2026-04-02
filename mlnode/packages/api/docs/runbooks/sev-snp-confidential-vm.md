@@ -8,7 +8,7 @@ Implements [Gonka TEE Proposal #951](https://github.com/gonka-ai/gonka/discussio
 **Host:** Ubuntu 24.04 LTS, kernel 6.14.0-37-generic
 **CPU:** AMD EPYC 7443P 24-Core (Milan, SP3 socket)
 **Guest:** Ubuntu 24.04 cloud image, kernel 6.8.0-106-generic
-**Code:** [kaitakuai/rtx-pro-6000 feat/tee](https://github.com/kaitakuai/rtx-pro-6000/tree/feat/tee)
+**Code:** [kaitakuai/gonka tee](https://github.com/kaitakuai/gonka/tree/tee/mlnode)
 
 ---
 
@@ -410,15 +410,15 @@ python3.12 -c "from vllm.platforms import current_platform; print(f'Platform: {c
 # Platform: cpu
 ```
 
-### Clone rtx-pro-6000 and Run Stages 2-3
+### Clone gonka MLNode and Run Stages 2-3
 
 ```bash
 cd /root
-git clone https://github.com/kaitakuai/rtx-pro-6000.git --recursive --branch feat/tee
+git clone https://github.com/kaitakuai/gonka.git --branch tee --depth 1
 
 # Stage 2: PoC v2 overlay
-cd /root/rtx-pro-6000
-dos2unix stage2_poc_patch.sh stage3_mlnode.sh stage3_tee.sh
+cd /root/gonka/mlnode/packages/api
+dos2unix stage2_poc_patch.sh stage3_mlnode.sh stage3_tee.sh 2>/dev/null
 dos2unix patches/*.sh patches/*.patch 2>/dev/null
 bash stage2_poc_patch.sh
 
@@ -434,15 +434,16 @@ pip uninstall -y flash-attn
 ## Step 8: Install TEE Layer (Stage 3.5)
 
 ```bash
-cd /root/rtx-pro-6000
+cd /root/gonka/mlnode/packages/api
 bash stage3_tee.sh
 ```
 
 This installs:
-- `tee/` module into `/app/packages/api/src/api/tee/`
-- `app_tee.py` as the new `app.py` (with TEE init)
 - PyNaCl for encryption
+- Verifies snpguest is available
 - Loads `sev-guest` kernel module
+
+TEE module (`tee/`) and `app.py` changes are already in the repo.
 
 ---
 
@@ -496,7 +497,7 @@ From the host (or any machine that can reach port 8080):
 
 ```bash
 pip3 install pynacl httpx
-python3 /root/rtx-pro-6000/client/tee_client.py --url http://127.0.0.1:8080 --prompt "What is TEE?"
+python3 /root/gonka/mlnode/packages/api/client/tee_client.py --url http://127.0.0.1:8080 --prompt "What is TEE?"
 ```
 
 Expected output:
