@@ -4,11 +4,28 @@ Complete guide to deploy a Confidential MLNode with AMD SEV-SNP, E2E encrypted i
 
 Implements [Gonka TEE Proposal #951](https://github.com/gonka-ai/gonka/discussions/951).
 
-**Tested on:** 2026-03-27
+**Tested on:** 2026-04-03
 **Host:** Ubuntu 24.04 LTS, kernel 6.14.0-37-generic
 **CPU:** AMD EPYC 7443P 24-Core (Milan, SP3 socket)
 **Guest:** Ubuntu 24.04 cloud image, kernel 6.8.0-106-generic
-**Code:** [kaitakuai/gonka tee](https://github.com/kaitakuai/gonka/tree/tee/mlnode)
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Step 1: Install Host Packages](#step-1-install-host-packages)
+- [Step 2: Build QEMU 9.2 with SEV-SNP Support](#step-2-build-qemu-92-with-sev-snp-support)
+- [Step 3: Build OVMF (AmdSev Platform)](#step-3-build-ovmf-amdsev-platform)
+- [Step 4: Prepare Guest VM Image](#step-4-prepare-guest-vm-image)
+- [Step 5: Launch SEV-SNP Guest VM](#step-5-launch-sev-snp-guest-vm)
+- [Step 6: Verify SEV-SNP Inside Guest](#step-6-verify-sev-snp-inside-guest)
+- [Step 7: Install MLNode Stack](#step-7-install-mlnode-stack)
+- [Step 8: Verify TEE Dependencies](#step-8-verify-tee-dependencies)
+- [Step 9: Start Confidential MLNode](#step-9-start-confidential-mlnode)
+- [Step 10: Test E2E Encrypted Inference](#step-10-test-e2e-encrypted-inference)
+- [Verify Host Cannot Read VM Memory](#verify-host-cannot-read-vm-memory)
+- [Troubleshooting](#troubleshooting)
+- [Architecture](#architecture)
+- [Security Properties](#security-properties)
 
 ---
 
@@ -21,43 +38,55 @@ Implements [Gonka TEE Proposal #951](https://github.com/gonka-ai/gonka/discussio
 - **RAM:** 64 GB recommended (16 GB allocated to guest)
 - **Storage:** 60+ GB free disk space
 - **BIOS/UEFI:** Full BMC/IPMI access required for BIOS changes
+- **Access:** Root access on the server. All commands below assume you are root (`sudo -i`). Commands inside the guest VM use `sudo` explicitly.
 
 ### BIOS Settings (via BMC/IPMI)
 
-Navigate to **Advanced > CPU Configuration** and set:
-- **SVM Mode** → Enabled
-- **SMEE** → Enabled
-- **SEV ASID Count** → configured
-- **SEV-ES ASID Space Limit Control** → Manual (99)
-- **SNP Memory (RMP Table) Coverage** → Enabled
+Open your server's BMC/IPMI web interface and enter BIOS Setup.
 
-Navigate to **Advanced > North Bridge Configuration** and set:
-- **IOMMU** → Enabled
-- **SEV-SNP Support** → Enabled
+> Screenshots below are from AMI BIOS on a Supermicro board. Your BIOS may look different, but the setting names are the same.
 
-Reboot the server after BIOS changes.
+**Advanced → CPU Configuration:**
+
+![CPU Configuration](images/01-cpu-configuration.png)
+
+| Setting | Set to |
+|---------|--------|
+| SMEE | **Enabled** |
+| SEV-ES ASID Space Limit Control | **Manual** |
+| SEV-ES ASID Space Limit | **99** |
+| SNP Memory (RMP Table) Coverage | **Enabled** |
+| SVM Mode | **Enabled** |
+
+**Advanced → North Bridge Configuration:**
+
+![North Bridge Configuration](images/02-north-bridge.png)
+
+| Setting | Set to |
+|---------|--------|
+| IOMMU | **Enabled** |
+| SEV-SNP Support | **Enabled** |
+
+**Save & Exit** to reboot with new settings.
 
 ### Verify SEV-SNP on Host
 
 ```bash
-dmesg | grep -i sev
+[ -c /dev/sev ] && echo "SEV device: OK" || echo "SEV device: MISSING"
+dmesg | grep -q "SEV-SNP" && echo "SEV-SNP: OK" || echo "SEV-SNP: MISSING"
+dmesg | grep -q "RMP table" && echo "RMP table: OK" || echo "RMP table: MISSING"
+dmesg | grep -q "SNP enabled" && echo "IOMMU SNP: OK" || echo "IOMMU SNP: MISSING"
 ```
 
 Expected output:
 ```
-SEV-SNP: RMP table physical range [0x0000000097900000 - 0x00000000a7efffff]
-ccp 0000:45:00.1: sev enabled
-ccp 0000:45:00.1: SEV-SNP API:1.55 build:29
-kvm_amd: SEV enabled (ASIDs 100 - 509)
-kvm_amd: SEV-ES enabled (ASIDs 1 - 99)
-kvm_amd: SEV-SNP enabled (ASIDs 1 - 99)
+SEV device: OK
+SEV-SNP: OK
+RMP table: OK
+IOMMU SNP: OK
 ```
 
-Also verify:
-```bash
-ls /dev/sev         # Should exist
-cat /sys/module/kvm_amd/parameters/sev_snp  # Should be Y
-```
+If any line says **MISSING**, see [Troubleshooting](#troubleshooting) below.
 
 ---
 
@@ -368,6 +397,7 @@ snpguest verify attestation -p milan ./certs report.bin
 
 ```bash
 cd /root
+# Clone the TEE branch (will be merged to main after review)
 git clone https://github.com/kaitakuai/gonka.git --branch tee --depth 1
 ```
 
@@ -431,7 +461,7 @@ source ~/.cargo/env
 snpguest --version
 
 # Make snpguest available system-wide (MLNode runs as root)
-sudo ln -sf $(which snpguest) /usr/local/bin/snpguest
+ln -sf $(which snpguest) /usr/local/bin/snpguest
 
 # sev-guest module should already be loaded from Step 6
 ls /dev/sev-guest
@@ -532,29 +562,28 @@ Expected output:
 
 Write a secret inside the guest, then try to find it from the host:
 
+**Inside guest** — write a secret to memory and keep the process alive:
+
 ```bash
-# Inside guest:
 python3 -c "
-import ctypes
+import ctypes, time
 secret = b'SUPER_SECRET_TEE_KEY_12345678'
 buf = ctypes.create_string_buffer(secret, len(secret))
 print(f'Secret in memory: {secret}')
-import time; time.sleep(30)
+time.sleep(60)
 "
+```
 
-# From host (in parallel):
+**From host** (in a separate terminal, while the guest process is running):
+
+```bash
 QEMU_PID=$(pgrep -f "qemu.*guest.qcow2")
 ADDR=$(cat /proc/$QEMU_PID/maps | grep "memfd:memory-backend-memfd" | head -1 | cut -d'-' -f1)
 
-python3 -c "
-import os
-fd = os.open(f'/proc/$QEMU_PID/mem', os.O_RDONLY)
-os.lseek(fd, 0x$ADDR, os.SEEK_SET)
-data = os.read(fd, 16*1024*1024)
-os.close(fd)
-print(f'Found secret: {data.find(b\"SUPER_SECRET\") != -1}')
-# Expected: False — memory is encrypted
-"
+# Search for the secret in QEMU process memory
+dd if=/proc/$QEMU_PID/mem bs=1M count=16 skip=$((16#$ADDR / 1048576)) 2>/dev/null \
+  | grep -c "SUPER_SECRET"
+# Expected: 0 — memory is encrypted, secret not found
 ```
 
 ---
