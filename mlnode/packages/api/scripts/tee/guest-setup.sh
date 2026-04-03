@@ -112,11 +112,15 @@ setup_app_dir() {
 # ── Step 6: Create venv + install deps ───────────────────────────────────────
 
 install_python_deps() {
+    # Ensure python3-venv is available
+    apt-get install -y python3-venv 2>&1 | tail -2
+
     if [ -f /opt/mlnode/bin/activate ]; then
-        log "venv already exists, checking deps..."
+        log "venv already exists"
     else
         python3 -m venv /opt/mlnode --system-site-packages
     fi
+    [ -f /opt/mlnode/bin/pip ] || die "venv creation failed" "apt install python3-venv and retry"
     /opt/mlnode/bin/pip install --upgrade pip 2>&1 | tail -1
 
     # Install MLNode + TEE deps
@@ -125,6 +129,7 @@ install_python_deps() {
         scipy fire toml tenacity \
         pynacl accelerate h2 nvidia-ml-py 2>&1 | tail -3
 
+    /opt/mlnode/bin/python3 -c "from nacl.public import PrivateKey" || die "PyNaCl not installed"
     log "Python deps installed"
 }
 
