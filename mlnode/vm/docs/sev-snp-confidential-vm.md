@@ -95,7 +95,7 @@ If any line says **MISSING**, see [Troubleshooting](#troubleshooting) below.
 ```bash
 apt update
 apt install -y \
-  qemu-utils cloud-image-utils cpu-checker sshpass \
+  qemu-utils cloud-image-utils cpu-checker \
   git build-essential ninja-build pkg-config \
   libglib2.0-dev libpixman-1-dev libslirp-dev \
   python3-venv python3-pip flex bison iasl nasm \
