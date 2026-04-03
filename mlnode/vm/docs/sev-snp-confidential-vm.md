@@ -203,10 +203,10 @@ export WORKSPACE=/root/edk2
 export EDK_TOOLS_PATH=/root/edk2/BaseTools
 export PATH=$PATH:/root/edk2/BaseTools/BinWrappers/PosixLike
 
-build -a X64 -b DEBUG -t GCC5 -p OvmfPkg/AmdSev/AmdSevX64.dsc -n $(nproc)
+build -a X64 -b RELEASE -t GCC5 -p OvmfPkg/AmdSev/AmdSevX64.dsc -n $(nproc)
 ```
 
-Output: `/root/edk2/Build/AmdSev/DEBUG_GCC5/FV/OVMF.fd` (4 MB)
+Output: `/root/edk2/Build/AmdSev/RELEASE_GCC5/FV/OVMF.fd` (4 MB)
 
 ---
 
@@ -216,8 +216,14 @@ Output: `/root/edk2/Build/AmdSev/DEBUG_GCC5/FV/OVMF.fd` (4 MB)
 
 ```bash
 mkdir -p /root/snp-vm && cd /root/snp-vm
-wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
-  -O ubuntu-24.04-cloud.img
+
+# Pin to a specific release (do not use 'current' — it is a floating pointer)
+UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/noble/20260401/noble-server-cloudimg-amd64.img"
+wget "$UBUNTU_IMAGE_URL" -O ubuntu-24.04-cloud.img
+
+# Verify checksum (update hash when changing image version)
+wget "$(dirname $UBUNTU_IMAGE_URL)/SHA256SUMS" -O SHA256SUMS
+grep "noble-server-cloudimg-amd64.img" SHA256SUMS | sha256sum -c -
 ```
 
 ### Create Guest Disk (60 GB overlay)
@@ -253,9 +259,7 @@ EOF
 
 cat > user-data << 'EOF'
 #cloud-config
-password: snpguest
-chpasswd: { expire: False }
-ssh_pwauth: True
+ssh_pwauth: False
 ssh_authorized_keys:
   - <YOUR_SSH_PUBLIC_KEY_HERE>
 packages:
@@ -279,7 +283,7 @@ cloud-localds cloud-init.iso user-data meta-data
 ### Copy OVMF
 
 ```bash
-cp /root/edk2/Build/AmdSev/DEBUG_GCC5/FV/OVMF.fd ./OVMF_AMDSEV.fd
+cp /root/edk2/Build/AmdSev/RELEASE_GCC5/FV/OVMF.fd ./OVMF_AMDSEV.fd
 ```
 
 ---
@@ -308,8 +312,8 @@ cd /root/snp-vm
   -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080 \
   -device virtio-net-pci,netdev=net0,iommu_platform=on \
   -display none \
-  -serial file:/root/snp-vm/console.log \
-  -monitor unix:/root/snp-vm/monitor.sock,server,nowait \
+  -serial null \
+  -monitor none \
   -daemonize
 ```
 
@@ -328,16 +332,19 @@ cd /root/snp-vm
 | `disable-legacy=on` | Use modern virtio (required for SEV) |
 | `hostfwd=tcp::2222-:22` | Forward host port 2222 to guest SSH |
 | `hostfwd=tcp::8080-:8080` | Forward host port 8080 to MLNode API |
+| `-serial null` | Disable serial console (host cannot read guest output) |
+| `-monitor none` | Disable QEMU monitor (no admin control channel) |
 
 ### Verify Boot
 
 ```bash
-# Watch console output
-tail -f /root/snp-vm/console.log
-
 # Wait ~60s for cloud-init, then SSH in
 ssh -p 2222 ubuntu@localhost
-# Password: snpguest (or use your SSH key)
+# Key-only authentication (no password)
+
+# Tip: if you need console output for debugging, temporarily change
+# -serial null to -serial file:/root/snp-vm/console.log
+# WARNING: serial console is readable by the host operator
 ```
 
 ---
@@ -365,7 +372,7 @@ ls -la /dev/sev-guest
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source ~/.cargo/env
-cargo install snpguest
+cargo install snpguest --version 0.10.0 --locked
 ```
 
 ### Verify Attestation
@@ -410,11 +417,11 @@ git clone https://github.com/kaitakuai/gonka.git --branch tee --depth 1
 python3 -m venv /opt/mlnode --system-site-packages
 /opt/mlnode/bin/pip install --upgrade pip
 
-# Install MLNode dependencies
+# Install MLNode dependencies (versions pinned for reproducibility)
 /opt/mlnode/bin/pip install \
-    fastapi uvicorn httpx huggingface-hub \
-    scipy fire toml tenacity \
-    pynacl accelerate h2 nvidia-ml-py
+    fastapi==0.115.0 uvicorn==0.30.6 httpx==0.27.2 huggingface-hub==0.25.2 \
+    scipy==1.14.1 fire==0.7.0 toml==0.10.2 tenacity==9.0.0 \
+    pynacl==1.5.0 accelerate==1.0.1 h2==4.1.0 nvidia-ml-py==12.560.30
 
 # Install CPU PyTorch
 /opt/mlnode/bin/pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
@@ -438,6 +445,18 @@ VLLM_TARGET_DEVICE=cpu /opt/mlnode/bin/python3 setup.py build_ext --inplace
 
 > **Note:** On production nodes with GPU, use `pip install vllm==0.15.1` directly
 > (no source build needed) and skip the CPU torch step.
+
+### Clean up build artifacts
+
+For production images, remove build toolchain and caches to reduce attack surface:
+
+```bash
+apt-get purge -y build-essential cmake pkg-config libssl-dev libnuma-dev
+apt-get autoremove -y
+rm -rf /tmp/vllm-build /tmp/vllm-wheels
+rm -rf ~/.cargo ~/.rustup
+rm -rf /root/gonka/.git
+```
 
 ### Set up app directory structure
 
@@ -503,7 +522,7 @@ echo "vLLM ready"
 # Start MLNode API with TEE
 cd /app/packages/api/src
 nohup python3 -m uvicorn api.app:app \
-    --host 0.0.0.0 \
+    --host 127.0.0.1 \
     --port 8080 \
     --log-level warning \
     > /tmp/mlnode.log 2>&1 &
