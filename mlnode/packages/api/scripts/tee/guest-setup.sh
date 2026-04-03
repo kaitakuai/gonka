@@ -82,6 +82,7 @@ verify_attestation() {
     snpguest fetch ca pem ./certs milan
     snpguest verify certs ./certs
     snpguest verify attestation -p milan ./certs report.bin
+    cd /tmp
     rm -rf "$dir"
     log "Attestation report generated and verified"
 }
