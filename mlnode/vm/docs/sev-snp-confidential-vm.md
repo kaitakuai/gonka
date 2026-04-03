@@ -664,11 +664,11 @@ Patch `pyproject.toml` in vLLM source: `sed -i 's/torch==2.10.0/torch>=2.9.0/'`
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ Host (Ubuntu 24.04, EPYC 7443P)                                 │
+│ Host (Ubuntu 24.04, EPYC 7443P)                                  │
 │                                                                  │
-│  QEMU 9.2.3 + KVM                                               │
+│  QEMU 9.2.3 + KVM                                                │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │ SEV-SNP Encrypted VM (32 GB, 8 vCPU)                      │  │
+│  │ SEV-SNP Encrypted VM (32 GB, 8 vCPU)                       │  │
 │  │                                                            │  │
 │  │  vLLM 0.15.1+cpu (:5000, localhost only)                   │  │
 │  │       ↑                                                    │  │
