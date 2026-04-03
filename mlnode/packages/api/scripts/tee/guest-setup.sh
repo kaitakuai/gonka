@@ -146,15 +146,11 @@ build_vllm_cpu() {
         fi
     fi
 
-    # Step 1: Install vLLM with all runtime dependencies (pulls GPU torch)
-    pip install vllm==0.15.1 2>&1 | tail -3
-
-    # Step 2: Replace GPU torch with CPU torch
+    # Step 1: Install CPU PyTorch
     pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
-        --index-url https://download.pytorch.org/whl/cpu \
-        --force-reinstall --no-deps 2>&1 | tail -2
+        --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2
 
-    # Step 3: Build vLLM CPU wheel from source and replace GPU wheel
+    # Step 2: Build vLLM CPU from source
     pip install "setuptools>=77" "packaging>=24.2" setuptools-scm cmake ninja regex 2>&1 | tail -1
     apt-get install -y libnuma-dev python3-dev 2>&1 | tail -1
 
@@ -165,9 +161,11 @@ build_vllm_cpu() {
     cd "$build_dir"
     sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
 
-    mkdir -p /tmp/vllm-wheels
-    pip wheel --no-deps --no-build-isolation -w /tmp/vllm-wheels . 2>&1 | tail -3
-    pip install --no-deps --force-reinstall /tmp/vllm-wheels/vllm-*.whl 2>&1 | tail -1
+    # Step 3: Install vLLM runtime deps (from pypi GPU wheel, deps only)
+    pip install vllm==0.15.1 2>&1 | tail -3
+    # Step 4: Replace GPU vllm with CPU editable install (builds CPU _C.so)
+    pip uninstall -y vllm 2>&1 | tail -1
+    VLLM_TARGET_DEVICE=cpu pip install --no-build-isolation --no-deps -e . 2>&1 | tail -3
 
     # Verify
     /opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" \
