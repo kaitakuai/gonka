@@ -50,6 +50,9 @@ launch_vm() {
         return 0
     fi
 
+    # Clear stale VM host key (changes on every disk recreate)
+    ssh-keygen -f "$HOME/.ssh/known_hosts" -R '[localhost]:2222' 2>/dev/null || true
+
     log "Launching SEV-SNP VM..."
     "$QEMU" \
         -enable-kvm \
