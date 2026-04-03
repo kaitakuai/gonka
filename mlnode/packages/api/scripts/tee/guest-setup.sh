@@ -150,7 +150,8 @@ build_vllm_cpu() {
         --force-reinstall --no-deps 2>&1 | tail -2
 
     # Build vLLM from source
-    /opt/mlnode/bin/pip install setuptools-scm cmake ninja 2>&1 | tail -1
+    /opt/mlnode/bin/pip install setuptools-scm cmake ninja regex 2>&1 | tail -1
+    apt-get install -y libnuma-dev 2>&1 | tail -1
 
     cd /tmp
     rm -rf vllm-build vllm-wheels
