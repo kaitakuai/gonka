@@ -136,21 +136,23 @@ install_python_deps() {
 # ── Step 7: Build vLLM CPU ───────────────────────────────────────────────────
 
 build_vllm_cpu() {
+    source /opt/mlnode/bin/activate
+
     # Check if already installed
-    if /opt/mlnode/bin/python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null | grep -q "0.15.1"; then
-        if /opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" 2>/dev/null; then
+    if python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null | grep -q "0.15.1"; then
+        if python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" 2>/dev/null; then
             log "vLLM 0.15.1 CPU already installed"
             return 0
         fi
     fi
 
     # Install CPU PyTorch first
-    /opt/mlnode/bin/pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
+    pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
         --index-url https://download.pytorch.org/whl/cpu \
         --force-reinstall --no-deps 2>&1 | tail -2
 
-    # Build vLLM from source
-    /opt/mlnode/bin/pip install setuptools-scm cmake ninja regex 2>&1 | tail -1
+    # Install vLLM build deps + build from source (pip vLLM doesn't support CPU)
+    pip install "setuptools>=77" "packaging>=24.2" setuptools-scm cmake ninja regex 2>&1 | tail -1
     apt-get install -y libnuma-dev 2>&1 | tail -1
 
     cd /tmp
@@ -159,11 +161,10 @@ build_vllm_cpu() {
     cd vllm-build
     sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
 
-    export VLLM_TARGET_DEVICE=cpu
-    /opt/mlnode/bin/python3 setup.py build_ext --inplace 2>&1 | tail -3
+    VLLM_TARGET_DEVICE=cpu python3 setup.py build_ext --inplace 2>&1 | tail -3
     mkdir -p /tmp/vllm-wheels
-    /opt/mlnode/bin/pip wheel --no-deps --no-build-isolation -w /tmp/vllm-wheels . 2>&1 | tail -3
-    /opt/mlnode/bin/pip install --no-deps /tmp/vllm-wheels/vllm-*.whl 2>&1 | tail -1
+    pip wheel --no-deps --no-build-isolation -w /tmp/vllm-wheels . 2>&1 | tail -3
+    pip install --no-deps /tmp/vllm-wheels/vllm-*.whl 2>&1 | tail -1
 
     # Verify
     /opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" \
