@@ -155,10 +155,11 @@ build_vllm_cpu() {
     pip install "setuptools>=77" "packaging>=24.2" setuptools-scm cmake ninja regex 2>&1 | tail -1
     apt-get install -y libnuma-dev 2>&1 | tail -1
 
-    cd /tmp
-    rm -rf vllm-build vllm-wheels
-    git clone https://github.com/vllm-project/vllm.git vllm-build --branch v0.15.1 --depth 1
-    cd vllm-build
+    local build_dir="/root/vllm-build"
+    rm -rf "$build_dir" /tmp/vllm-wheels
+    cd /root
+    git clone https://github.com/vllm-project/vllm.git "$build_dir" --branch v0.15.1 --depth 1
+    cd "$build_dir"
     sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
 
     VLLM_TARGET_DEVICE=cpu python3 setup.py build_ext --inplace 2>&1 | tail -3
@@ -170,7 +171,7 @@ build_vllm_cpu() {
     /opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" \
         || die "vLLM CPU build failed" "Check /tmp/vllm-build for build logs"
 
-    rm -rf /tmp/vllm-build /tmp/vllm-wheels
+    rm -rf "$build_dir" /tmp/vllm-wheels
     log "vLLM 0.15.1 CPU built and installed"
 }
 
