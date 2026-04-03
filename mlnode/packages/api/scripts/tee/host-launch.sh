@@ -55,7 +55,7 @@ launch_vm() {
         -enable-kvm \
         -cpu EPYC-v4 \
         -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \
-        -object memory-backend-memfd,id=ram1,size=16G,share=true,prealloc=false \
+        -object memory-backend-memfd,id=ram1,size=${VM_RAM:-32G},share=true,prealloc=false \
         -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on \
         -smp 8 \
         -bios "$SNP_VM_DIR/OVMF_AMDSEV.fd" \
