@@ -35,7 +35,7 @@ Implements [Gonka TEE Proposal #951](https://github.com/gonka-ai/gonka/discussio
 
 - **CPU:** AMD EPYC 7003 (Milan) or newer on SP3/SP5 socket
   - NOT compatible: Ryzen, Threadripper, EPYC 4004 (AM5 socket)
-- **RAM:** 64 GB recommended (16 GB allocated to guest)
+- **RAM:** 64 GB recommended (32 GB allocated to guest — vLLM install requires >16 GB)
 - **Storage:** 60+ GB free disk space
 - **BIOS/UEFI:** Full BMC/IPMI access required for BIOS changes
 - **Access:** Root access on the server. All commands below assume you are root (`sudo -i`). Commands inside the guest VM use `sudo` explicitly.
@@ -217,13 +217,8 @@ Output: `/root/edk2/Build/AmdSev/RELEASE_GCC5/FV/OVMF.fd` (4 MB)
 ```bash
 mkdir -p /root/snp-vm && cd /root/snp-vm
 
-# Pin to a specific release (do not use 'current' — it is a floating pointer)
-UBUNTU_IMAGE_URL="https://cloud-images.ubuntu.com/noble/20260401/noble-server-cloudimg-amd64.img"
-wget "$UBUNTU_IMAGE_URL" -O ubuntu-24.04-cloud.img
-
-# Verify checksum (update hash when changing image version)
-wget "$(dirname $UBUNTU_IMAGE_URL)/SHA256SUMS" -O SHA256SUMS
-grep "noble-server-cloudimg-amd64.img" SHA256SUMS | sha256sum -c -
+wget https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
+  -O ubuntu-24.04-cloud.img
 ```
 
 ### Create Guest Disk (60 GB overlay)
@@ -297,7 +292,7 @@ cd /root/snp-vm
   -enable-kvm \
   -cpu EPYC-v4 \
   -machine q35,confidential-guest-support=sev0,memory-backend=ram1 \
-  -object memory-backend-memfd,id=ram1,size=16G,share=true,prealloc=false \
+  -object memory-backend-memfd,id=ram1,size=32G,share=true,prealloc=false \
   -object sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on \
   -smp 8 \
   -bios /root/snp-vm/OVMF_AMDSEV.fd \
@@ -379,21 +374,24 @@ cargo install snpguest --version 0.10.0 --locked
 
 ```bash
 mkdir -p /tmp/attestation && cd /tmp/attestation
-snpguest report report.bin request_data.txt --random
-snpguest display report report.bin
+sudo snpguest report report.bin request_data.txt --random
+sudo snpguest display report report.bin
 
 # Fetch and verify AMD cert chain
 mkdir -p certs
-snpguest fetch vcek -p milan pem ./certs report.bin
-snpguest fetch ca pem ./certs milan
-snpguest verify certs ./certs
+sudo snpguest fetch vcek -p milan pem ./certs report.bin
+sudo snpguest fetch ca pem ./certs milan
+sudo snpguest verify certs ./certs
 # The AMD ARK was self-signed!
 # The AMD ASK was signed by the AMD ARK!
 # The VCEK was signed by the AMD ASK!
 
-snpguest verify attestation -p milan ./certs report.bin
+sudo snpguest verify attestation -p milan ./certs report.bin
 # VEK signed the Attestation Report!
 ```
+
+> **Note:** snpguest needs root access to `/dev/sev-guest`. If `sudo snpguest` says
+> "command not found", use the full path: `sudo ~/.cargo/bin/snpguest`
 
 ---
 
@@ -414,46 +412,65 @@ git clone https://github.com/kaitakuai/gonka.git --branch tee --depth 1
 > uninstalled via pip. Always use a venv.
 
 ```bash
+# Install python3-venv (not always present on cloud images)
+sudo apt install -y python3-venv python3-dev
+
 python3 -m venv /opt/mlnode --system-site-packages
 /opt/mlnode/bin/pip install --upgrade pip
 
-# Install MLNode dependencies (versions pinned for reproducibility)
+# Install MLNode dependencies
 /opt/mlnode/bin/pip install \
-    fastapi==0.115.0 uvicorn==0.30.6 httpx==0.27.2 huggingface-hub==0.25.2 \
-    scipy==1.14.1 fire==0.7.0 toml==0.10.2 tenacity==9.0.0 \
-    pynacl==1.5.0 accelerate==1.0.1 h2==4.1.0 nvidia-ml-py==12.560.30
+    fastapi uvicorn httpx huggingface-hub \
+    scipy fire toml tenacity \
+    pynacl accelerate h2 nvidia-ml-py
 
 # Install CPU PyTorch
 /opt/mlnode/bin/pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
     --index-url https://download.pytorch.org/whl/cpu
+```
 
-# Install vLLM build deps + build from source (pip vLLM doesn't support CPU)
-/opt/mlnode/bin/pip install setuptools-scm cmake ninja
+### Build vLLM 0.15.1 for CPU
+
+> **Why build from source?** The pip `vllm` package only ships GPU binaries.
+> CPU support requires compiling the C++ extensions with `VLLM_TARGET_DEVICE=cpu`.
+
+```bash
+source /opt/mlnode/bin/activate
+
+# Install vLLM with all runtime deps (this pulls GPU torch, but we replace it)
+pip install vllm==0.15.1
+
+# Replace GPU torch with CPU torch
+pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --force-reinstall --no-deps
+
+# Build CPU vLLM from source
+pip install "setuptools>=77" "packaging>=24.2" setuptools-scm cmake ninja
 cd /tmp
 git clone https://github.com/vllm-project/vllm.git vllm-build --branch v0.15.1 --depth 1
 cd vllm-build
 sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
-VLLM_TARGET_DEVICE=cpu /opt/mlnode/bin/python3 setup.py build_ext --inplace
-/opt/mlnode/bin/pip wheel --no-deps --no-build-isolation -w /tmp/vllm-wheels .
-/opt/mlnode/bin/pip install --no-deps /tmp/vllm-wheels/vllm-*.whl
+
+# Uninstall GPU vLLM, install CPU editable build
+pip uninstall -y vllm
+VLLM_TARGET_DEVICE=cpu pip install --no-build-isolation --no-deps -e .
 
 # Verify
-/opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; print(current_platform.device_type)"
+python3 -c "from vllm.platforms import current_platform; print(current_platform.device_type)"
 # cpu
-/opt/mlnode/bin/python3 -c "from nacl.public import PrivateKey; print('PyNaCl OK')"
+python3 -c "from nacl.public import PrivateKey; print('PyNaCl OK')"
 ```
 
-> **Note:** On production nodes with GPU, use `pip install vllm==0.15.1` directly
-> (no source build needed) and skip the CPU torch step.
+> **Note:** On production nodes with GPU, just `pip install vllm==0.15.1` — no source
+> build needed, no CPU torch step.
 
-### Clean up build artifacts
-
-For production images, remove build toolchain and caches to reduce attack surface:
+### Clean up build artifacts (optional, for production images)
 
 ```bash
-apt-get purge -y build-essential cmake pkg-config libssl-dev libnuma-dev
-apt-get autoremove -y
-rm -rf /tmp/vllm-build /tmp/vllm-wheels
+sudo apt-get purge -y cmake pkg-config libssl-dev libnuma-dev
+sudo apt-get autoremove -y
+rm -rf /tmp/vllm-build
 rm -rf ~/.cargo ~/.rustup
 rm -rf /root/gonka/.git
 ```
@@ -479,15 +496,16 @@ source ~/.cargo/env
 snpguest --version
 
 # Make snpguest available system-wide (MLNode runs as root)
-ln -sf $(which snpguest) /usr/local/bin/snpguest
+sudo ln -sf $(which snpguest) /usr/local/bin/snpguest
 
 # sev-guest module should already be loaded from Step 6
 ls /dev/sev-guest
 
-# Verify all TEE components
-/opt/mlnode/bin/python3 -c "from nacl.public import PrivateKey; print('PyNaCl OK')"
-/opt/mlnode/bin/python3 -c "import vllm; print(vllm.__version__)"
-snpguest --version
+# Verify all TEE components (use venv activate from Step 7)
+source /opt/mlnode/bin/activate
+python3 -c "from nacl.public import PrivateKey; print('PyNaCl OK')"
+python3 -c "from vllm.platforms import current_platform; print(f'vLLM platform: {current_platform.device_type}')"
+sudo snpguest --version
 ```
 
 ---
@@ -650,7 +668,7 @@ Patch `pyproject.toml` in vLLM source: `sed -i 's/torch==2.10.0/torch>=2.9.0/'`
 │                                                                  │
 │  QEMU 9.2.3 + KVM                                               │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │ SEV-SNP Encrypted VM (16 GB, 8 vCPU)                      │  │
+│  │ SEV-SNP Encrypted VM (32 GB, 8 vCPU)                      │  │
 │  │                                                            │  │
 │  │  vLLM 0.15.1+cpu (:5000, localhost only)                   │  │
 │  │       ↑                                                    │  │
