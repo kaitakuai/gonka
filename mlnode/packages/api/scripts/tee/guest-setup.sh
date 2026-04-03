@@ -55,8 +55,11 @@ install_snpguest() {
         return 0
     fi
 
+    # Build tools needed for cargo compile
+    apt-get install -y build-essential pkg-config libssl-dev 2>&1 | tail -2
+
     # Install Rust if needed
-    if ! command -v cargo > /dev/null 2>&1; then
+    if ! su - ubuntu -c 'command -v cargo' > /dev/null 2>&1; then
         su - ubuntu -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y' 2>&1 | tail -2
     fi
 
