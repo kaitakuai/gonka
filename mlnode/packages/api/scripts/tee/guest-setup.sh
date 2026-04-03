@@ -33,7 +33,9 @@ CHECKPOINT_FILE="/tmp/.tee-guest-setup-progress"
 # ── Step 1: Verify SEV-SNP ──────────────────────────────────────────────────
 
 verify_sev_snp() {
-    dmesg | grep -q "Memory Encryption Features active" || \
+    local enc_lines
+    enc_lines=$(dmesg 2>/dev/null | grep "Memory Encryption Features active" || true)
+    [ -n "$enc_lines" ] || \
         die "Memory encryption not active" "This VM may not be launched with SEV-SNP. Check host QEMU flags."
 
     # Load sev-guest module

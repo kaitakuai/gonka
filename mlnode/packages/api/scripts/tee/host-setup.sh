@@ -18,11 +18,13 @@ SNP_VM_DIR="/root/snp-vm"
 # ── Step 0: Verify SEV-SNP ──────────────────────────────────────────────────
 
 verify_sev_snp() {
-    dmesg | grep -q "SEV-SNP" || die \
+    local sev_lines
+    sev_lines=$(dmesg 2>/dev/null | grep "SEV-SNP" || true)
+    [ -n "$sev_lines" ] || die \
         "SEV-SNP not found in dmesg" \
         "Check BIOS: SVM, SMEE, SNP Memory Coverage, IOMMU, SEV-SNP must be enabled. See runbook Prerequisites."
     [ -c /dev/sev ] || die "/dev/sev not found" "Kernel may need kvm_amd module with sev_snp=1"
-    log "SEV-SNP verified: $(dmesg | grep 'SEV-SNP API' | tail -1)"
+    log "SEV-SNP verified: $(echo "$sev_lines" | grep 'API' | tail -1)"
 }
 
 # ── Step 1: Install packages ────────────────────────────────────────────────
