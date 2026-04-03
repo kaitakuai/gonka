@@ -30,12 +30,11 @@ verify_sev_snp() {
 install_packages() {
     apt-get update -qq
     apt-get install -y \
-        qemu-system-x86 qemu-utils libvirt-daemon-system libvirt-clients \
-        ovmf cloud-image-utils virtinst cpu-checker \
+        qemu-utils cloud-image-utils cpu-checker sshpass \
         git build-essential ninja-build pkg-config \
         libglib2.0-dev libpixman-1-dev libslirp-dev \
         python3-venv python3-pip flex bison iasl nasm \
-        mtools grub-efi-amd64-bin sshpass socat
+        mtools grub-efi-amd64-bin
     kvm-ok || die "KVM not available" "Check BIOS virtualization settings"
 }
 
