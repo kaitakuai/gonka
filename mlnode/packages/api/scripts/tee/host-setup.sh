@@ -106,9 +106,11 @@ else
 fi
 GRUBCFG
 
-    # Build
+    # Build (edksetup.sh uses uninitialized vars, temporarily disable nounset)
     cd /root/edk2
+    set +u
     source edksetup.sh
+    set -u
     make -C BaseTools -j"$(nproc)"
     export WORKSPACE=/root/edk2
     export EDK_TOOLS_PATH=/root/edk2/BaseTools
