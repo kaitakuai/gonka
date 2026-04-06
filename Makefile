@@ -5,8 +5,10 @@ TAG_NAME := "release/v$(VERSION)"
 USE_REGISTRY_CACHE ?= 0
 ifeq ($(USE_REGISTRY_CACHE),1)
 _MOCK_CACHE_ARGS := --cache-from type=registry,ref=ghcr.io/gonka-ai/mock-server:buildcache --cache-to type=registry,ref=ghcr.io/gonka-ai/mock-server:buildcache,mode=min
+_MOCK_BUILD_CMD := docker buildx build --load $(_MOCK_CACHE_ARGS)
 else
 _MOCK_CACHE_ARGS :=
+_MOCK_BUILD_CMD := DOCKER_BUILDKIT=1 docker build
 endif
 
 all: build-docker
@@ -23,7 +25,7 @@ mock-server-build-docker:
 	@echo "Building mock-server JAR file..."
 	@cd testermint/mock_server && ./gradlew clean && ./gradlew shadowJar
 	@echo "Building mock-server docker image..."
-	@docker buildx build --load $(_MOCK_CACHE_ARGS) -t inference-mock-server -f testermint/Dockerfile testermint
+	@$(_MOCK_BUILD_CMD) -t inference-mock-server -f testermint/Dockerfile testermint
 
 proxy-build-docker:
 	@make -C proxy build-docker SET_LATEST=1

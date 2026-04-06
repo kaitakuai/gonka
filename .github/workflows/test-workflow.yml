@@ -137,16 +137,6 @@ jobs:
           docker --version
           docker compose version
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install Make
         run: |
           sudo apt-get update
@@ -167,7 +157,7 @@ jobs:
         env:
           GENESIS_OVERRIDES_FILE: "inference-chain/test_genesis_overrides.json"
         run: |
-          make build-docker USE_REGISTRY_CACHE=1
+          make build-docker
           echo "=== Images immediately after build ==="
           docker images | head -20
 
@@ -192,7 +182,7 @@ jobs:
       - name: Make Upgrade Build
         if: ${{ inputs.enable_upgrades }}
         run: |
-          make build-for-upgrade-tests USE_REGISTRY_CACHE=1
+          make build-for-upgrade-tests
           # Fix ownership of upgrade build files
           sudo chown -R $USER:$USER public-html/ || true
 
@@ -561,4 +551,3 @@ jobs:
           echo "*Individual test reports are available in the Checks tab above*" >> $GITHUB_STEP_SUMMARY
           
           echo "##[debug]FINAL TOTALS: Passed=$TOTAL_PASSED, Failed=$TOTAL_FAILED, Skipped=$TOTAL_SKIPPED"
-

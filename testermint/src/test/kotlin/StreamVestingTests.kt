@@ -7,11 +7,33 @@ import com.productscience.data.BitcoinRewardParams
 import com.productscience.data.EpochParams
 import com.productscience.data.TokenomicsParams
 import java.time.Duration
+import java.net.SocketException
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.data.Offset
 import org.junit.jupiter.api.Test
+import org.tinylog.kotlin.Logger
 
 class StreamVestingTests : TestermintTest() {
+    private fun initVestingCluster(config: ApplicationConfig): Pair<LocalCluster, LocalInferencePair> {
+        var lastFailure: Throwable? = null
+        repeat(3) { attempt ->
+            try {
+                return initCluster(config = config, reboot = true)
+            } catch (t: Throwable) {
+                val shouldRetry =
+                    t is IllegalStateException ||
+                        generateSequence(t) { it.cause }.any { it is SocketException }
+                if (!shouldRetry || attempt == 2) {
+                    throw t
+                }
+                lastFailure = t
+                Logger.warn("Stream vesting cluster bootstrap failed on attempt ${attempt + 1}, retrying: ${t.message}", "")
+                Thread.sleep(Duration.ofSeconds(10))
+            }
+        }
+        throw lastFailure ?: IllegalStateException("Stream vesting cluster bootstrap failed")
+    }
+
     @Test
     fun `comprehensive vesting test with automatic reward system detection`() {
         // Configure genesis with 2-epoch vesting periods for fast testing
@@ -34,7 +56,7 @@ class StreamVestingTests : TestermintTest() {
             genesisSpec = inferenceConfig.genesisSpec?.merge(fastVestingSpec) ?: fastVestingSpec
         )
 
-        val (cluster, genesis) = initCluster(config = fastVestingConfig, reboot = true)
+        val (cluster, genesis) = initVestingCluster(fastVestingConfig)
 
         val params = genesis.node.getInferenceParams().params
         val isBitcoinEnabled = isBitcoinRewardsEnabled(params.bitcoinRewardParams)

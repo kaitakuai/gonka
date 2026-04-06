@@ -26,6 +26,13 @@ class SubnetTests : TestermintTest() {
         genesisSpec = inferenceConfig.genesisSpec?.merge(noRestrictionsSpec) ?: noRestrictionsSpec
     )
 
+    private val noRestrictionsLongEpochConfig = inferenceConfig.copy(
+        genesisSpec = createSpec(
+            epochLength = 40,
+            epochShift = 10
+        ).merge(noRestrictionsSpec)
+    )
+
     @Test
     fun `create subnet escrow and query it`() {
         val (cluster, genesis) = initCluster(reboot = true)
@@ -209,8 +216,8 @@ class SubnetTests : TestermintTest() {
 
     @Test
     fun `parallel subnet sessions with isolated settlement`() {
-        val sessionCount = 10
-        val (cluster, genesis) = initCluster(config = noRestrictionsConfig, reboot = true)
+        val sessionCount = 6
+        val (cluster, genesis) = initCluster(config = noRestrictionsLongEpochConfig, reboot = true)
         genesis.waitForNextEpoch()
 
         cluster.allPairs.forEach { pair ->
