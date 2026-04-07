@@ -1,6 +1,6 @@
 #!/bin/bash
-# Guest setup: verify SEV-SNP, install snpguest, clone gonka, build vLLM CPU.
-# Run as root inside the SEV-SNP VM.
+# Guest setup: verify TEE (SEV-SNP or TDX), install tools, clone gonka, build vLLM CPU.
+# Run as root inside the TEE VM.
 # Idempotent — safe to re-run.
 #
 # Usage:
@@ -30,24 +30,60 @@ CHECKPOINT_FILE="/tmp/.tee-guest-setup-progress"
 
 [ "$(id -u)" -eq 0 ] || die "Must run as root (sudo)"
 
-# ── Step 1: Verify SEV-SNP ──────────────────────────────────────────────────
+# ── Step 1: Detect and verify TEE ────────────────────────────────────────────
 
-verify_sev_snp() {
+TEE_PLATFORM=""
+
+detect_guest_tee() {
     local enc_lines
     enc_lines=$(dmesg 2>/dev/null | grep "Memory Encryption Features active" || true)
     [ -n "$enc_lines" ] || \
-        die "Memory encryption not active" "This VM may not be launched with SEV-SNP. Check host QEMU flags."
+        die "Memory encryption not active" "This VM was not launched with SEV-SNP or TDX. Check host QEMU flags."
 
+    if echo "$enc_lines" | grep -q "AMD SEV"; then
+        TEE_PLATFORM="amd-sev-snp"
+    elif echo "$enc_lines" | grep -q "Intel TDX"; then
+        TEE_PLATFORM="intel-tdx"
+    else
+        die "Unknown TEE type in: $enc_lines"
+    fi
+
+    log "TEE platform: $TEE_PLATFORM"
+}
+
+verify_sev_snp() {
     # Load sev-guest module
     if [ ! -c /dev/sev-guest ]; then
         apt-get install -y "linux-modules-extra-$(uname -r)" 2>/dev/null || true
-        modprobe sev-guest
+        modprobe sev-guest 2>/dev/null || true
     fi
     [ -c /dev/sev-guest ] || die "/dev/sev-guest not found" "modprobe sev-guest failed"
     log "SEV-SNP active, /dev/sev-guest present"
 }
 
-# ── Step 2: Install snpguest ────────────────────────────────────────────────
+verify_tdx() {
+    if [ ! -c /dev/tdx_guest ]; then
+        modprobe tdx_guest 2>/dev/null || true
+    fi
+    [ -c /dev/tdx_guest ] || die "/dev/tdx_guest not found" "modprobe tdx_guest failed"
+
+    # Check configfs-tsm (preferred for quote generation)
+    if [ -d /sys/kernel/config/tsm/report ]; then
+        log "TDX active, /dev/tdx_guest + configfs-tsm present"
+    else
+        log "TDX active, /dev/tdx_guest present (no configfs-tsm — will use ioctl)"
+    fi
+}
+
+verify_tee() {
+    detect_guest_tee
+    case "$TEE_PLATFORM" in
+        amd-sev-snp) verify_sev_snp ;;
+        intel-tdx)   verify_tdx ;;
+    esac
+}
+
+# ── Step 2: Install attestation tools (platform-specific) ────────────────────
 
 install_snpguest() {
     if command -v snpguest > /dev/null 2>&1; then
@@ -55,7 +91,6 @@ install_snpguest() {
         return 0
     fi
 
-    # Build tools needed for cargo compile
     apt-get install -y build-essential pkg-config libssl-dev 2>&1 | tail -2
 
     # Install Rust if needed
@@ -65,15 +100,27 @@ install_snpguest() {
 
     su - ubuntu -c 'source ~/.cargo/env && cargo install snpguest' 2>&1 | tail -3
 
-    # Symlink to system path (MLNode runs as root)
     ln -sf /home/ubuntu/.cargo/bin/snpguest /usr/local/bin/snpguest
     require_cmd snpguest "snpguest installation failed"
     log "snpguest installed: $(snpguest --version 2>&1 | head -1)"
 }
 
+install_attestation_tools() {
+    case "$TEE_PLATFORM" in
+        amd-sev-snp)
+            install_snpguest
+            ;;
+        intel-tdx)
+            # TDX uses configfs-tsm (kernel built-in) + Python ctypes
+            # No extra binary tools needed — intel_tdx.py handles everything
+            log "TDX attestation: using configfs-tsm (no extra tools needed)"
+            ;;
+    esac
+}
+
 # ── Step 3: Verify attestation ───────────────────────────────────────────────
 
-verify_attestation() {
+verify_amd_attestation() {
     local dir=$(mktemp -d)
     cd "$dir"
     snpguest report report.bin request.txt --random
@@ -84,7 +131,35 @@ verify_attestation() {
     snpguest verify attestation -p milan ./certs report.bin
     cd /tmp
     rm -rf "$dir"
-    log "Attestation report generated and verified"
+    log "AMD attestation report generated and verified"
+}
+
+verify_tdx_attestation() {
+    # Quick test: write to configfs-tsm, check outblob
+    if [ -d /sys/kernel/config/tsm/report ]; then
+        local entry="/sys/kernel/config/tsm/report/setup-test"
+        mkdir -p "$entry"
+        dd if=/dev/urandom bs=64 count=1 2>/dev/null > "$entry/inblob"
+        sleep 3
+        local size
+        size=$(wc -c < "$entry/outblob")
+        rmdir "$entry" 2>/dev/null || true
+        if [ "$size" -gt 0 ]; then
+            log "TDX Quote generated via configfs-tsm ($size bytes)"
+        else
+            warn "TDX Quote empty (QGS may not be running on host)"
+            warn "Attestation will use structural validation only"
+        fi
+    else
+        warn "configfs-tsm not available — will use /dev/tdx_guest ioctl"
+    fi
+}
+
+verify_attestation() {
+    case "$TEE_PLATFORM" in
+        amd-sev-snp) verify_amd_attestation ;;
+        intel-tdx)   verify_tdx_attestation ;;
+    esac
 }
 
 # ── Step 4: Clone gonka ─────────────────────────────────────────────────────
@@ -112,7 +187,6 @@ setup_app_dir() {
 # ── Step 6: Create venv + install deps ───────────────────────────────────────
 
 install_python_deps() {
-    # Ensure python3-venv is available
     apt-get install -y python3-venv 2>&1 | tail -2
 
     if [ -f /opt/mlnode/bin/activate ]; then
@@ -123,7 +197,6 @@ install_python_deps() {
     [ -f /opt/mlnode/bin/pip ] || die "venv creation failed" "apt install python3-venv and retry"
     /opt/mlnode/bin/pip install --upgrade pip 2>&1 | tail -1
 
-    # Install MLNode + TEE deps
     /opt/mlnode/bin/pip install \
         fastapi uvicorn httpx huggingface-hub \
         scipy fire toml tenacity \
@@ -138,7 +211,6 @@ install_python_deps() {
 build_vllm_cpu() {
     source /opt/mlnode/bin/activate
 
-    # Check if already installed
     if python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null | grep -q "0.15.1"; then
         if python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" 2>/dev/null; then
             log "vLLM 0.15.1 CPU already installed"
@@ -146,11 +218,9 @@ build_vllm_cpu() {
         fi
     fi
 
-    # Step 1: Install CPU PyTorch
     pip install torch==2.9.1+cpu torchvision==0.24.1+cpu \
         --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2
 
-    # Step 2: Build vLLM CPU from source
     pip install "setuptools>=77" "packaging>=24.2" setuptools-scm cmake ninja regex 2>&1 | tail -1
     apt-get install -y libnuma-dev python3-dev 2>&1 | tail -1
 
@@ -161,13 +231,10 @@ build_vllm_cpu() {
     cd "$build_dir"
     sed -i 's/torch==2.10.0/torch>=2.9.0/' pyproject.toml
 
-    # Step 3: Install vLLM runtime deps (from pypi GPU wheel, deps only)
     pip install vllm==0.15.1 2>&1 | tail -3
-    # Step 4: Replace GPU vllm with CPU editable install (builds CPU _C.so)
     pip uninstall -y vllm 2>&1 | tail -1
     VLLM_TARGET_DEVICE=cpu pip install --no-build-isolation --no-deps -e . 2>&1 | tail -3
 
-    # Verify
     /opt/mlnode/bin/python3 -c "from vllm.platforms import current_platform; assert current_platform.device_type == 'cpu'" \
         || die "vLLM CPU build failed" "Check /tmp/vllm-build for build logs"
 
@@ -178,18 +245,24 @@ build_vllm_cpu() {
 # ── Run ──────────────────────────────────────────────────────────────────────
 
 echo "=== TEE Guest Setup ==="
-run_step "verify-sev-snp"       verify_sev_snp
-run_step "install-snpguest"     install_snpguest
-run_step "verify-attestation"   verify_attestation
-run_step "clone-gonka"          clone_gonka
-run_step "setup-app-dir"        setup_app_dir
-run_step "install-python-deps"  install_python_deps
-run_step "build-vllm-cpu"       build_vllm_cpu
+run_step "verify-tee"            verify_tee
+run_step "install-attest-tools"  install_attestation_tools
+run_step "verify-attestation"    verify_attestation
+run_step "clone-gonka"           clone_gonka
+run_step "setup-app-dir"         setup_app_dir
+run_step "install-python-deps"   install_python_deps
+run_step "build-vllm-cpu"        build_vllm_cpu
 
 echo ""
+log "TEE platform: $TEE_PLATFORM"
 log "All checks:"
-log "  /dev/sev-guest:  $([ -c /dev/sev-guest ] && echo OK || echo MISSING)"
-log "  snpguest:        $(snpguest --version 2>&1 | head -1)"
+if [ "$TEE_PLATFORM" = "amd-sev-snp" ]; then
+    log "  /dev/sev-guest:  $([ -c /dev/sev-guest ] && echo OK || echo MISSING)"
+    log "  snpguest:        $(snpguest --version 2>&1 | head -1 || echo MISSING)"
+elif [ "$TEE_PLATFORM" = "intel-tdx" ]; then
+    log "  /dev/tdx_guest:  $([ -c /dev/tdx_guest ] && echo OK || echo MISSING)"
+    log "  configfs-tsm:    $([ -d /sys/kernel/config/tsm/report ] && echo OK || echo MISSING)"
+fi
 log "  vLLM:            $(/opt/mlnode/bin/python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo MISSING)"
 log "  PyNaCl:          $(/opt/mlnode/bin/python3 -c 'from nacl.public import PrivateKey; print("OK")' 2>/dev/null || echo MISSING)"
 echo ""
