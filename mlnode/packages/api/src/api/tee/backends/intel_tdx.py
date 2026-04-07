@@ -27,6 +27,11 @@ INTEL_PCS_URL = os.getenv(
     "https://api.trustedservices.intel.com/sgx/certification/v4"
 )
 
+# Intel PCS API key for PCK certificate retrieval.
+# Required for full cert chain verification in production.
+# Get from: https://api.portal.trustedservices.intel.com/provisioning-certification
+INTEL_API_KEY = os.getenv("INTEL_API_KEY", "")
+
 # TDX ioctl constants (linux/tdx-guest.h)
 TDX_CMD_GET_REPORT0 = 0xC0405401   # _IOWR('T', 1, struct tdx_report_req)
 TDX_CMD_GET_QUOTE = 0xC0185402     # _IOWR('T', 2, struct tdx_quote_req)
@@ -89,7 +94,7 @@ class IntelTdxBackend(TEEBackend):
         try:
             entry_path.mkdir(exist_ok=True)
             (entry_path / "inblob").write_bytes(report_data)
-            (entry_path / "provider").write_text("tdx_guest\n")
+            # provider is read-only and auto-populated by kernel (e.g. "tdx_guest")
             quote_bytes = (entry_path / "outblob").read_bytes()
         finally:
             if entry_path.exists():
@@ -173,26 +178,46 @@ class IntelTdxBackend(TEEBackend):
         return certs
 
     def _fetch_from_pcs(self) -> dict:
-        """Fetch certs from Intel Provisioning Certification Service."""
+        """Fetch certs from Intel Provisioning Certification Service.
+
+        If INTEL_API_KEY is set, fetches the platform-specific PCK certificate
+        using the quote's certification data. Otherwise fetches only the
+        intermediate and root certs from the CRL endpoint.
+        """
         import urllib.request
         import urllib.error
+        from urllib.parse import unquote
 
         certs = {"pck": None, "intermediate": None, "root": None}
 
-        # Fetch PCK CRL (contains intermediate cert in header)
+        # Fetch PCK cert if API key is available and we have a quote
+        if INTEL_API_KEY and self._quote_bytes:
+            try:
+                certs["pck"] = self._fetch_pck_cert()
+            except Exception as e:
+                logger.warning(f"Failed to fetch PCK cert: {e}")
+
+        # Fetch intermediate + root from PCK CRL issuer chain
         try:
             req = urllib.request.Request(f"{INTEL_PCS_URL}/pckcrl?ca=platform")
+            if INTEL_API_KEY:
+                req.add_header("Ocp-Apim-Subscription-Key", INTEL_API_KEY)
             with urllib.request.urlopen(req, timeout=10) as resp:
-                resp.read()  # consume body
+                resp.read()
                 issuer_chain = resp.headers.get("SGX-PCK-CRL-Issuer-Chain", "")
                 if issuer_chain:
-                    # URL-decode the chain
-                    from urllib.parse import unquote
                     chain = unquote(issuer_chain)
-                    parts = chain.split("-----END CERTIFICATE-----")
-                    if len(parts) >= 2:
-                        certs["intermediate"] = parts[0] + "-----END CERTIFICATE-----\n"
-                        certs["root"] = parts[1].strip() + "\n" if parts[1].strip() else None
+                    # Chain contains multiple PEM certs concatenated
+                    pem_certs = []
+                    for block in chain.split("-----END CERTIFICATE-----"):
+                        block = block.strip()
+                        if block:
+                            pem_certs.append(block + "\n-----END CERTIFICATE-----\n")
+                    if len(pem_certs) >= 2:
+                        certs["intermediate"] = pem_certs[0]
+                        certs["root"] = pem_certs[1]
+                    elif len(pem_certs) == 1:
+                        certs["intermediate"] = pem_certs[0]
         except (urllib.error.URLError, OSError) as e:
             logger.warning(f"Failed to fetch PCK CRL: {e}")
 
@@ -203,22 +228,119 @@ class IntelTdxBackend(TEEBackend):
 
         return certs
 
+    def _fetch_pck_cert(self) -> str | None:
+        """Fetch platform-specific PCK certificate from Intel PCS.
+
+        Extracts QE ID and encrypted PPID from the TDX Quote's
+        certification data, then requests the PCK cert from Intel PCS.
+        """
+        import urllib.request
+        from urllib.parse import unquote
+
+        if not self._quote_bytes or len(self._quote_bytes) < 700:
+            return None
+
+        # Extract FMSPC from quote certification data (offset varies by quote type)
+        # For TDX Quote v4, certification data is after the signature
+        # Try extracting QE report certification data
+        qe_report_offset = 632  # header(48) + td_report(584)
+        if len(self._quote_bytes) <= qe_report_offset:
+            return None
+
+        # Extract FMSPC and platform info via PCK ID Retrieval Tool output
+        # if available on disk
+        pck_id_file = Path("/root/pckid_retrieval.csv")
+        if not pck_id_file.exists():
+            pck_id_file = Path("/opt/intel/sgx-dcap-pccs/pckid_retrieval.csv")
+        if not pck_id_file.exists():
+            # Try running the tool
+            try:
+                subprocess.run(
+                    ["PCKIDRetrievalTool"],
+                    capture_output=True, timeout=30,
+                )
+                pck_id_file = Path("pckid_retrieval.csv")
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                logger.warning("PCKIDRetrievalTool not available")
+                return None
+
+        if not pck_id_file.exists():
+            return None
+
+        # Parse CSV: enc_ppid,pce_id,cpu_svn,pce_svn,qe_id,...
+        csv_line = pck_id_file.read_text().strip().split("\n")[0]
+        fields = csv_line.split(",")
+        if len(fields) < 5:
+            logger.warning("Invalid pckid_retrieval.csv format")
+            return None
+
+        enc_ppid = fields[0]
+        pce_id = fields[1]
+        cpu_svn = fields[2]
+        pce_svn = fields[3]
+        qe_id = fields[4]
+
+        # Request PCK cert from Intel PCS
+        url = (
+            f"{INTEL_PCS_URL}/pckcert"
+            f"?encrypted_ppid={enc_ppid}"
+            f"&pceid={pce_id}"
+            f"&cpusvn={cpu_svn}"
+            f"&pcesvn={pce_svn}"
+            f"&qeid={qe_id}"
+        )
+        req = urllib.request.Request(url)
+        req.add_header("Ocp-Apim-Subscription-Key", INTEL_API_KEY)
+
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            pck_pem = unquote(resp.read().decode())
+            # PCS also returns issuer chain in header
+            issuer = resp.headers.get("SGX-PCK-Certificate-Issuer-Chain", "")
+            if issuer:
+                logger.info("PCK cert fetched with issuer chain from Intel PCS")
+
+        logger.info(f"PCK certificate fetched ({len(pck_pem)} bytes)")
+        return pck_pem
+
     def verify_certs(self) -> bool:
-        """Verify Intel certificate chain using openssl."""
+        """Verify Intel certificate chain using openssl.
+
+        Verifies: Root CA → Intermediate → PCK (if available).
+        Without PCK cert (no INTEL_API_KEY), verifies Root → Intermediate only.
+        """
         root_path = self.certs_dir / "root.pem"
         intermediate_path = self.certs_dir / "intermediate.pem"
+        pck_path = self.certs_dir / "pck.pem"
 
         if not root_path.exists() or not intermediate_path.exists():
             logger.warning("Intel certs not available for verification")
             return False
 
+        # Verify intermediate against root
         r = subprocess.run(
             ["openssl", "verify", "-CAfile", str(root_path), str(intermediate_path)],
             capture_output=True, text=True,
         )
-        ok = r.returncode == 0
-        logger.info(f"Intel cert chain verification: {'ok' if ok else 'FAILED'}")
-        return ok
+        if r.returncode != 0:
+            logger.info("Intel cert chain verification: FAILED (intermediate)")
+            return False
+
+        # If PCK cert available, verify it against the chain
+        if pck_path.exists():
+            chain_path = self.certs_dir / "chain.pem"
+            chain_path.write_text(root_path.read_text() + intermediate_path.read_text())
+            r = subprocess.run(
+                ["openssl", "verify", "-CAfile", str(chain_path), str(pck_path)],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                logger.info("Intel cert chain verification: FAILED (PCK)")
+                return False
+            logger.info("Intel cert chain verification: ok (Root → Intermediate → PCK)")
+        else:
+            logger.info("Intel cert chain verification: ok (Root → Intermediate only, no PCK — set INTEL_API_KEY for full chain)")
+
+        return True
 
     def verify_report(self) -> bool:
         """
