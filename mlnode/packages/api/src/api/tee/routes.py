@@ -179,7 +179,8 @@ async def encrypted_chat_completions(req: EncryptedRequest, request: Request):
     openai_request.pop("stream", None)
 
     model = openai_request.get("model", "default")
-    logger.info(f"TEE inference request (model={model})")  # No prompt logged
+    safe_model = str(model)[:64].replace("\n", "").replace("\r", "") if model else "unknown"
+    logger.info(f"TEE inference request (model={safe_model})")
 
     try:
         client = await _get_vllm_client()

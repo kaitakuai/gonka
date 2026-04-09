@@ -72,7 +72,7 @@ def generate_attestation(keys, tee_info: TEEInfo, image_hash: str = None) -> dic
     # Step 3: Verify
     certs_valid = backend.verify_certs()
     report_valid = backend.verify_report()
-    logger.info(f"Attestation verification: certs={certs_valid}, report={report_valid}")
+    logger.debug(f"Attestation verification: certs={certs_valid}, report={report_valid}")
 
     # Step 4: Parse report
     parsed_report = backend.parse_report(report_bytes)
