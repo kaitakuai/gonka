@@ -21,6 +21,8 @@ Storage (§7.2.3):
 
 import os
 import re
+import shutil
+import stat
 from pathlib import Path
 
 from common.logger import create_logger
@@ -106,18 +108,48 @@ def load_model(
     # Step 2: Check if already downloaded and verified
     if _all_files_verified(manifest, model_path):
         logger.info("All model files already present and verified")
+        _lock_files(manifest, model_path)
         return model_path, manifest
 
-    # Step 3: Download from HuggingFace (or mirror)
+    # Step 3: Check disk space before downloading
+    _check_disk_space(model_path, manifest.total_size_bytes)
+
+    # Step 4: Download from HuggingFace (or mirror)
     logger.info(f"Downloading model to {model_path}...")
     _download_model(manifest, model_path)
 
-    # Step 4: Verify ALL files (spec §10.2 MI-1)
+    # Step 5: Verify ALL files (spec §10.2 MI-1)
     logger.info("Verifying SHA-256 hashes...")
     _verify_all_files(manifest, model_path)
 
+    # Step 6: Lock files read-only (TOCTOU mitigation)
+    _lock_files(manifest, model_path)
+
     logger.info(f"Model loaded and verified: {manifest.model_id}")
     return model_path, manifest
+
+
+def _check_disk_space(model_path: Path, required_bytes: int) -> None:
+    """Check that enough disk space is available before downloading."""
+    margin = 1024 * 1024 * 512  # 512 MB margin for metadata/temp files
+    usage = shutil.disk_usage(model_path)
+    if usage.free < required_bytes + margin:
+        raise ModelLoadError(
+            f"Not enough disk space: need {(required_bytes + margin) / (1024**3):.1f} GB, "
+            f"have {usage.free / (1024**3):.1f} GB free at {model_path}"
+        )
+    logger.info(f"  Disk space: {usage.free / (1024**3):.1f} GB free, need {required_bytes / (1024**3):.1f} GB")
+
+
+def _lock_files(manifest: ModelManifest, model_path: Path) -> None:
+    """Set verified model files read-only (TOCTOU mitigation).
+
+    Prevents modification between verification and vLLM loading.
+    """
+    for entry in manifest.files:
+        file_path = _safe_path(model_path, entry.filename)
+        if file_path.exists():
+            file_path.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)  # 0o444
 
 
 def _all_files_verified(manifest: ModelManifest, model_path: Path) -> bool:
@@ -128,6 +160,7 @@ def _all_files_verified(manifest: ModelManifest, model_path: Path) -> bool:
             return False
         if not manifest.verify_file(entry.filename, file_path):
             logger.warning(f"Cached file hash mismatch: {entry.filename} — re-downloading")
+            file_path.chmod(stat.S_IWUSR | stat.S_IRUSR)  # make writable before delete
             file_path.unlink()
             return False
     return True
@@ -153,6 +186,7 @@ def _download_model(manifest: ModelManifest, model_path: Path) -> None:
                 continue
             else:
                 logger.warning(f"  {entry.filename}: cached but hash mismatch, re-downloading")
+                file_path.chmod(stat.S_IWUSR | stat.S_IRUSR)
                 file_path.unlink()
 
         logger.info(f"  {entry.filename}: downloading ({entry.size_bytes / (1024**2):.1f} MB)...")
