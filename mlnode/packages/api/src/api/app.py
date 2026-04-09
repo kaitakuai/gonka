@@ -34,7 +34,19 @@ from api.proxy import ProxyMiddleware, start_vllm_proxy, stop_vllm_proxy, setup_
 # TEE support (Confidential MLNode — proposal #951)
 TEE_ENABLED = os.getenv("TEE_ENABLED", "0") == "1"
 if TEE_ENABLED:
+    from fastapi import HTTPException as _HTTPException
     from api.tee.routes import router as tee_router
+
+    # Spec §10.2 MI-4: runtime model change MUST be blocked in TEE mode
+    _TEE_BLOCKED_PREFIXES = ("/inference/up", "/inference/down", "/models/download")
+
+    async def _tee_block_model_change(request):
+        for prefix in _TEE_BLOCKED_PREFIXES:
+            if request.url.path.endswith(prefix):
+                raise _HTTPException(
+                    status_code=403,
+                    detail="Model changes are not allowed in TEE mode (spec §10.2 MI-4)",
+                )
 
 WATCH_INTERVAL = 2
 
@@ -132,11 +144,14 @@ app.include_router(
     dependencies=[Depends(check_service_conflicts)]
 )
 
+_inference_deps = [Depends(check_service_conflicts)]
+if TEE_ENABLED:
+    _inference_deps.append(Depends(_tee_block_model_change))
 app.include_router(
     inference_router,
     prefix=API_PREFIX,
     tags=["Inference"],
-    dependencies=[Depends(check_service_conflicts)]
+    dependencies=_inference_deps
 )
 
 # PoC v2 routes work when inference (vLLM) is running - no conflict check needed
@@ -159,10 +174,14 @@ if TEE_ENABLED:
         tags=["TEE"],
     )
 
+_models_deps = []
+if TEE_ENABLED:
+    _models_deps.append(Depends(_tee_block_model_change))
 app.include_router(
     models_router,
     prefix=API_PREFIX + "/models",
     tags=["Models"],
+    dependencies=_models_deps if _models_deps else None,
 )
 
 app.include_router(

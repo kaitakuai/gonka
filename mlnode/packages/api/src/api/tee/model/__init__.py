@@ -1,1 +1,1 @@
-from .manifest import ModelManifest  # noqa: F401
+from .manifest import ManifestFile, ModelManifest  # noqa: F401

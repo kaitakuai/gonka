@@ -104,20 +104,39 @@ class EncryptedResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.get("/attestation")
-async def get_attestation(request: Request):
+async def get_attestation(request: Request, nonce: str | None = None):
     """
     Returns attestation certificate bundle.
 
     Contains everything a remote verifier needs:
     - Encryption + signing public keys
-    - SNP attestation report (signed by AMD VCEK)
-    - AMD certificate chain (ARK -> ASK -> VCEK)
+    - Hardware attestation report (AMD VCEK / Intel TDX Quote)
+    - Certificate chain
     - VM metadata (measurement, OS, vLLM version, image hash)
+
+    Optional: ?nonce=<hex_32bytes> for freshness proof (spec §3.1).
     """
     att = getattr(request.app.state, "tee_attestation", None)
     if att is None:
         raise HTTPException(status_code=503, detail="Attestation not ready")
-    return att
+
+    if nonce is None:
+        return att
+
+    # Freshness proof: sign nonce with attested Ed25519 key (spec §3.1)
+    keys = getattr(request.app.state, "tee_keys", None)
+    if keys is None:
+        raise HTTPException(status_code=503, detail="TEE not ready")
+
+    try:
+        nonce_bytes = bytes.fromhex(nonce)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Nonce must be valid hex")
+    if len(nonce_bytes) != 32:
+        raise HTTPException(status_code=400, detail="Nonce must be 32 bytes")
+
+    freshness_sig = keys.sign_private.sign(nonce_bytes).signature
+    return {**att, "freshness_proof": freshness_sig.hex()}
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +179,8 @@ async def encrypted_chat_completions(req: EncryptedRequest, request: Request):
     openai_request.pop("stream", None)
 
     model = openai_request.get("model", "default")
-    logger.info(f"TEE inference request (model={model})")  # No prompt logged
+    safe_model = str(model)[:64].replace("\n", "").replace("\r", "") if model else "unknown"
+    logger.info(f"TEE inference request (model={safe_model})")
 
     try:
         client = await _get_vllm_client()

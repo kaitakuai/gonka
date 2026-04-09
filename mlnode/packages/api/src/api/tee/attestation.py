@@ -5,6 +5,7 @@ Refactored in Phase 5.6: attestation logic moved to backends/,
 this module is now a thin orchestration layer.
 """
 
+import os
 import platform
 
 from common.logger import create_logger
@@ -71,7 +72,7 @@ def generate_attestation(keys, tee_info: TEEInfo, image_hash: str = None) -> dic
     # Step 3: Verify
     certs_valid = backend.verify_certs()
     report_valid = backend.verify_report()
-    logger.info(f"Attestation verification: certs={certs_valid}, report={report_valid}")
+    logger.debug(f"Attestation verification: certs={certs_valid}, report={report_valid}")
 
     # Step 4: Parse report
     parsed_report = backend.parse_report(report_bytes)
@@ -129,13 +130,16 @@ def generate_attestation(keys, tee_info: TEEInfo, image_hash: str = None) -> dic
         # --- Certificate Chain ---
         "certs": certs,
 
-        # --- Verification status ---
-        "verification": {
+    }
+
+    # Verification object: debug-only per spec §3.1.6.
+    # Client MUST NOT use these flags for trust decisions (ADR-0010).
+    if os.getenv("TEE_DEBUG_ATTESTATION", "0") == "1":
+        bundle["verification"] = {
             "certs_valid": certs_valid,
             "report_valid": report_valid,
             "keys_bound": keys_bound,
-        },
-    }
+        }
 
     # Warnings from detection
     if tee_info.warnings:
