@@ -428,7 +428,7 @@ func (am AppModule) EndBlock(ctx context.Context) error {
 	if epochContext.IsSetNewValidatorsStage(blockHeight) {
 		am.LogInfo("StartStage:onSetNewValidatorsStage", types.Stages, "blockHeight", blockHeight)
 		am.onSetNewValidatorsStage(ctx, blockHeight, blockTime)
-		if err := am.keeper.SetEffectiveEpochIndex(ctx, getNextEpochIndex(*currentEpoch)); err != nil {
+		if err := am.keeper.SetEffectiveEpochIndex(sdkCtx, getNextEpochIndex(*currentEpoch)); err != nil {
 			return err
 		}
 		am.LogInfo("Epoch index flipped; new validator set activates at H+2",
