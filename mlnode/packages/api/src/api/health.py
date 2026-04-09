@@ -1,11 +1,14 @@
+import os
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel
 
 from api.gpu.types import GPUDevice
 from api.service_management import ServiceState
+
+TEE_ENABLED = os.getenv("TEE_ENABLED", "0") == "1"
 
 router = APIRouter()
 
@@ -31,11 +34,20 @@ class ManagersInfo(BaseModel):
     train: ManagerStatus
 
 
+class TEEStatus(BaseModel):
+    """TEE status for Network Node discovery (spec §3.3)."""
+    enabled: bool
+    type: str
+    attestation_ready: bool
+    gpu_cc: bool
+
+
 class HealthResponse(BaseModel):
     status: str
     service_state: ServiceState
     gpu: GPUInfo
     managers: ManagersInfo
+    tee: Optional[TEEStatus] = None
 
 class ReadinessResponse(BaseModel):
     ready: bool
@@ -83,11 +95,24 @@ async def get_health_data(request: Request) -> HealthResponse:
     if managers_info.inference.running and not managers_info.inference.healthy:
         overall_healthy = False
 
+    # TEE status (spec §3.3)
+    tee_status = None
+    if TEE_ENABLED:
+        tee_info = getattr(request.app.state, "tee_info", None)
+        tee_attestation = getattr(request.app.state, "tee_attestation", None)
+        tee_status = TEEStatus(
+            enabled=True,
+            type=tee_info.cpu_tee.value if tee_info else "unknown",
+            attestation_ready=tee_attestation is not None,
+            gpu_cc=tee_info.gpu_cc is not None if tee_info else False,
+        )
+
     return HealthResponse(
         status="healthy" if overall_healthy else "unhealthy",
         service_state=request.app.state.service_state,
         gpu=gpu_info,
         managers=managers_info,
+        tee=tee_status,
     )
 
 
