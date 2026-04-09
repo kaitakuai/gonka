@@ -19,14 +19,13 @@ Storage (§7.2.3):
   encrypted by SEV-SNP/TDX hardware. The host sees only ciphertext.
 """
 
-import hashlib
 import os
-import sys
+import re
 from pathlib import Path
 
 from common.logger import create_logger
 
-from .manifest import ModelManifest
+from .manifest import ModelManifest, _sha256_file
 
 logger = create_logger(__name__)
 
@@ -37,6 +36,9 @@ DEFAULT_MODEL_DIR = Path("/data/models")
 # Manifest location (baked into VM image at build time)
 DEFAULT_MANIFEST_PATH = Path("/app/model_manifest.json")
 
+# Strict model_id pattern: org/name with safe characters only
+_MODEL_ID_RE = re.compile(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
+
 
 class ModelLoadError(Exception):
     """Fatal error during model loading. MLNode MUST NOT start."""
@@ -46,6 +48,14 @@ class ModelLoadError(Exception):
 class HashMismatchError(ModelLoadError):
     """SHA-256 hash mismatch — possible supply chain attack (spec §10.2 MI-2)."""
     pass
+
+
+def _safe_path(base: Path, filename: str) -> Path:
+    """Resolve filename under base, rejecting path traversal."""
+    resolved = (base / filename).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        raise ModelLoadError(f"Path traversal in manifest filename: {filename}")
+    return resolved
 
 
 def load_model(
@@ -68,32 +78,41 @@ def load_model(
     manifest_path = Path(manifest_path or DEFAULT_MANIFEST_PATH)
     model_dir = Path(model_dir or DEFAULT_MODEL_DIR)
 
-    # Step 1: Load manifest
+    # Step 1: Load manifest (MUST exist in TEE mode — spec §10.2 MI-1)
     if not manifest_path.exists():
-        logger.warning(f"No model manifest at {manifest_path} — skipping model verification")
-        return model_dir, None
+        raise ModelLoadError(
+            f"Model manifest not found at {manifest_path}. "
+            f"Cannot start without integrity verification in TEE mode."
+        )
 
     logger.info(f"Loading model manifest: {manifest_path}")
     manifest = ModelManifest.load(manifest_path)
+
+    # Validate model_id
+    if not _MODEL_ID_RE.match(manifest.model_id):
+        raise ModelLoadError(f"Invalid model_id format: {manifest.model_id}")
+
     logger.info(
         f"  Model: {manifest.model_id}@{manifest.revision[:12]}, "
         f"{manifest.file_count} files, {manifest.total_size_bytes / (1024**3):.1f} GB"
     )
 
-    # Step 2: Prepare model directory
+    # Validate all filenames before any I/O (reject path traversal)
     model_path = model_dir / manifest.model_id.replace("/", "--")
     model_path.mkdir(parents=True, exist_ok=True)
+    for entry in manifest.files:
+        _safe_path(model_path, entry.filename)
 
-    # Step 3: Check if already downloaded and verified
+    # Step 2: Check if already downloaded and verified
     if _all_files_verified(manifest, model_path):
         logger.info("All model files already present and verified")
         return model_path, manifest
 
-    # Step 4: Download from HuggingFace (or mirror)
+    # Step 3: Download from HuggingFace (or mirror)
     logger.info(f"Downloading model to {model_path}...")
     _download_model(manifest, model_path)
 
-    # Step 5: Verify ALL files (spec §10.2 MI-1)
+    # Step 4: Verify ALL files (spec §10.2 MI-1)
     logger.info("Verifying SHA-256 hashes...")
     _verify_all_files(manifest, model_path)
 
@@ -104,7 +123,7 @@ def load_model(
 def _all_files_verified(manifest: ModelManifest, model_path: Path) -> bool:
     """Check if all files exist and have correct hashes (cached download)."""
     for entry in manifest.files:
-        file_path = model_path / entry.filename
+        file_path = _safe_path(model_path, entry.filename)
         if not file_path.exists():
             return False
         if not manifest.verify_file(entry.filename, file_path):
@@ -127,9 +146,8 @@ def _download_model(manifest: ModelManifest, model_path: Path) -> None:
         logger.info(f"Using HF mirror: {endpoint}")
 
     for entry in manifest.files:
-        file_path = model_path / entry.filename
+        file_path = _safe_path(model_path, entry.filename)
         if file_path.exists():
-            # Already downloaded (partial resume)
             if manifest.verify_file(entry.filename, file_path):
                 logger.info(f"  {entry.filename}: cached, verified")
                 continue
@@ -140,7 +158,7 @@ def _download_model(manifest: ModelManifest, model_path: Path) -> None:
         logger.info(f"  {entry.filename}: downloading ({entry.size_bytes / (1024**2):.1f} MB)...")
 
         try:
-            downloaded = hf_hub_download(
+            hf_hub_download(
                 manifest.model_id,
                 entry.filename,
                 revision=manifest.revision,
@@ -164,7 +182,7 @@ def _verify_all_files(manifest: ModelManifest, model_path: Path) -> None:
       [MI-2] Hash mismatch MUST prevent the model from loading.
     """
     for entry in manifest.files:
-        file_path = model_path / entry.filename
+        file_path = _safe_path(model_path, entry.filename)
         if not file_path.exists():
             raise ModelLoadError(f"File missing after download: {entry.filename}")
 
@@ -176,15 +194,3 @@ def _verify_all_files(manifest: ModelManifest, model_path: Path) -> None:
                 f"Possible supply chain attack. Refusing to load model."
             )
         logger.info(f"  {entry.filename}: SHA-256 OK")
-
-
-def _sha256_file(path: Path) -> str:
-    """Compute SHA-256 of a file, streaming."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
