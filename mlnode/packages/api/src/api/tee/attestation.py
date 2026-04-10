@@ -5,7 +5,10 @@ Refactored in Phase 5.6: attestation logic moved to backends/,
 this module is now a thin orchestration layer.
 """
 
+import hashlib
+import os
 import platform
+from pathlib import Path
 
 from common.logger import create_logger
 
@@ -46,6 +49,73 @@ def _collect_vm_metadata() -> dict:
     }
 
 
+# Paths to include in image hash computation.
+# Deterministic: sorted by name, same files = same hash, any change = different hash.
+_IMAGE_HASH_PATHS = [
+    Path("/app/packages/api/src"),
+    Path("/app/packages/common/src"),
+    Path("/app/model_manifest.json"),
+    Path("/app/entrypoint.sh"),
+]
+
+# Only include files with these extensions (positive filter — safer than exclusion).
+_HASH_EXTENSIONS = {".py", ".json", ".yaml", ".yml", ".toml", ".cfg", ".txt", ".sh"}
+
+
+def compute_image_hash() -> str:
+    """Compute deterministic SHA-256 hash of the application code, config, and deps.
+
+    Covers:
+      - Python source files under /app (positive extension filter)
+      - Model manifest
+      - Entrypoint script
+      - pip freeze output (installed package versions)
+
+    Same code + same deps = same hash. Change one byte = different hash.
+
+    This is NOT the same as the TEE measurement (which covers the entire
+    VM disk image). This is a software-level hash for verifying that the
+    application code and dependencies match expectations.
+    """
+    import subprocess as _sp
+
+    h = hashlib.sha256()
+    file_count = 0
+
+    # Hash application files
+    for root_path in _IMAGE_HASH_PATHS:
+        if root_path.is_file() and not root_path.is_symlink():
+            h.update(str(root_path).encode())
+            h.update(root_path.read_bytes())
+            file_count += 1
+        elif root_path.is_dir() and not root_path.is_symlink():
+            for fpath in sorted(root_path.rglob("*")):
+                if (fpath.is_file()
+                        and not fpath.is_symlink()
+                        and fpath.suffix in _HASH_EXTENSIONS):
+                    rel = str(fpath.relative_to(root_path))
+                    h.update(rel.encode())
+                    h.update(fpath.read_bytes())
+                    file_count += 1
+
+    # Hash pip freeze output (covers all installed dependencies)
+    try:
+        result = _sp.run(
+            ["pip", "freeze", "--all"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            h.update(b"__pip_freeze__")
+            h.update(result.stdout.strip().encode())
+            file_count += 1
+    except Exception:
+        logger.warning("pip freeze failed — dependency versions NOT included in image hash")
+
+    digest = h.hexdigest()
+    logger.debug(f"Image hash computed: {digest[:16]}... ({file_count} files)")
+    return digest
+
+
 def generate_attestation(keys, tee_info: TEEInfo, image_hash: str = None) -> dict:
     """
     Generate full attestation bundle per proposal #951.
@@ -53,11 +123,14 @@ def generate_attestation(keys, tee_info: TEEInfo, image_hash: str = None) -> dic
     Args:
         keys: TEEKeyManager instance
         tee_info: Detected TEE environment from detect_tee()
-        image_hash: SHA-256 of the base VM image
+        image_hash: SHA-256 override. If None, auto-computed from /app code.
 
     Returns:
         Attestation bundle dict with all fields needed for remote verification.
     """
+    # Auto-compute image hash if not provided
+    if image_hash is None:
+        image_hash = compute_image_hash()
     backend = _get_backend(tee_info)
     logger.info(f"Generating attestation using {backend.tee_type()} backend")
 
