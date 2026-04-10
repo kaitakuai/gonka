@@ -9,11 +9,14 @@
 #   TEE_PLATFORM=$(bash host/detect.sh)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$SCRIPT_DIR/../lib.sh" ] && source "$SCRIPT_DIR/../lib.sh" || {
+if [ -f "$SCRIPT_DIR/../lib.sh" ]; then
+    # shellcheck source=mlnode/vm/scripts/lib.sh
+    source "$SCRIPT_DIR/../lib.sh"
+else
     log()  { echo "[+] $*"; }
     warn() { echo "[!] $*"; }
     die()  { echo "[ERROR] $1" >&2; exit 1; }
-}
+fi
 
 detect_platform() {
     local platform=""
@@ -62,6 +65,7 @@ detect_platform() {
         die "No TEE hardware found. Cannot launch Confidential MLNode."
     fi
 
+    # shellcheck disable=SC2034  # set for callers that source this script
     TEE_PLATFORM="$platform"
     echo "$platform"
 }

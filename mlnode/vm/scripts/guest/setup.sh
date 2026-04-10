@@ -10,6 +10,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # If lib.sh is not next to us (first run from gonka clone), inline essentials
 if [ -f "$SCRIPT_DIR/../lib.sh" ]; then
+    # shellcheck source=mlnode/vm/scripts/lib.sh
     source "$SCRIPT_DIR/../lib.sh"
 else
     set -euo pipefail
@@ -121,8 +122,9 @@ install_attestation_tools() {
 # ── Step 3: Verify attestation ───────────────────────────────────────────────
 
 verify_amd_attestation() {
-    local dir=$(mktemp -d)
-    cd "$dir"
+    local dir
+    dir=$(mktemp -d)
+    cd "$dir" || die "cannot cd $dir"
     snpguest report report.bin request.txt --random
     mkdir -p certs
     snpguest fetch vcek -p milan pem ./certs report.bin
@@ -209,6 +211,7 @@ install_python_deps() {
 # ── Step 7: Build vLLM CPU ───────────────────────────────────────────────────
 
 build_vllm_cpu() {
+    # shellcheck disable=SC1091  # venv created by previous step at runtime
     source /opt/mlnode/bin/activate
 
     if python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null | grep -q "0.15.1"; then

@@ -8,8 +8,10 @@
 #   FORCE=1 bash host/setup.sh      # redo all steps
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=mlnode/vm/scripts/lib.sh
 source "$SCRIPT_DIR/../lib.sh"
 
+# shellcheck disable=SC2034  # read by checkpoint_set/checkpoint_done in lib.sh
 CHECKPOINT_FILE="/tmp/.tee-host-setup-progress"
 SNP_VM_DIR="/root/snp-vm"
 
@@ -48,10 +50,11 @@ build_qemu() {
         return 0
     fi
 
-    cd /root
+    cd /root || die "cannot cd /root"
     [ -d qemu ] || git clone https://gitlab.com/qemu-project/qemu.git --branch v9.2.3 --depth 1
-    cd qemu
-    mkdir -p build && cd build
+    cd qemu || die "cannot cd qemu"
+    mkdir -p build
+    cd build || die "cannot cd build"
     ../configure --target-list=x86_64-softmmu --enable-kvm --enable-slirp --prefix=/usr/local
     make -j"$(nproc)"
     make install
@@ -70,13 +73,13 @@ build_ovmf() {
         return 0
     fi
 
-    cd /root
+    cd /root || die "cannot cd /root"
     [ -d edk2 ] || git clone https://github.com/tianocore/edk2.git --branch edk2-stable202411 --depth 1
-    cd edk2
+    cd edk2 || die "cannot cd edk2"
     git submodule update --init --depth 1
 
     # Patch GRUB modules (Ubuntu doesn't ship linuxefi/sevsecret)
-    cd OvmfPkg/AmdSev/Grub
+    cd OvmfPkg/AmdSev/Grub || die "cannot cd OvmfPkg/AmdSev/Grub"
     sed -i 's/linuxefi//' grub.sh
     sed -i '/sevsecret/d' grub.sh
 
@@ -107,8 +110,9 @@ fi
 GRUBCFG
 
     # Build (edksetup.sh uses uninitialized vars, temporarily disable nounset)
-    cd /root/edk2
+    cd /root/edk2 || die "cannot cd /root/edk2"
     set +u
+    # shellcheck disable=SC1091  # edksetup.sh is part of edk2 build, fetched at runtime
     source edksetup.sh
     set -u
     make -C BaseTools -j"$(nproc)"
@@ -118,13 +122,14 @@ GRUBCFG
     build -a X64 -b DEBUG -t GCC5 -p OvmfPkg/AmdSev/AmdSevX64.dsc -n "$(nproc)"
 
     require_file "$ovmf_out" "OVMF build failed"
-    log "OVMF built: $(ls -lh "$ovmf_out" | awk '{print $5}')"
+    log "OVMF built: $(du -h "$ovmf_out" | awk '{print $1}')"
 }
 
 # ── Step 4: Prepare VM image ────────────────────────────────────────────────
 
 prepare_vm_image() {
-    mkdir -p "$SNP_VM_DIR" && cd "$SNP_VM_DIR"
+    mkdir -p "$SNP_VM_DIR"
+    cd "$SNP_VM_DIR" || die "cannot cd $SNP_VM_DIR"
 
     # Download Ubuntu cloud image
     if [ ! -f ubuntu-24.04-cloud.img ]; then

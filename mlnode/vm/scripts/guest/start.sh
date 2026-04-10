@@ -57,6 +57,7 @@ start_vllm() {
     fi
 
     log "Starting vLLM ($MODEL, CPU)..."
+    # shellcheck disable=SC1091  # venv created at runtime by guest/setup.sh
     source /opt/mlnode/bin/activate
     nohup python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL" \
@@ -91,8 +92,9 @@ start_mlnode() {
     fi
 
     log "Starting MLNode API (TEE_ENABLED=$TEE_ENABLED)..."
+    # shellcheck disable=SC1091  # venv created at runtime by guest/setup.sh
     source /opt/mlnode/bin/activate
-    cd /app/packages/api/src
+    cd /app/packages/api/src || die "cannot cd /app/packages/api/src"
     nohup python3 -m uvicorn api.app:app \
         --host 0.0.0.0 \
         --port "$MLNODE_PORT" \
@@ -115,6 +117,7 @@ start_mlnode() {
 
 run_e2e_test() {
     log "Running E2E encrypted inference test..."
+    # shellcheck disable=SC1091  # venv created at runtime by guest/setup.sh
     source /opt/mlnode/bin/activate
     python3 /root/gonka/mlnode/packages/api/client/tee_client.py \
         --url "http://127.0.0.1:$MLNODE_PORT" \
