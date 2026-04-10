@@ -154,8 +154,7 @@ def generate_attestation(keys, tee_info: TEEInfo, image_hash: str = None) -> dic
 
     # Step 6: Collect VM metadata
     vm_meta = _collect_vm_metadata()
-    if image_hash:
-        vm_meta["image_hash"] = image_hash
+    vm_meta["image_hash"] = image_hash
 
     # Step 7: Build GPU CC info
     gpu_info = None
