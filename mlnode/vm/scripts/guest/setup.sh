@@ -8,25 +8,11 @@
 #   sudo FORCE=1 bash guest/setup.sh      # redo all steps
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# If _common.sh is not next to us (first run from gonka clone), inline essentials
-if [ -f "$SCRIPT_DIR/../_common.sh" ]; then
-    source "$SCRIPT_DIR/../_common.sh"
-else
-    set -euo pipefail
-    CHECKPOINT_FILE="/tmp/.tee-guest-setup-progress"
-    FORCE="${FORCE:-0}"
-    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-    log()  { echo -e "${GREEN}[+]${NC} $*"; }
-    warn() { echo -e "${YELLOW}[!]${NC} $*"; }
-    err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-    die() { err "$1"; [ -n "${2:-}" ] && echo -e "${YELLOW}[FIX]${NC} $2" >&2; exit "${3:-1}"; }
-    checkpoint_set() { echo "$1" >> "$CHECKPOINT_FILE"; }
-    checkpoint_done() { [ "$FORCE" = "1" ] && return 1; grep -qxF "$1" "$CHECKPOINT_FILE" 2>/dev/null; }
-    run_step() { local n="$1"; shift; if checkpoint_done "$n"; then log "SKIP $n"; return 0; fi; log "START $n"; if "$@"; then checkpoint_set "$n"; log "DONE $n"; else die "Step '$n' failed" "Fix and re-run."; fi; }
-    require_cmd() { command -v "$1" > /dev/null 2>&1 || die "'$1' not found" "${2:-}"; }
-fi
+# shellcheck source=mlnode/vm/scripts/lib.sh
+source "$SCRIPT_DIR/../lib.sh"
 
-CHECKPOINT_FILE="/tmp/.tee-guest-setup-progress"
+# shellcheck disable=SC2034  # read by checkpoint_set/checkpoint_done in lib.sh
+CHECKPOINT_FILE="/tmp/.tee/guest/setup.progress"
 
 [ "$(id -u)" -eq 0 ] || die "Must run as root (sudo)"
 
@@ -121,8 +107,9 @@ install_attestation_tools() {
 # ── Step 3: Verify attestation ───────────────────────────────────────────────
 
 verify_amd_attestation() {
-    local dir=$(mktemp -d)
-    cd "$dir"
+    local dir
+    dir=$(mktemp -d)
+    cd "$dir" || die "cannot cd $dir"
     snpguest report report.bin request.txt --random
     mkdir -p certs
     snpguest fetch vcek -p milan pem ./certs report.bin
@@ -209,6 +196,7 @@ install_python_deps() {
 # ── Step 7: Build vLLM CPU ───────────────────────────────────────────────────
 
 build_vllm_cpu() {
+    # shellcheck disable=SC1091  # venv created by previous step at runtime
     source /opt/mlnode/bin/activate
 
     if python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null | grep -q "0.15.1"; then

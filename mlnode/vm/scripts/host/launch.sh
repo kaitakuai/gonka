@@ -14,7 +14,9 @@
 #   API_PORT=8080    # host port forwarded to guest API (default: 8080)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/../_common.sh"
+# shellcheck source=mlnode/vm/scripts/lib.sh
+source "$SCRIPT_DIR/../lib.sh"
+# shellcheck source=mlnode/vm/scripts/host/detect.sh
 source "$SCRIPT_DIR/detect.sh"
 
 VM_DIR="/root/tee-vm"
@@ -180,7 +182,7 @@ launch_vm() {
 
     # Wait for SSH
     log "VM launched. Waiting for SSH on port $SSH_PORT..."
-    for i in $(seq 1 24); do
+    for _ in $(seq 1 24); do
         if ssh -p "$SSH_PORT" -o ConnectTimeout=3 -o StrictHostKeyChecking=accept-new ubuntu@localhost "echo ok" > /dev/null 2>&1; then
             log "VM ready — SSH on port $SSH_PORT"
             return 0

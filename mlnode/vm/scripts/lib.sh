@@ -1,10 +1,17 @@
 #!/bin/bash
-# Common helpers for TEE setup scripts.
-# Source this file, do not execute directly.
+# Library of helpers for TEE deployment scripts.
+# Sourced by host/*.sh and guest/*.sh — not executed directly.
+#
+# Provides:
+#   - logging: log, warn, err, die (with fix-hint)
+#   - checkpoint state: checkpoint_set, checkpoint_done, run_step
+#   - preconditions: require_cmd, require_file
 
 set -euo pipefail
 
-CHECKPOINT_FILE="${CHECKPOINT_FILE:-/tmp/.tee-setup-progress}"
+# CHECKPOINT_FILE MUST be set by the caller before sourcing this library.
+# Convention: /tmp/.tee/<host|guest>/<script>.progress
+# (e.g. /tmp/.tee/host/setup.progress for host/setup.sh)
 FORCE="${FORCE:-0}"
 
 # Colors
@@ -25,11 +32,17 @@ die() {
     exit "${3:-1}"
 }
 
-# Checkpoint: mark step as done
-checkpoint_set() { echo "$1" >> "$CHECKPOINT_FILE"; }
+# Checkpoint: mark step as done.
+# Caller must have set CHECKPOINT_FILE before calling.
+checkpoint_set() {
+    : "${CHECKPOINT_FILE:?CHECKPOINT_FILE must be set before using checkpoints}"
+    mkdir -p "$(dirname "$CHECKPOINT_FILE")"
+    echo "$1" >> "$CHECKPOINT_FILE"
+}
 
 # Checkpoint: check if step already done (skip if --force)
 checkpoint_done() {
+    : "${CHECKPOINT_FILE:?CHECKPOINT_FILE must be set before using checkpoints}"
     [ "$FORCE" = "1" ] && return 1
     grep -qxF "$1" "$CHECKPOINT_FILE" 2>/dev/null
 }
