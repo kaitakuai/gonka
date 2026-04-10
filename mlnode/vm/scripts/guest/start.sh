@@ -1,12 +1,12 @@
 #!/bin/bash
 # Start Confidential MLNode: vLLM + TEE-enabled API.
-# Run as root inside the SEV-SNP VM after guest-setup.sh.
+# Run as root inside the SEV-SNP VM after guest/setup.sh.
 #
 # Usage:
-#   sudo bash guest-start.sh              # start
-#   sudo bash guest-start.sh stop         # stop
-#   sudo bash guest-start.sh status       # check
-#   sudo bash guest-start.sh test         # start + E2E test
+#   sudo bash guest/start.sh              # start
+#   sudo bash guest/start.sh stop         # stop
+#   sudo bash guest/start.sh status       # check
+#   sudo bash guest/start.sh test         # start + E2E test
 
 set -euo pipefail
 
@@ -139,10 +139,10 @@ case "${1:-start}" in
         echo ""
         show_status
         echo ""
-        log "To test: sudo bash guest-start.sh test"
+        log "To test: sudo bash guest/start.sh test"
         ;;
     *)
-        echo "Usage: sudo bash guest-start.sh [start|stop|status|test]"
+        echo "Usage: sudo bash guest/start.sh [start|stop|status|test]"
         exit 1
         ;;
 esac

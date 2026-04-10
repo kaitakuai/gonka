@@ -4,12 +4,12 @@
 # Exits with error if no TEE platform found.
 #
 # Usage:
-#   source detect_platform.sh   # sets TEE_PLATFORM variable
+#   source host/detect.sh   # sets TEE_PLATFORM variable
 #   # or
-#   TEE_PLATFORM=$(bash detect_platform.sh)
+#   TEE_PLATFORM=$(bash host/detect.sh)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$SCRIPT_DIR/_common.sh" ] && source "$SCRIPT_DIR/_common.sh" || {
+[ -f "$SCRIPT_DIR/../_common.sh" ] && source "$SCRIPT_DIR/../_common.sh" || {
     log()  { echo "[+] $*"; }
     warn() { echo "[!] $*"; }
     die()  { echo "[ERROR] $1" >&2; exit 1; }

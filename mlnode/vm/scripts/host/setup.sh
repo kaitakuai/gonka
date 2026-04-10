@@ -4,11 +4,11 @@
 # Idempotent — safe to re-run. Skips completed steps.
 #
 # Usage:
-#   bash host-setup.sh              # normal run
-#   FORCE=1 bash host-setup.sh      # redo all steps
+#   bash host/setup.sh              # normal run
+#   FORCE=1 bash host/setup.sh      # redo all steps
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/_common.sh"
+source "$SCRIPT_DIR/../_common.sh"
 
 CHECKPOINT_FILE="/tmp/.tee-host-setup-progress"
 SNP_VM_DIR="/root/snp-vm"
@@ -199,4 +199,4 @@ run_step "install-packages"  install_packages
 run_step "build-qemu"        build_qemu
 run_step "build-ovmf"        build_ovmf
 run_step "prepare-vm-image"  prepare_vm_image
-echo "=== Host setup complete. Run host-launch.sh to start the VM ==="
+echo "=== Host setup complete. Run host/launch.sh to start the VM ==="
