@@ -28,9 +28,9 @@ Installs packages, builds QEMU 9.2 + OVMF AmdSev, prepares VM image.
 
 ```bash
 git clone https://github.com/kaitakuai/gonka.git --branch tee --depth 1
-cd gonka/mlnode/packages/api/scripts/tee
+cd gonka/mlnode/vm/scripts
 
-bash host-setup.sh
+bash host/setup.sh
 ```
 
 ### 2. Launch VM (~1 min)
@@ -38,7 +38,7 @@ bash host-setup.sh
 Starts SEV-SNP encrypted VM and waits for SSH.
 
 ```bash
-bash host-launch.sh
+bash host/launch.sh
 ```
 
 ### 3. Guest setup (~10 min)
@@ -48,7 +48,7 @@ SSH into VM and install everything: verifies SEV-SNP, installs snpguest, clones 
 ```bash
 ssh -p 2222 ubuntu@localhost
 # Inside VM:
-sudo bash /root/gonka/mlnode/packages/api/scripts/tee/guest-setup.sh
+sudo bash /root/gonka/mlnode/vm/scripts/guest/setup.sh
 ```
 
 ### 4. Start + test (~2 min)
@@ -56,7 +56,7 @@ sudo bash /root/gonka/mlnode/packages/api/scripts/tee/guest-setup.sh
 Starts vLLM + MLNode with TEE attestation, runs E2E encrypted inference test.
 
 ```bash
-sudo bash /root/gonka/mlnode/packages/api/scripts/tee/guest-start.sh test
+sudo bash /root/gonka/mlnode/vm/scripts/guest/start.sh test
 ```
 
 Expected output:
@@ -82,19 +82,19 @@ Expected output:
 
 ```bash
 # Check status
-sudo bash guest-start.sh status
+sudo bash guest/start.sh status
 
 # Stop
-sudo bash guest-start.sh stop
+sudo bash guest/start.sh stop
 
 # Start without test
-sudo bash guest-start.sh
+sudo bash guest/start.sh
 
 # Stop VM (from host)
-bash host-launch.sh stop
+bash host/launch.sh stop
 
 # VM status (from host)
-bash host-launch.sh status
+bash host/launch.sh status
 ```
 
 ---
@@ -105,10 +105,10 @@ All scripts are **idempotent** — completed steps are skipped on re-run.
 
 ```bash
 # Just re-run the same command — it picks up where it left off
-sudo bash guest-setup.sh
+sudo bash guest/setup.sh
 
 # Force redo all steps
-sudo FORCE=1 bash guest-setup.sh
+sudo FORCE=1 bash guest/setup.sh
 ```
 
 Checkpoint files: `/tmp/.tee-host-setup-progress`, `/tmp/.tee-guest-setup-progress`.
@@ -119,7 +119,7 @@ Checkpoint files: `/tmp/.tee-host-setup-progress`, `/tmp/.tee-guest-setup-progre
 
 | Script | Runs on | What it does |
 |--------|---------|-------------|
-| `host-setup.sh` | Host (root) | Packages, QEMU 9.2, OVMF AmdSev, VM image |
-| `host-launch.sh` | Host (root) | Launch / stop / status SEV-SNP VM |
-| `guest-setup.sh` | VM (sudo) | SEV verify, snpguest, gonka, venv, vLLM CPU |
-| `guest-start.sh` | VM (sudo) | vLLM + MLNode start / stop / status / test |
+| `host/setup.sh` | Host (root) | Packages, QEMU 9.2, OVMF AmdSev, VM image |
+| `host/launch.sh` | Host (root) | Launch / stop / status SEV-SNP VM |
+| `guest/setup.sh` | VM (sudo) | SEV verify, snpguest, gonka, venv, vLLM CPU |
+| `guest/start.sh` | VM (sudo) | vLLM + MLNode start / stop / status / test |
