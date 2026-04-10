@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib.sh"
 
 # shellcheck disable=SC2034  # read by checkpoint_set/checkpoint_done in lib.sh
-CHECKPOINT_FILE="/tmp/.tee-host-setup-progress"
+CHECKPOINT_FILE="/tmp/.tee/host/setup.progress"
 SNP_VM_DIR="/root/snp-vm"
 
 [ "$(id -u)" -eq 0 ] || die "Must run as root"

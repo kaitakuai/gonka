@@ -111,7 +111,7 @@ sudo bash guest/setup.sh
 sudo FORCE=1 bash guest/setup.sh
 ```
 
-Checkpoint files: `/tmp/.tee-host-setup-progress`, `/tmp/.tee-guest-setup-progress`.
+Checkpoint files: `/tmp/.tee/host/setup.progress`, `/tmp/.tee/guest/setup.progress`.
 
 ---
 
