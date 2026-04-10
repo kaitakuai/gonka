@@ -4,13 +4,13 @@
 # Idempotent — safe to re-run.
 #
 # Usage:
-#   sudo bash guest-setup.sh              # normal run
-#   sudo FORCE=1 bash guest-setup.sh      # redo all steps
+#   sudo bash guest/setup.sh              # normal run
+#   sudo FORCE=1 bash guest/setup.sh      # redo all steps
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # If _common.sh is not next to us (first run from gonka clone), inline essentials
-if [ -f "$SCRIPT_DIR/_common.sh" ]; then
-    source "$SCRIPT_DIR/_common.sh"
+if [ -f "$SCRIPT_DIR/../_common.sh" ]; then
+    source "$SCRIPT_DIR/../_common.sh"
 else
     set -euo pipefail
     CHECKPOINT_FILE="/tmp/.tee-guest-setup-progress"
@@ -266,4 +266,4 @@ fi
 log "  vLLM:            $(/opt/mlnode/bin/python3 -c 'import vllm; print(vllm.__version__)' 2>/dev/null || echo MISSING)"
 log "  PyNaCl:          $(/opt/mlnode/bin/python3 -c 'from nacl.public import PrivateKey; print("OK")' 2>/dev/null || echo MISSING)"
 echo ""
-echo "=== Guest setup complete. Run guest-start.sh to launch MLNode ==="
+echo "=== Guest setup complete. Run guest/start.sh to launch MLNode ==="

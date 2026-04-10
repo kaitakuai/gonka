@@ -1,11 +1,11 @@
 #!/bin/bash
 # Launch TEE guest VM (AMD SEV-SNP or Intel TDX — auto-detected).
-# Run as root on the bare-metal host after host-setup.sh.
+# Run as root on the bare-metal host after host/setup.sh.
 #
 # Usage:
-#   bash host-launch.sh          # launch VM (auto-detect platform)
-#   bash host-launch.sh stop     # stop VM
-#   bash host-launch.sh status   # check VM status
+#   bash host/launch.sh          # launch VM (auto-detect platform)
+#   bash host/launch.sh stop     # stop VM
+#   bash host/launch.sh status   # check VM status
 #
 # Environment:
 #   VM_RAM=32G       # guest RAM (default: 32G)
@@ -14,8 +14,8 @@
 #   API_PORT=8080    # host port forwarded to guest API (default: 8080)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/_common.sh"
-source "$SCRIPT_DIR/detect_platform.sh"
+source "$SCRIPT_DIR/../_common.sh"
+source "$SCRIPT_DIR/detect.sh"
 
 VM_DIR="/root/tee-vm"
 VM_RAM="${VM_RAM:-32G}"
@@ -52,13 +52,13 @@ status_vm() {
 # ── QEMU binary ──────────────────────────────────────────────────────────────
 
 find_qemu() {
-    # Prefer locally built QEMU (host-setup.sh builds to /usr/local/bin)
+    # Prefer locally built QEMU (host/setup.sh builds to /usr/local/bin)
     if [ -x /usr/local/bin/qemu-system-x86_64 ]; then
         echo /usr/local/bin/qemu-system-x86_64
     elif [ -x /usr/bin/qemu-system-x86_64 ]; then
         echo /usr/bin/qemu-system-x86_64
     else
-        die "qemu-system-x86_64 not found" "Run host-setup.sh first"
+        die "qemu-system-x86_64 not found" "Run host/setup.sh first"
     fi
 }
 
@@ -67,9 +67,9 @@ find_qemu() {
 launch_amd() {
     local qemu="$1"
 
-    require_file "$VM_DIR/OVMF_AMDSEV.fd" "Run host-setup.sh first (AMD OVMF not built)"
-    require_file "$VM_DIR/vmlinuz" "Run host-setup.sh first (kernel not extracted)"
-    require_file "$VM_DIR/initrd.img" "Run host-setup.sh first (initrd not extracted)"
+    require_file "$VM_DIR/OVMF_AMDSEV.fd" "Run host/setup.sh first (AMD OVMF not built)"
+    require_file "$VM_DIR/vmlinuz" "Run host/setup.sh first (kernel not extracted)"
+    require_file "$VM_DIR/initrd.img" "Run host/setup.sh first (initrd not extracted)"
 
     log "Launching AMD SEV-SNP VM (RAM=$VM_RAM, CPUs=$VM_CPUS)..."
     "$qemu" \
@@ -160,11 +160,11 @@ launch_vm() {
     log "Platform: $platform"
 
     # Check common files
-    require_file "$VM_DIR/guest.qcow2" "Run host-setup.sh first"
-    require_file "$VM_DIR/cloud-init.iso" "Run host-setup.sh first"
+    require_file "$VM_DIR/guest.qcow2" "Run host/setup.sh first"
+    require_file "$VM_DIR/cloud-init.iso" "Run host/setup.sh first"
 
     if vm_running; then
-        warn "VM already running. Use 'bash host-launch.sh stop' to stop it first."
+        warn "VM already running. Use 'bash host/launch.sh stop' to stop it first."
         return 0
     fi
 
