@@ -8,7 +8,7 @@
 #   FORCE=1 bash host/setup.sh      # redo all steps
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/../_common.sh"
+source "$SCRIPT_DIR/../lib.sh"
 
 CHECKPOINT_FILE="/tmp/.tee-host-setup-progress"
 SNP_VM_DIR="/root/snp-vm"

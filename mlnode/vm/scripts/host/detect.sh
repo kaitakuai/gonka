@@ -9,7 +9,7 @@
 #   TEE_PLATFORM=$(bash host/detect.sh)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$SCRIPT_DIR/../_common.sh" ] && source "$SCRIPT_DIR/../_common.sh" || {
+[ -f "$SCRIPT_DIR/../lib.sh" ] && source "$SCRIPT_DIR/../lib.sh" || {
     log()  { echo "[+] $*"; }
     warn() { echo "[!] $*"; }
     die()  { echo "[ERROR] $1" >&2; exit 1; }

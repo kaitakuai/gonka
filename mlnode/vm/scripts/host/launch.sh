@@ -14,7 +14,7 @@
 #   API_PORT=8080    # host port forwarded to guest API (default: 8080)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/../_common.sh"
+source "$SCRIPT_DIR/../lib.sh"
 source "$SCRIPT_DIR/detect.sh"
 
 VM_DIR="/root/tee-vm"

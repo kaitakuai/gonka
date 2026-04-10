@@ -8,9 +8,9 @@
 #   sudo FORCE=1 bash guest/setup.sh      # redo all steps
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# If _common.sh is not next to us (first run from gonka clone), inline essentials
-if [ -f "$SCRIPT_DIR/../_common.sh" ]; then
-    source "$SCRIPT_DIR/../_common.sh"
+# If lib.sh is not next to us (first run from gonka clone), inline essentials
+if [ -f "$SCRIPT_DIR/../lib.sh" ]; then
+    source "$SCRIPT_DIR/../lib.sh"
 else
     set -euo pipefail
     CHECKPOINT_FILE="/tmp/.tee-guest-setup-progress"

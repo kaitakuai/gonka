@@ -1,6 +1,11 @@
 #!/bin/bash
-# Common helpers for TEE setup scripts.
-# Source this file, do not execute directly.
+# Library of helpers for TEE deployment scripts.
+# Sourced by host/*.sh and guest/*.sh — not executed directly.
+#
+# Provides:
+#   - logging: log, warn, err, die (with fix-hint)
+#   - checkpoint state: checkpoint_set, checkpoint_done, run_step
+#   - preconditions: require_cmd, require_file
 
 set -euo pipefail
 
