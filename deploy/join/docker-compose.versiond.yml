@@ -1,0 +1,23 @@
+services:
+  versiond:
+    container_name: versiond
+    image: ghcr.io/product-science/versiond:0.2.11
+    environment:
+      - VERSIOND_ORACLE_URL=http://api:9100/versions
+      - NODE_MANAGER_ADDR=api:9400
+      # Override a specific version binary for development:
+      # - VERSIOND_OVERRIDE_v0_2_11=/opt/local/subnet-dev
+      # Force versions not yet approved by governance:
+      # - VERSIOND_FORCE=v0.2.13-rc1
+    volumes:
+      - versiond-bin:/opt/versiond/bin
+      - versiond-data:/opt/versiond/data
+    ports:
+      - "${PORT:-8080}:8080"
+    depends_on:
+      - api
+    restart: always
+
+volumes:
+  versiond-bin:
+  versiond-data:

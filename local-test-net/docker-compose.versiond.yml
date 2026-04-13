@@ -11,6 +11,7 @@ services:
       VERSIOND_BIN_DIR: /opt/versiond/bin
       VERSIOND_DATA_DIR: /opt/versiond/data
       VERSIOND_BINARY_NAME: testapp
+      NODE_MANAGER_ADDR: ${NODE_MANAGER_ADDR:-${KEY_NAME}-api:9400}
     ports:
       - "${VERSIOND_PORT:-7080}:8080"
     networks:

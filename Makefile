@@ -1,4 +1,4 @@
-.PHONY: release decentralized-api-release inference-chain-release tmkms-release proxy-release proxy-ssl-release bridge-release check-docker build-testermint run-blockchain-tests test-blockchain local-build api-local-build node-local-build api-test node-test mock-server-build-docker proxy-build-docker proxy-ssl-build-docker bridge-build-docker run-bls-tests subnetctl-build versiond-build-docker testapp-server-build-docker
+.PHONY: release decentralized-api-release inference-chain-release tmkms-release proxy-release proxy-ssl-release bridge-release versiond-release check-docker build-testermint run-blockchain-tests test-blockchain local-build api-local-build node-local-build api-test node-test mock-server-build-docker proxy-build-docker proxy-ssl-build-docker bridge-build-docker run-bls-tests subnetctl-build versiond-build-docker testapp-server-build-docker
 
 VERSION ?= $(shell git describe --always)
 TAG_NAME := "release/v$(VERSION)"
@@ -44,7 +44,7 @@ testapp-server-build-docker:
 	@echo "Building testapp-server docker image..."
 	@docker build -t testapp-server:latest -f local-test-net/Dockerfile.testapp-server .
 
-release: decentralized-api-release inference-chain-release tmkms-release proxy-release proxy-ssl-release bridge-release
+release: decentralized-api-release inference-chain-release tmkms-release proxy-release proxy-ssl-release bridge-release versiond-release
 	@git tag $(TAG_NAME)
 	@git push origin $(TAG_NAME)
 
@@ -75,6 +75,11 @@ bridge-release:
 	@echo "Releasing bridge..."
 	@make -C bridge release
 	@make -C bridge docker-push
+
+versiond-release:
+	@echo "Releasing versiond..."
+	@make -C versioned release
+	@make -C versioned docker-push
 
 check-docker:
 	@docker info > /dev/null 2>&1 || (echo "Docker Desktop is not running. Please start Docker Desktop." && exit 1)

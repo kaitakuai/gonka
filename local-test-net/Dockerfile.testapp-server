@@ -2,8 +2,10 @@ FROM golang:1.24.2-alpine3.20 AS builder
 RUN apk add --no-cache zip
 
 WORKDIR /build
-COPY versioned/e2e/testapp/main.go main.go
-RUN go mod init testapp && CGO_ENABLED=0 GOOS=linux go build -o testapp main.go
+COPY versioned/go.mod versioned/go.sum ./
+RUN go mod download
+COPY versioned/ .
+RUN CGO_ENABLED=0 GOOS=linux go build -o testapp ./e2e/testapp
 
 RUN mkdir -p /srv/files && \
     zip -j /srv/files/testapp.zip testapp && \

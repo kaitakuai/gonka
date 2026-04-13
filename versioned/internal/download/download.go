@@ -56,7 +56,9 @@ func Download(ctx context.Context, url, expectedSHA256, destDir, binaryName stri
 		tmpFile.Close()
 		return fmt.Errorf("write to temp file: %w", err)
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
 
 	slog.Info("download complete", "url", url, "bytes", written)
 
@@ -86,7 +88,10 @@ func AtomicWriteFile(destDir, filename string, r io.Reader) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("write: %w", err)
 	}
-	tmp.Close()
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
 
 	if err := os.Chmod(tmpPath, 0755); err != nil {
 		os.Remove(tmpPath)

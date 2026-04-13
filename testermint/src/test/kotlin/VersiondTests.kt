@@ -126,6 +126,41 @@ class VersiondTests : TestermintTest() {
 
     @Test
     @Order(3)
+    fun `subnet binary can talk to nodemanager grpc service`() {
+        val versionName = "v0.2.11"
+
+        logSection("Verifying $versionName is running before nodemanager test")
+        val health = getVersiondHealth()
+        assertThat(health.any { it["name"] == versionName && it["status"] == "running" })
+            .withFailMessage("Expected $versionName to be running")
+            .isTrue()
+
+        logSection("Calling /nodemanager-test through versiond proxy")
+        val response = getNodeManagerTest(versionName)
+
+        assertThat(response["nodemanager_addr"])
+            .withFailMessage("Expected nodemanager_addr to be set, got: $response")
+            .isNotNull()
+
+        assertThat(response["grpc_connected"])
+            .withFailMessage("Expected grpc_connected=true, got: $response")
+            .isEqualTo("true")
+
+        if (response.containsKey("endpoint") && response["endpoint"]?.isNotEmpty() == true) {
+            logHighlight("Acquire succeeded: endpoint=${response["endpoint"]}, node_id=${response["node_id"]}")
+            assertThat(response["lock_id"])
+                .withFailMessage("Expected lock_id to be set on successful acquire")
+                .isNotNull()
+        } else {
+            logHighlight("Acquire returned no nodes (expected in minimal test env): ${response["error"]}")
+            assertThat(response["error"])
+                .withFailMessage("Expected either endpoint or error in response")
+                .isNotNull()
+        }
+    }
+
+    @Test
+    @Order(4)
     fun `governance proposal adds second version and both route`() {
         val v1 = "v0.2.11"
         val v2 = "v0.2.12"
@@ -250,6 +285,17 @@ class VersiondTests : TestermintTest() {
             Logger.warn("Failed to query versiond /healthz: ${e.message}")
             emptyList()
         }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun getNodeManagerTest(versionName: String): Map<String, String> {
+        val (_, response, result) = Fuel.get("$versiondUrl/$versionName/nodemanager-test")
+            .timeoutRead(15_000)
+            .responseString()
+        assertThat(response.statusCode)
+            .withFailMessage("GET /$versionName/nodemanager-test returned ${response.statusCode}: ${result}")
+            .isEqualTo(200)
+        return cosmosJson.fromJson(result.get(), Map::class.java) as Map<String, String>
     }
 
     @Suppress("UNCHECKED_CAST")
