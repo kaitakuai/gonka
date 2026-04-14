@@ -53,8 +53,8 @@ const (
 	Msg_RemoveParticipantsFromAllowList_FullMethodName  = "/inference.inference.Msg/RemoveParticipantsFromAllowList"
 	Msg_ApproveIbcTokenForTrading_FullMethodName        = "/inference.inference.Msg/ApproveIbcTokenForTrading"
 	Msg_RegisterIbcTokenMetadata_FullMethodName         = "/inference.inference.Msg/RegisterIbcTokenMetadata"
-	Msg_CreateSubnetEscrow_FullMethodName               = "/inference.inference.Msg/CreateSubnetEscrow"
-	Msg_SettleSubnetEscrow_FullMethodName               = "/inference.inference.Msg/SettleSubnetEscrow"
+	Msg_CreateDevshardEscrow_FullMethodName             = "/inference.inference.Msg/CreateDevshardEscrow"
+	Msg_SettleDevshardEscrow_FullMethodName             = "/inference.inference.Msg/SettleDevshardEscrow"
 )
 
 // MsgClient is the client API for Msg service.
@@ -99,8 +99,8 @@ type MsgClient interface {
 	RemoveParticipantsFromAllowList(ctx context.Context, in *MsgRemoveParticipantsFromAllowList, opts ...grpc.CallOption) (*MsgRemoveParticipantsFromAllowListResponse, error)
 	ApproveIbcTokenForTrading(ctx context.Context, in *MsgApproveIbcTokenForTrading, opts ...grpc.CallOption) (*MsgApproveIbcTokenForTradingResponse, error)
 	RegisterIbcTokenMetadata(ctx context.Context, in *MsgRegisterIbcTokenMetadata, opts ...grpc.CallOption) (*MsgRegisterIbcTokenMetadataResponse, error)
-	CreateSubnetEscrow(ctx context.Context, in *MsgCreateSubnetEscrow, opts ...grpc.CallOption) (*MsgCreateSubnetEscrowResponse, error)
-	SettleSubnetEscrow(ctx context.Context, in *MsgSettleSubnetEscrow, opts ...grpc.CallOption) (*MsgSettleSubnetEscrowResponse, error)
+	CreateDevshardEscrow(ctx context.Context, in *MsgCreateDevshardEscrow, opts ...grpc.CallOption) (*MsgCreateDevshardEscrowResponse, error)
+	SettleDevshardEscrow(ctx context.Context, in *MsgSettleDevshardEscrow, opts ...grpc.CallOption) (*MsgSettleDevshardEscrowResponse, error)
 }
 
 type msgClient struct {
@@ -417,18 +417,18 @@ func (c *msgClient) RegisterIbcTokenMetadata(ctx context.Context, in *MsgRegiste
 	return out, nil
 }
 
-func (c *msgClient) CreateSubnetEscrow(ctx context.Context, in *MsgCreateSubnetEscrow, opts ...grpc.CallOption) (*MsgCreateSubnetEscrowResponse, error) {
-	out := new(MsgCreateSubnetEscrowResponse)
-	err := c.cc.Invoke(ctx, Msg_CreateSubnetEscrow_FullMethodName, in, out, opts...)
+func (c *msgClient) CreateDevshardEscrow(ctx context.Context, in *MsgCreateDevshardEscrow, opts ...grpc.CallOption) (*MsgCreateDevshardEscrowResponse, error) {
+	out := new(MsgCreateDevshardEscrowResponse)
+	err := c.cc.Invoke(ctx, Msg_CreateDevshardEscrow_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *msgClient) SettleSubnetEscrow(ctx context.Context, in *MsgSettleSubnetEscrow, opts ...grpc.CallOption) (*MsgSettleSubnetEscrowResponse, error) {
-	out := new(MsgSettleSubnetEscrowResponse)
-	err := c.cc.Invoke(ctx, Msg_SettleSubnetEscrow_FullMethodName, in, out, opts...)
+func (c *msgClient) SettleDevshardEscrow(ctx context.Context, in *MsgSettleDevshardEscrow, opts ...grpc.CallOption) (*MsgSettleDevshardEscrowResponse, error) {
+	out := new(MsgSettleDevshardEscrowResponse)
+	err := c.cc.Invoke(ctx, Msg_SettleDevshardEscrow_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -477,8 +477,8 @@ type MsgServer interface {
 	RemoveParticipantsFromAllowList(context.Context, *MsgRemoveParticipantsFromAllowList) (*MsgRemoveParticipantsFromAllowListResponse, error)
 	ApproveIbcTokenForTrading(context.Context, *MsgApproveIbcTokenForTrading) (*MsgApproveIbcTokenForTradingResponse, error)
 	RegisterIbcTokenMetadata(context.Context, *MsgRegisterIbcTokenMetadata) (*MsgRegisterIbcTokenMetadataResponse, error)
-	CreateSubnetEscrow(context.Context, *MsgCreateSubnetEscrow) (*MsgCreateSubnetEscrowResponse, error)
-	SettleSubnetEscrow(context.Context, *MsgSettleSubnetEscrow) (*MsgSettleSubnetEscrowResponse, error)
+	CreateDevshardEscrow(context.Context, *MsgCreateDevshardEscrow) (*MsgCreateDevshardEscrowResponse, error)
+	SettleDevshardEscrow(context.Context, *MsgSettleDevshardEscrow) (*MsgSettleDevshardEscrowResponse, error)
 	mustEmbedUnimplementedMsgServer()
 }
 
@@ -588,11 +588,11 @@ func (UnimplementedMsgServer) ApproveIbcTokenForTrading(context.Context, *MsgApp
 func (UnimplementedMsgServer) RegisterIbcTokenMetadata(context.Context, *MsgRegisterIbcTokenMetadata) (*MsgRegisterIbcTokenMetadataResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RegisterIbcTokenMetadata not implemented")
 }
-func (UnimplementedMsgServer) CreateSubnetEscrow(context.Context, *MsgCreateSubnetEscrow) (*MsgCreateSubnetEscrowResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateSubnetEscrow not implemented")
+func (UnimplementedMsgServer) CreateDevshardEscrow(context.Context, *MsgCreateDevshardEscrow) (*MsgCreateDevshardEscrowResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateDevshardEscrow not implemented")
 }
-func (UnimplementedMsgServer) SettleSubnetEscrow(context.Context, *MsgSettleSubnetEscrow) (*MsgSettleSubnetEscrowResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method SettleSubnetEscrow not implemented")
+func (UnimplementedMsgServer) SettleDevshardEscrow(context.Context, *MsgSettleDevshardEscrow) (*MsgSettleDevshardEscrowResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SettleDevshardEscrow not implemented")
 }
 func (UnimplementedMsgServer) mustEmbedUnimplementedMsgServer() {}
 
@@ -1219,38 +1219,38 @@ func _Msg_RegisterIbcTokenMetadata_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Msg_CreateSubnetEscrow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(MsgCreateSubnetEscrow)
+func _Msg_CreateDevshardEscrow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MsgCreateDevshardEscrow)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(MsgServer).CreateSubnetEscrow(ctx, in)
+		return srv.(MsgServer).CreateDevshardEscrow(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Msg_CreateSubnetEscrow_FullMethodName,
+		FullMethod: Msg_CreateDevshardEscrow_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MsgServer).CreateSubnetEscrow(ctx, req.(*MsgCreateSubnetEscrow))
+		return srv.(MsgServer).CreateDevshardEscrow(ctx, req.(*MsgCreateDevshardEscrow))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Msg_SettleSubnetEscrow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(MsgSettleSubnetEscrow)
+func _Msg_SettleDevshardEscrow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MsgSettleDevshardEscrow)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(MsgServer).SettleSubnetEscrow(ctx, in)
+		return srv.(MsgServer).SettleDevshardEscrow(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Msg_SettleSubnetEscrow_FullMethodName,
+		FullMethod: Msg_SettleDevshardEscrow_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(MsgServer).SettleSubnetEscrow(ctx, req.(*MsgSettleSubnetEscrow))
+		return srv.(MsgServer).SettleDevshardEscrow(ctx, req.(*MsgSettleDevshardEscrow))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1399,12 +1399,12 @@ var Msg_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Msg_RegisterIbcTokenMetadata_Handler,
 		},
 		{
-			MethodName: "CreateSubnetEscrow",
-			Handler:    _Msg_CreateSubnetEscrow_Handler,
+			MethodName: "CreateDevshardEscrow",
+			Handler:    _Msg_CreateDevshardEscrow_Handler,
 		},
 		{
-			MethodName: "SettleSubnetEscrow",
-			Handler:    _Msg_SettleSubnetEscrow_Handler,
+			MethodName: "SettleDevshardEscrow",
+			Handler:    _Msg_SettleDevshardEscrow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

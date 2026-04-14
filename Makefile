@@ -1,6 +1,7 @@
-.PHONY: release decentralized-api-release inference-chain-release tmkms-release proxy-release proxy-ssl-release bridge-release versiond-release check-docker build-testermint run-blockchain-tests test-blockchain local-build api-local-build node-local-build api-test node-test mock-server-build-docker proxy-build-docker proxy-ssl-build-docker bridge-build-docker run-bls-tests subnetctl-build versiond-build-docker testapp-server-build-docker
+.PHONY: release decentralized-api-release inference-chain-release tmkms-release proxy-release proxy-ssl-release bridge-release versiond-release check-docker build-testermint run-blockchain-tests test-blockchain local-build api-local-build node-local-build api-test node-test mock-server-build-docker proxy-build-docker proxy-ssl-build-docker bridge-build-docker run-bls-tests devshardctl-build devshardd-build versiond-build-docker testapp-server-build-docker
 
 VERSION ?= $(shell git describe --always)
+DEVSHARD_VERSION ?= dev
 TAG_NAME := "release/v$(VERSION)"
 USE_REGISTRY_CACHE ?= 0
 ifeq ($(USE_REGISTRY_CACHE),1)
@@ -108,9 +109,23 @@ api-local-build:
 	@echo "Building decentralized-api locally..."
 	@cd decentralized-api && go build -mod=mod -o ./build/dapi
 
-subnetctl-build:
-	@echo "Building subnetctl..."
-	@cd subnet && go build -o ../build/subnetctl ./cmd/subnetctl/
+devshardctl-build:
+	@echo "Building devshardctl..."
+	@cd devshard && go build -ldflags "-X main.Version=$(DEVSHARD_VERSION)" -o ../build/devshardctl ./cmd/devshardctl/
+
+devshardd-build:
+	@echo "Building devshardd..."
+	@mkdir -p build
+	@DOCKER_BUILDKIT=1 docker build --no-cache --target builder \
+		--build-arg BLST_PORTABLE=1 \
+		--build-arg DEVSHARD_VERSION=$(DEVSHARD_VERSION) \
+		-f decentralized-api/Dockerfile . \
+		-t devshardd-builder:latest -q >/dev/null
+	@CID=$$(docker create devshardd-builder:latest) && \
+		docker cp $$CID:/app/decentralized-api/build/devshardd build/devshardd && \
+		docker rm $$CID >/dev/null
+	@chmod +x build/devshardd
+	@echo "Built build/devshardd ($$(file build/devshardd | grep -o 'statically linked\|dynamically linked'))"
 
 node-local-build:
 	@echo "Building inference-chain locally..."

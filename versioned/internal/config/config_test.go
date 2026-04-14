@@ -31,8 +31,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.DataDir != "/opt/versiond/data" {
 		t.Errorf("DataDir = %q, want %q", cfg.DataDir, "/opt/versiond/data")
 	}
-	if cfg.BinaryName != "subnet" {
-		t.Errorf("BinaryName = %q, want %q", cfg.BinaryName, "subnet")
+	if cfg.BinaryName != "devshard" {
+		t.Errorf("BinaryName = %q, want %q", cfg.BinaryName, "devshard")
 	}
 	if cfg.BasePort != 5000 {
 		t.Errorf("BasePort = %d, want %d", cfg.BasePort, 5000)
@@ -152,7 +152,7 @@ func TestLoad_ForceVersionsTrimsSpaces(t *testing.T) {
 func TestLoad_ForceVersionsDottedWithOverride(t *testing.T) {
 	t.Setenv("VERSIOND_ORACLE_URL", "http://oracle:8080/versions")
 	t.Setenv("VERSIOND_FORCE", "v0.2.11")
-	t.Setenv("VERSIOND_OVERRIDE_v0_2_11", "/path/to/subnet")
+	t.Setenv("VERSIOND_OVERRIDE_v0_2_11", "/path/to/devshard")
 
 	cfg, err := Load()
 	if err != nil {

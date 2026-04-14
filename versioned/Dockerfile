@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /versiond ./cmd/versiond
 
 FROM alpine:3.20
-RUN apk add --no-cache tini ca-certificates
+RUN apk add --no-cache tini ca-certificates libgcc
 COPY --from=builder /versiond /usr/bin/versiond
 ENTRYPOINT ["tini", "--"]
 CMD ["versiond"]

@@ -19,7 +19,7 @@ on:
       - 'local-test-net/**'
       - 'testermint/**'
       - 'versioned/**'
-      - 'subnet/**'
+      - 'devshard/**'
 
   issue_comment:
     types: [created]

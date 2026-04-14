@@ -186,13 +186,13 @@ class InferenceStatusDeserializer : JsonDeserializer<InferenceStatus> {
     }
 }
 
-class SubnetInferenceStatusDeserializer : JsonDeserializer<SubnetInferenceStatus> {
+class DevshardInferenceStatusDeserializer : JsonDeserializer<DevshardInferenceStatus> {
     override fun deserialize(
         json: JsonElement,
         typeOfT: Type?,
         context: JsonDeserializationContext?
-    ): SubnetInferenceStatus {
-        return SubnetInferenceStatus.fromAny(
+    ): DevshardInferenceStatus {
+        return DevshardInferenceStatus.fromAny(
             if (json.isJsonPrimitive && json.asJsonPrimitive.isNumber) {
                 json.asInt
             } else {

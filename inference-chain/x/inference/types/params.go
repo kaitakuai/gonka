@@ -94,11 +94,11 @@ const (
 )
 
 const (
-	DefaultSubnetEscrowMinAmount    uint64 = 5_000_000_000
-	DefaultSubnetEscrowMaxAmount    uint64 = 10_000_000_000
-	DefaultSubnetMaxEscrowsPerEpoch uint32 = 100
-	DefaultSubnetGroupSize          uint32 = 16
-	DefaultSubnetTokenPrice         uint64 = 1
+	DefaultDevshardEscrowMinAmount    uint64 = 5_000_000_000
+	DefaultDevshardEscrowMaxAmount    uint64 = 10_000_000_000
+	DefaultDevshardMaxEscrowsPerEpoch uint32 = 100
+	DefaultDevshardGroupSize          uint32 = 16
+	DefaultDevshardTokenPrice         uint64 = 1
 )
 
 func DefaultGenesisOnlyParams() GenesisOnlyParams {
@@ -158,7 +158,7 @@ func DefaultParams() Params {
 			// Note: proto encoding does not preserve empty-vs-nil for repeated fields; keep nil to match round-trips.
 			AllowedTransferAddresses: nil, // nil = no restriction, all TAs allowed
 		},
-		SubnetEscrowParams: DefaultSubnetEscrowParams(),
+		DevshardEscrowParams: DefaultDevshardEscrowParams(),
 	}
 }
 
@@ -306,46 +306,46 @@ func DefaultDynamicPricingParams() *DynamicPricingParams {
 	}
 }
 
-func DefaultSubnetEscrowParams() *SubnetEscrowParams {
-	return &SubnetEscrowParams{
-		MinAmount:               DefaultSubnetEscrowMinAmount,
-		MaxAmount:               DefaultSubnetEscrowMaxAmount,
-		MaxEscrowsPerEpoch:      DefaultSubnetMaxEscrowsPerEpoch,
-		GroupSize:               DefaultSubnetGroupSize,
+func DefaultDevshardEscrowParams() *DevshardEscrowParams {
+	return &DevshardEscrowParams{
+		MinAmount:               DefaultDevshardEscrowMinAmount,
+		MaxAmount:               DefaultDevshardEscrowMaxAmount,
+		MaxEscrowsPerEpoch:      DefaultDevshardMaxEscrowsPerEpoch,
+		GroupSize:               DefaultDevshardGroupSize,
 		AllowedCreatorAddresses: nil,
-		TokenPrice:              DefaultSubnetTokenPrice,
+		TokenPrice:              DefaultDevshardTokenPrice,
 	}
 }
 
-func (p *SubnetEscrowParams) Validate() error {
+func (p *DevshardEscrowParams) Validate() error {
 	if p.MinAmount == 0 {
-		return fmt.Errorf("subnet escrow min_amount must be positive")
+		return fmt.Errorf("devshard escrow min_amount must be positive")
 	}
 	if p.MaxAmount < p.MinAmount {
-		return fmt.Errorf("subnet escrow max_amount (%d) must be >= min_amount (%d)", p.MaxAmount, p.MinAmount)
+		return fmt.Errorf("devshard escrow max_amount (%d) must be >= min_amount (%d)", p.MaxAmount, p.MinAmount)
 	}
 	if p.GroupSize == 0 {
-		return fmt.Errorf("subnet escrow group_size must be positive")
+		return fmt.Errorf("devshard escrow group_size must be positive")
 	}
 	seen := make(map[string]struct{}, len(p.ApprovedVersions))
 	for i, v := range p.ApprovedVersions {
 		if v.Name == "" {
-			return fmt.Errorf("subnet_escrow_params.approved_versions[%d]: name cannot be empty", i)
+			return fmt.Errorf("devshard_escrow_params.approved_versions[%d]: name cannot be empty", i)
 		}
 		if v.Binary == "" {
-			return fmt.Errorf("subnet_escrow_params.approved_versions[%d]: binary cannot be empty", i)
+			return fmt.Errorf("devshard_escrow_params.approved_versions[%d]: binary cannot be empty", i)
 		}
 		if v.Sha256 == "" {
-			return fmt.Errorf("subnet_escrow_params.approved_versions[%d]: sha256 cannot be empty", i)
+			return fmt.Errorf("devshard_escrow_params.approved_versions[%d]: sha256 cannot be empty", i)
 		}
 		if len(v.Sha256) != 64 {
-			return fmt.Errorf("subnet_escrow_params.approved_versions[%d]: sha256 must be 64 hex characters, got %d", i, len(v.Sha256))
+			return fmt.Errorf("devshard_escrow_params.approved_versions[%d]: sha256 must be 64 hex characters, got %d", i, len(v.Sha256))
 		}
 		if _, err := hex.DecodeString(v.Sha256); err != nil {
-			return fmt.Errorf("subnet_escrow_params.approved_versions[%d]: sha256 is not valid hex: %w", i, err)
+			return fmt.Errorf("devshard_escrow_params.approved_versions[%d]: sha256 is not valid hex: %w", i, err)
 		}
 		if _, dup := seen[v.Name]; dup {
-			return fmt.Errorf("subnet_escrow_params.approved_versions: duplicate name %q", v.Name)
+			return fmt.Errorf("devshard_escrow_params.approved_versions: duplicate name %q", v.Name)
 		}
 		seen[v.Name] = struct{}{}
 	}
@@ -520,8 +520,8 @@ func (p Params) Validate() error {
 		}
 	}
 
-	if p.SubnetEscrowParams != nil {
-		if err := p.SubnetEscrowParams.Validate(); err != nil {
+	if p.DevshardEscrowParams != nil {
+		if err := p.DevshardEscrowParams.Validate(); err != nil {
 			return err
 		}
 	}

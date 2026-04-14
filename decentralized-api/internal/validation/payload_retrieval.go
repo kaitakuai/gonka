@@ -35,7 +35,7 @@ var payloadRetrievalClient = &http.Client{
 }
 
 // PayloadResponse matches the executor endpoint response.
-// Used by both chain validation and subnet validation paths.
+// Used by both chain validation and devshard validation paths.
 type PayloadResponse struct {
 	InferenceId       string `json:"inference_id"`
 	PromptPayload     []byte `json:"prompt_payload"`

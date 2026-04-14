@@ -11,7 +11,7 @@ import "inference/inference/params.proto";
 import "inference/inference/hardware_node.proto";
 import "inference/inference/bridge.proto";
 import "inference/inference/poc_v2.proto";
-import "inference/inference/subnet_escrow.proto";
+import "inference/inference/devshard_escrow.proto";
 
 option go_package = "github.com/productscience/inference/x/inference/types";
 
@@ -57,8 +57,8 @@ service Msg {
   rpc RemoveParticipantsFromAllowList  (MsgRemoveParticipantsFromAllowList) returns (MsgRemoveParticipantsFromAllowListResponse);
   rpc ApproveIbcTokenForTrading        (MsgApproveIbcTokenForTrading) returns (MsgApproveIbcTokenForTradingResponse);
   rpc RegisterIbcTokenMetadata         (MsgRegisterIbcTokenMetadata) returns (MsgRegisterIbcTokenMetadataResponse);
-  rpc CreateSubnetEscrow               (MsgCreateSubnetEscrow) returns (MsgCreateSubnetEscrowResponse);
-  rpc SettleSubnetEscrow               (MsgSettleSubnetEscrow) returns (MsgSettleSubnetEscrowResponse);
+  rpc CreateDevshardEscrow               (MsgCreateDevshardEscrow) returns (MsgCreateDevshardEscrowResponse);
+  rpc SettleDevshardEscrow               (MsgSettleDevshardEscrow) returns (MsgSettleDevshardEscrowResponse);
 }
 // MsgUpdateParams is the Msg/UpdateParams request type.
 message MsgUpdateParams {
@@ -474,26 +474,27 @@ message MsgRegisterIbcTokenMetadata {
 
 message MsgRegisterIbcTokenMetadataResponse {}
 
-message MsgCreateSubnetEscrow {
+message MsgCreateDevshardEscrow {
   option (cosmos.msg.v1.signer) = "creator";
   string creator = 1;
   uint64 amount = 2;
 }
 
-message MsgCreateSubnetEscrowResponse {
+message MsgCreateDevshardEscrowResponse {
   uint64 escrow_id = 1;
 }
 
-message MsgSettleSubnetEscrow {
+message MsgSettleDevshardEscrow {
   option (cosmos.msg.v1.signer) = "settler";
   string settler = 1;
   uint64 escrow_id = 2;
+  string version = 9;
   bytes state_root = 3;
   uint64 nonce = 4;
   bytes rest_hash = 5;
-  repeated SubnetSettlementHostStats host_stats = 6;
-  repeated SubnetSlotSignature signatures = 7;
+  repeated DevshardSettlementHostStats host_stats = 6;
+  repeated DevshardSlotSignature signatures = 7;
   uint64 fees = 8;
 }
 
-message MsgSettleSubnetEscrowResponse {}
+message MsgSettleDevshardEscrowResponse {}

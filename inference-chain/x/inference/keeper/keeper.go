@@ -97,13 +97,12 @@ type (
 		// Punishment grace epochs for upgrade protection
 		PunishmentGraceEpochs collections.Map[uint64, types.GraceEpochParams]
 		ActiveParticipantsSet collections.KeySet[collections.Pair[uint64, sdk.AccAddress]]
-		// Subnet escrow collections
-		// Subnet escrow collections
-		SubnetEscrows           collections.Map[uint64, types.SubnetEscrow]
-		SubnetEscrowCounter     collections.Item[uint64]
-		SubnetEscrowEpochCount  collections.Map[uint64, uint64]
-		SubnetHostEpochStatsMap collections.Map[collections.Pair[uint64, sdk.AccAddress], types.SubnetHostEpochStats]
-		SubnetEscrowsByEpoch    collections.Map[collections.Pair[uint64, uint64], collections.NoValue]
+		// Devshard escrow collections
+		DevshardEscrows           collections.Map[uint64, types.DevshardEscrow]
+		DevshardEscrowCounter     collections.Item[uint64]
+		DevshardEscrowEpochCount  collections.Map[uint64, uint64]
+		DevshardHostEpochStatsMap collections.Map[collections.Pair[uint64, sdk.AccAddress], types.DevshardHostEpochStats]
+		DevshardEscrowsByEpoch    collections.Map[collections.Pair[uint64, uint64], collections.NoValue]
 	}
 )
 
@@ -496,38 +495,38 @@ func NewKeeper(
 			"active_participants_cache",
 			collections.PairKeyCodec(collections.Uint64Key, sdk.AccAddressKey),
 		),
-		// Subnet escrow collections
-		SubnetEscrows: collections.NewMap(
+		// Devshard escrow collections
+		DevshardEscrows: collections.NewMap(
 			sb,
-			types.SubnetEscrowsPrefix,
-			"subnet_escrows",
+			types.DevshardEscrowsPrefix,
+			"devshard_escrows",
 			collections.Uint64Key,
-			codec.CollValue[types.SubnetEscrow](cdc),
+			codec.CollValue[types.DevshardEscrow](cdc),
 		),
-		SubnetEscrowCounter: collections.NewItem(
+		DevshardEscrowCounter: collections.NewItem(
 			sb,
-			types.SubnetEscrowCounterPrefix,
-			"subnet_escrow_counter",
+			types.DevshardEscrowCounterPrefix,
+			"devshard_escrow_counter",
 			collections.Uint64Value,
 		),
-		SubnetEscrowEpochCount: collections.NewMap(
+		DevshardEscrowEpochCount: collections.NewMap(
 			sb,
-			types.SubnetEscrowEpochCountPrefix,
-			"subnet_escrow_epoch_count",
+			types.DevshardEscrowEpochCountPrefix,
+			"devshard_escrow_epoch_count",
 			collections.Uint64Key,
 			collections.Uint64Value,
 		),
-		SubnetHostEpochStatsMap: collections.NewMap(
+		DevshardHostEpochStatsMap: collections.NewMap(
 			sb,
-			types.SubnetHostEpochStatsPrefix,
-			"subnet_host_epoch_stats",
+			types.DevshardHostEpochStatsPrefix,
+			"devshard_host_epoch_stats",
 			collections.PairKeyCodec(collections.Uint64Key, sdk.AccAddressKey),
-			codec.CollValue[types.SubnetHostEpochStats](cdc),
+			codec.CollValue[types.DevshardHostEpochStats](cdc),
 		),
-		SubnetEscrowsByEpoch: collections.NewMap(
+		DevshardEscrowsByEpoch: collections.NewMap(
 			sb,
-			types.SubnetEscrowsByEpochPrefix,
-			"subnet_escrows_by_epoch",
+			types.DevshardEscrowsByEpochPrefix,
+			"devshard_escrows_by_epoch",
 			collections.PairKeyCodec(collections.Uint64Key, collections.Uint64Key),
 			collections.NoValue{},
 		),

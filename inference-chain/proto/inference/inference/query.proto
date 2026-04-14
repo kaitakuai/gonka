@@ -32,7 +32,7 @@ import "inference/inference/liquidity_pool.proto";
 import "inference/inference/poc_v2.proto";
 import "inference/inference/random_seed.proto";
 import "inference/inference/poc_validation_snapshot.proto";
-import "inference/inference/subnet_escrow.proto";
+import "inference/inference/devshard_escrow.proto";
 
 option go_package = "github.com/productscience/inference/x/inference/types";
 
@@ -424,12 +424,12 @@ service Query {
     option (google.api.http).get = "/productscience/inference/inference/poc_validation_snapshot/{poc_stage_start_height}";
   }
 
-  rpc SubnetEscrow (QueryGetSubnetEscrowRequest) returns (QueryGetSubnetEscrowResponse) {
-    option (google.api.http).get = "/productscience/inference/inference/subnet_escrow/{id}";
+  rpc DevshardEscrow (QueryGetDevshardEscrowRequest) returns (QueryGetDevshardEscrowResponse) {
+    option (google.api.http).get = "/productscience/inference/inference/devshard_escrow/{id}";
   }
 
-  rpc SubnetHostEpochStats (QueryGetSubnetHostEpochStatsRequest) returns (QueryGetSubnetHostEpochStatsResponse) {
-    option (google.api.http).get = "/productscience/inference/inference/subnet_host_epoch_stats/{epoch_index}/{participant}";
+  rpc DevshardHostEpochStats (QueryGetDevshardHostEpochStatsRequest) returns (QueryGetDevshardHostEpochStatsResponse) {
+    option (google.api.http).get = "/productscience/inference/inference/devshard_host_epoch_stats/{epoch_index}/{participant}";
   }
 }
 // QueryParamsRequest is request type for the Query/Params RPC method.
@@ -1146,21 +1146,21 @@ message QueryPoCValidationSnapshotResponse {
   bool found = 2;
 }
 
-message QueryGetSubnetEscrowRequest {
+message QueryGetDevshardEscrowRequest {
   uint64 id = 1;
 }
 
-message QueryGetSubnetEscrowResponse {
-  SubnetEscrow escrow = 1;
+message QueryGetDevshardEscrowResponse {
+  DevshardEscrow escrow = 1;
   bool found = 2;
 }
 
-message QueryGetSubnetHostEpochStatsRequest {
+message QueryGetDevshardHostEpochStatsRequest {
   uint64 epoch_index = 1;
   string participant = 2;
 }
 
-message QueryGetSubnetHostEpochStatsResponse {
-  SubnetHostEpochStats stats = 1;
+message QueryGetDevshardHostEpochStatsResponse {
+  DevshardHostEpochStats stats = 1;
   bool found = 2;
 }

@@ -2,15 +2,14 @@ package process
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -89,22 +88,10 @@ func (m *Manager) Status() []health.StatusEntry {
 	return out
 }
 
-// hashFile computes the sha256 hex digest of a file on disk.
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
 // Reconcile compares desired state against local state and converges.
-// sha256 is the sole identity for binaries. URLs are download hints only.
+// The desired sha256 is the archive identity from the oracle. Downloaded
+// versions also record local install metadata so we can distinguish archive
+// identity from the extracted executable bytes on disk.
 func (m *Manager) Reconcile(ctx context.Context, desired []oracle.Version) error {
 	// Step 0: build desired set, injecting forced versions.
 	desiredSet := make(map[string]oracle.Version, len(desired))
@@ -134,6 +121,7 @@ func (m *Manager) Reconcile(ctx context.Context, desired []oracle.Version) error
 	// Snapshot which versions are running and which are downloading.
 	type versionSnapshot struct {
 		version       oracle.Version
+		versionDir    string
 		binPath       string
 		isRunning     bool
 		isDownloading bool
@@ -142,7 +130,8 @@ func (m *Manager) Reconcile(ctx context.Context, desired []oracle.Version) error
 	var snapshots []versionSnapshot
 
 	for _, v := range desiredSet {
-		binPath := filepath.Join(m.cfg.BinDir, v.Name, m.cfg.BinaryName)
+		versionDir := filepath.Join(m.cfg.BinDir, v.Name)
+		binPath := filepath.Join(versionDir, m.cfg.BinaryName)
 		if overrideSrc, isOverride := m.cfg.Overrides[v.Name]; isOverride {
 			overrides = append(overrides, overrideAction{v, overrideSrc, binPath})
 			continue
@@ -151,6 +140,7 @@ func (m *Manager) Reconcile(ctx context.Context, desired []oracle.Version) error
 		_, isDownloading := m.downloading[v.Name]
 		snapshots = append(snapshots, versionSnapshot{
 			version:       v,
+			versionDir:    versionDir,
 			binPath:       binPath,
 			isRunning:     isRunning,
 			isDownloading: isDownloading,
@@ -180,32 +170,39 @@ func (m *Manager) Reconcile(ctx context.Context, desired []oracle.Version) error
 		}
 
 		if snap.isRunning {
-			diskHash, hashErr := hashFile(snap.binPath)
-			if hashErr != nil {
-				slog.Error("cannot hash running binary, skipping", "version", snap.version.Name, "error", hashErr)
+			matches, metadata, diskBinaryHash, stateErr := installedVersionMatches(snap.versionDir, snap.binPath, desiredHash)
+			if stateErr == nil && matches {
 				continue
 			}
-			if diskHash == desiredHash {
-				continue
-			}
-			slog.Info("hash mismatch on running version, scheduling swap",
-				"version", snap.version.Name, "disk", diskHash, "desired", desiredHash)
+			logInstalledVersionMismatch(
+				"running version",
+				snap.version.Name,
+				desiredHash,
+				metadata,
+				diskBinaryHash,
+				stateErr,
+			)
 			toSwap = append(toSwap, versionAction{version: snap.version, sha256: desiredHash, child: snap.child})
 			continue
 		}
 
 		// Not running.
-		diskHash, hashErr := hashFile(snap.binPath)
-		if hashErr == nil && diskHash == desiredHash {
+		matches, metadata, diskBinaryHash, stateErr := installedVersionMatches(snap.versionDir, snap.binPath, desiredHash)
+		if stateErr == nil && matches {
 			toStart = append(toStart, snap.version)
 			continue
 		}
-
-		if hashErr == nil {
-			slog.Info("cached binary hash mismatch, re-downloading",
-				"version", snap.version.Name, "disk", diskHash, "desired", desiredHash)
-			os.Remove(snap.binPath)
+		if stateErr == nil || !errors.Is(stateErr, os.ErrNotExist) {
+			logInstalledVersionMismatch(
+				"cached version",
+				snap.version.Name,
+				desiredHash,
+				metadata,
+				diskBinaryHash,
+				stateErr,
+			)
 		}
+		cleanupInstalledVersionState(snap.versionDir, snap.binPath)
 		toDownload = append(toDownload, versionAction{version: snap.version, sha256: desiredHash})
 	}
 
@@ -279,7 +276,7 @@ type versionAction struct {
 // reconcileOverride handles a version with a local override binary.
 // Does disk I/O outside the lock, then takes the lock to update state.
 func (m *Manager) reconcileOverride(ctx context.Context, v oracle.Version, overrideSrc, binPath string) {
-	srcHash, err := hashFile(overrideSrc)
+	srcHash, err := download.HashFile(overrideSrc)
 	if err != nil {
 		slog.Error("override source unreadable", "version", v.Name, "path", overrideSrc, "error", err)
 		return
@@ -291,7 +288,7 @@ func (m *Manager) reconcileOverride(ctx context.Context, v oracle.Version, overr
 	m.mu.Unlock()
 
 	if isRunning {
-		diskHash, hashErr := hashFile(binPath)
+		diskHash, hashErr := download.HashFile(binPath)
 		if hashErr == nil && diskHash == srcHash {
 			return // already running the same override binary
 		}
@@ -389,6 +386,54 @@ func (m *Manager) downloadBinary(ctx context.Context, v oracle.Version, sha stri
 	return nil
 }
 
+func installedVersionMatches(versionDir, binPath, desiredArchiveHash string) (bool, download.InstallMetadata, string, error) {
+	metadata, err := download.ReadInstallMetadata(versionDir)
+	if err != nil {
+		return false, download.InstallMetadata{}, "", err
+	}
+
+	diskBinaryHash, err := download.HashFile(binPath)
+	if err != nil {
+		return false, metadata, "", err
+	}
+
+	if !strings.EqualFold(metadata.ArchiveSHA256, desiredArchiveHash) {
+		return false, metadata, diskBinaryHash, nil
+	}
+	if !strings.EqualFold(metadata.BinarySHA256, diskBinaryHash) {
+		return false, metadata, diskBinaryHash, nil
+	}
+	return true, metadata, diskBinaryHash, nil
+}
+
+func cleanupInstalledVersionState(versionDir, binPath string) {
+	_ = os.Remove(binPath)
+	_ = os.Remove(filepath.Join(versionDir, download.InstallMetadataFilename))
+}
+
+func logInstalledVersionMismatch(scope, versionName, desiredArchiveHash string, metadata download.InstallMetadata, diskBinaryHash string, stateErr error) {
+	if stateErr != nil {
+		slog.Info("installed version state unreadable, scheduling download",
+			"scope", scope,
+			"version", versionName,
+			"error", stateErr)
+		return
+	}
+	if !strings.EqualFold(metadata.ArchiveSHA256, desiredArchiveHash) {
+		slog.Info("installed archive hash mismatch, scheduling download",
+			"scope", scope,
+			"version", versionName,
+			"installed_archive", metadata.ArchiveSHA256,
+			"desired_archive", desiredArchiveHash)
+		return
+	}
+	slog.Info("installed binary hash mismatch, scheduling download",
+		"scope", scope,
+		"version", versionName,
+		"recorded_binary", metadata.BinarySHA256,
+		"disk_binary", diskBinaryHash)
+}
+
 // startChild must be called with m.mu held.
 func (m *Manager) startChild(ctx context.Context, v oracle.Version) {
 	childCtx, childCancel := context.WithCancel(ctx)
@@ -466,7 +511,7 @@ func (m *Manager) runChild(ctx context.Context, c *child) {
 			"--data-dir", dataDir,
 			"--port", fmt.Sprintf("%d", c.port),
 		)
-		cmd.Env = append(os.Environ(), fmt.Sprintf("SUBNET_LOG_PREFIX=%s", c.version.Name))
+		cmd.Env = childEnv(c.version.Name)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -528,6 +573,13 @@ func (m *Manager) runChild(ctx context.Context, c *child) {
 			backoff = 60 * time.Second
 		}
 	}
+}
+
+func childEnv(version string) []string {
+	return append(
+		os.Environ(),
+		fmt.Sprintf("DEVSHARD_LOG_PREFIX=%s", version),
+	)
 }
 
 // waitForPort polls until a TCP connection succeeds on the given port.

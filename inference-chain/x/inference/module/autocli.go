@@ -283,9 +283,9 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "epoch_index"}},
 				},
 				{
-					RpcMethod:      "SubnetEscrow",
-					Use:            "show-subnet-escrow [id]",
-					Short:          "Query a subnet escrow by ID",
+					RpcMethod:      "DevshardEscrow",
+					Use:            "show-devshard-escrow [id]",
+					Short:          "Query a devshard escrow by ID",
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "id"}},
 				},
 				// this line is used by ignite scaffolding # autocli/query
@@ -404,13 +404,13 @@ func (am AppModule) AutoCLIOptions() *autocliv1.ModuleOptions {
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "amount"}, {ProtoField: "destination_address"}, {ProtoField: "chain_id"}},
 				},
 				{
-					RpcMethod:      "CreateSubnetEscrow",
-					Use:            "create-subnet-escrow [amount]",
-					Short:          "Create a subnet escrow",
+					RpcMethod:      "CreateDevshardEscrow",
+					Use:            "create-devshard-escrow [amount]",
+					Short:          "Create a devshard escrow",
 					PositionalArgs: []*autocliv1.PositionalArgDescriptor{{ProtoField: "amount"}},
 				},
 				{
-					RpcMethod: "SettleSubnetEscrow",
+					RpcMethod: "SettleDevshardEscrow",
 					Skip:      true,
 				},
 				// this line is used by ignite scaffolding # autocli/tx

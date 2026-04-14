@@ -38,21 +38,25 @@ data class ApplicationAPI(
 
 
     fun getParticipants(): List<Participant> = wrapLog("GetParticipants", false) {
-        val url = urlFor(SERVER_TYPE_PUBLIC)
-        val resp = Fuel.get("$url/v1/participants")
-            .timeoutRead(1000 * 60)
-            .responseObject<ParticipantsResponse>(gsonDeserializer(cosmosJson))
-        logResponse(resp)
-        resp.third.get().participants
+        retryOnBadGateway {
+            val url = urlFor(SERVER_TYPE_PUBLIC)
+            val resp = Fuel.get("$url/v1/participants")
+                .timeoutRead(1000 * 60)
+                .responseObject<ParticipantsResponse>(gsonDeserializer(cosmosJson))
+            logResponse(resp)
+            resp.third.get().participants
+        }
     }
 
     fun getActiveParticipants(): ActiveParticipantsResponse = wrapLog("GetActiveParticipants", false) {
-        val url = urlFor(SERVER_TYPE_PUBLIC)
-        val resp = Fuel.get("$url/v1/epochs/current/participants")
-            .timeoutRead(1000 * 60)
-            .responseObject<ActiveParticipantsResponse>(gsonDeserializer(cosmosJson))
-        logResponse(resp)
-        resp.third.get()
+        retryOnBadGateway {
+            val url = urlFor(SERVER_TYPE_PUBLIC)
+            val resp = Fuel.get("$url/v1/epochs/current/participants")
+                .timeoutRead(1000 * 60)
+                .responseObject<ActiveParticipantsResponse>(gsonDeserializer(cosmosJson))
+            logResponse(resp)
+            resp.third.get()
+        }
     }
 
     fun addInferenceParticipant(inferenceParticipant: InferenceParticipant) = wrapLog("AddInferenceParticipant", true) {
@@ -433,15 +437,15 @@ data class ApplicationAPI(
         response.third.get()
     }
 
-    inline fun <reified Out : Any> get(url: String, path: String): Out {
+    inline fun <reified Out : Any> get(url: String, path: String): Out = retryOnBadGateway {
         val response = Fuel.get("$url/$path")
             .responseString()
         logResponse(response)
 
         val body = response.third.get() // throws on HTTP error
-        Logger.trace("Response body: {}", body) // Always log successful response bodies
+        Logger.trace("Response body: {}", body)
 
-        return try {
+        try {
             cosmosJson.fromJson(body, Out::class.java)
         } catch (e: Exception) {
             Logger.error(e, "JSON parse error for url={} body={}", "$url/$path", body)
@@ -487,15 +491,36 @@ data class ApplicationAPI(
         get<ApiConfig>(url, "admin/v1/config")
     }
 
-    fun getSubnetMempool(escrowId: Long): SubnetMempoolResponse = wrapLog("GetSubnetMempool", false) {
+    fun getDevshardMempool(escrowId: Long): DevshardMempoolResponse = wrapLog("GetDevshardMempool", false) {
         val url = urlFor(SERVER_TYPE_PUBLIC)
-        val resp = Fuel.get("$url/v1/subnet/sessions/$escrowId/mempool")
+        val resp = Fuel.get("$url/v1/devshard/sessions/$escrowId/mempool")
             .timeoutRead(1000 * 30)
-            .responseObject<SubnetMempoolResponse>(gsonDeserializer(cosmosJson))
+            .responseObject<DevshardMempoolResponse>(gsonDeserializer(cosmosJson))
         logResponse(resp)
         resp.third.get()
     }
 
+}
+
+// Retry helper for transient 502 Bad Gateway errors during cluster boot.
+// The nginx proxy accepts connections immediately but returns 502 while the
+// api backend behind it is still starting. Previous direct-api-port approach
+// surfaced this as connection-refused which existing retry loops handled;
+// with proxy-routed traffic we get 502 instead.
+fun <T> retryOnBadGateway(maxAttempts: Int = 5, delayMs: Long = 2000, block: () -> T): T {
+    var lastException: Exception? = null
+    for (attempt in 1..maxAttempts) {
+        try {
+            return block()
+        } catch (e: Exception) {
+            val is502 = e.message?.contains("502") == true
+            if (!is502 || attempt == maxAttempts) throw e
+            lastException = e
+            Logger.debug("502 Bad Gateway (attempt $attempt/$maxAttempts), retrying in ${delayMs}ms")
+            Thread.sleep(delayMs)
+        }
+    }
+    throw lastException!!
 }
 
 

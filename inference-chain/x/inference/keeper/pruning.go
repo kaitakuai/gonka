@@ -33,7 +33,7 @@ func (k Keeper) Prune(ctx context.Context, currentEpochIndex int64) error {
 	if err != nil {
 		return err
 	}
-	err = k.GetSubnetPruner(params).Prune(ctx, k, currentEpochIndex)
+	err = k.GetDevshardPruner(params).Prune(ctx, k, currentEpochIndex)
 	if err != nil {
 		return err
 	}
@@ -113,25 +113,25 @@ func (k Keeper) GetPoCBatchesPruner(params types.Params) Pruner[collections.Trip
 	}
 }
 
-func (k Keeper) GetSubnetPruner(params types.Params) Pruner[collections.Pair[uint64, uint64], collections.NoValue] {
+func (k Keeper) GetDevshardPruner(params types.Params) Pruner[collections.Pair[uint64, uint64], collections.NoValue] {
 	return Pruner[collections.Pair[uint64, uint64], collections.NoValue]{
-		Threshold:  SubnetPruningThreshold,
-		PruningMax: SubnetPruningMax,
-		List:       k.SubnetEscrowsByEpoch,
+		Threshold:  DevshardPruningThreshold,
+		PruningMax: DevshardPruningMax,
+		List:       k.DevshardEscrowsByEpoch,
 		Ranger: func(ctx context.Context, epoch int64) collections.Ranger[collections.Pair[uint64, uint64]] {
 			return collections.NewPrefixedPairRange[uint64, uint64](uint64(epoch))
 		},
 		GetLastPruned: func(state types.PruningState) int64 {
-			return state.SubnetPrunedEpoch
+			return state.DevshardPrunedEpoch
 		},
 		SetLastPruned: func(state *types.PruningState, epoch int64) {
-			state.SubnetPrunedEpoch = epoch
+			state.DevshardPrunedEpoch = epoch
 		},
 		Remover: func(ctx context.Context, key collections.Pair[uint64, uint64]) error {
 			epochIndex := key.K1()
 			escrowID := key.K2()
 
-			escrow, found := k.GetSubnetEscrow(ctx, escrowID)
+			escrow, found := k.GetDevshardEscrow(ctx, escrowID)
 			if found && !escrow.Settled {
 				if err := k.distributeUnsettledEscrow(ctx, escrow); err != nil {
 					k.LogError("failed to distribute unsettled escrow", types.Pruning,
@@ -140,26 +140,26 @@ func (k Keeper) GetSubnetPruner(params types.Params) Pruner[collections.Pair[uin
 			}
 
 			// Delete escrow and index entry
-			if err := k.SubnetEscrows.Remove(ctx, escrowID); err != nil {
-				k.LogError("failed to remove subnet escrow", types.Pruning, "escrow_id", escrowID, "error", err)
+			if err := k.DevshardEscrows.Remove(ctx, escrowID); err != nil {
+				k.LogError("failed to remove devshard escrow", types.Pruning, "escrow_id", escrowID, "error", err)
 			}
-			if err := k.SubnetEscrowsByEpoch.Remove(ctx, collections.Join(epochIndex, escrowID)); err != nil {
-				k.LogError("failed to remove subnet escrow index", types.Pruning, "escrow_id", escrowID, "error", err)
+			if err := k.DevshardEscrowsByEpoch.Remove(ctx, collections.Join(epochIndex, escrowID)); err != nil {
+				k.LogError("failed to remove devshard escrow index", types.Pruning, "escrow_id", escrowID, "error", err)
 			}
 			return nil
 		},
 		PostPruneEpoch: func(ctx context.Context, epoch int64) error {
 			epochIndex := uint64(epoch)
-			// Clear SubnetHostEpochStats for this epoch
+			// Clear DevshardHostEpochStats for this epoch
 			statsRng := collections.NewPrefixedPairRange[uint64, sdk.AccAddress](epochIndex)
-			err := k.SubnetHostEpochStatsMap.Clear(ctx, statsRng)
+			err := k.DevshardHostEpochStatsMap.Clear(ctx, statsRng)
 			if err != nil {
-				k.LogError("failed to clear subnet host epoch stats", types.Pruning, "epoch", epochIndex, "error", err)
+				k.LogError("failed to clear devshard host epoch stats", types.Pruning, "epoch", epochIndex, "error", err)
 			}
 			// Delete epoch count
-			err = k.SubnetEscrowEpochCount.Remove(ctx, epochIndex)
+			err = k.DevshardEscrowEpochCount.Remove(ctx, epochIndex)
 			if err != nil {
-				k.LogError("failed to remove subnet escrow epoch count", types.Pruning, "epoch", epochIndex, "error", err)
+				k.LogError("failed to remove devshard escrow epoch count", types.Pruning, "epoch", epochIndex, "error", err)
 			}
 			return nil
 		},

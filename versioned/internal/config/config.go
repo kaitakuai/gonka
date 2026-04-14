@@ -30,7 +30,7 @@ func Load() (Config, error) {
 		PollInterval:  parseDuration("VERSIOND_POLL_INTERVAL", 30*time.Second),
 		BinDir:        envOrDefault("VERSIOND_BIN_DIR", "/opt/versiond/bin"),
 		DataDir:       envOrDefault("VERSIOND_DATA_DIR", "/opt/versiond/data"),
-		BinaryName:    envOrDefault("VERSIOND_BINARY_NAME", "subnet"),
+		BinaryName:    envOrDefault("VERSIOND_BINARY_NAME", "devshard"),
 		BasePort:      5000,
 		Overrides:     loadOverrides(),
 		ForceVersions: loadForceVersions(),

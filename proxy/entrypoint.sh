@@ -14,6 +14,12 @@ export EXPLORER_SERVICE_NAME=${EXPLORER_SERVICE_NAME:-explorer}
 export PROXY_SSL_SERVICE_NAME=${PROXY_SSL_SERVICE_NAME:-proxy-ssl}
 export PROXY_SSL_PORT=${PROXY_SSL_PORT:-8080}
 
+# Versiond is optional. When VERSIOND_SERVICE_NAME is set the proxy adds an
+# upstream and a /devshard/ location that forwards to versiond. Versiond
+# strips the /<version>/ prefix and routes to the right child binary.
+VERSIOND_SERVICE_NAME=${VERSIOND_SERVICE_NAME:-}
+VERSIOND_PORT=${VERSIOND_PORT:-8080}
+
 if [ -n "${KEY_NAME}" ] && [ "${KEY_NAME}" != "" ]; then
     export KEY_NAME_PREFIX="${KEY_NAME}-"
 else
@@ -25,6 +31,9 @@ export FINAL_API_SERVICE="${KEY_NAME_PREFIX}${API_SERVICE_NAME}"
 export FINAL_NODE_SERVICE="${KEY_NAME_PREFIX}${NODE_SERVICE_NAME}"
 export FINAL_EXPLORER_SERVICE="${KEY_NAME_PREFIX}${EXPLORER_SERVICE_NAME}"
 export FINAL_PROXY_SSL_SERVICE="${KEY_NAME_PREFIX}${PROXY_SSL_SERVICE_NAME}"
+if [ -n "${VERSIOND_SERVICE_NAME}" ]; then
+    export FINAL_VERSIOND_SERVICE="${KEY_NAME_PREFIX}${VERSIOND_SERVICE_NAME}"
+fi
 
 # Check if dashboard is enabled
 DASHBOARD_ENABLED="false"
@@ -89,6 +98,29 @@ if [ "$SSL_ENABLED" = "true" ]; then
     echo "   SSL: Enabled for domain $DOMAIN_NAME"
 else
     echo "   SSL: Disabled"
+fi
+
+# Versiond upstream + /devshard/ location, only when configured.
+if [ -n "${VERSIOND_SERVICE_NAME}" ]; then
+    echo "   Versiond Service: $FINAL_VERSIOND_SERVICE:$VERSIOND_PORT"
+    export VERSIOND_UPSTREAM="upstream versiond_backend {
+        zone versiond_backend 64k;
+        server ${FINAL_VERSIOND_SERVICE}:${VERSIOND_PORT} resolve;
+    }"
+    # /devshard/<version>/* hits nginx, /devshard/ is stripped by proxy_pass
+    # (trailing slash). versiond receives /<version>/* and routes by the
+    # first segment to the matching child binary.
+    export DEVSHARD_VERSIOND_LOCATION="location /devshard/ {
+            proxy_pass http://versiond_backend/;
+            proxy_set_header Host \$\$host;
+            proxy_set_header X-Real-IP \$\$remote_addr;
+            proxy_set_header X-Forwarded-For \$\$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$\$scheme;
+            proxy_set_header Authorization \$\$http_authorization;
+        }"
+else
+    export VERSIOND_UPSTREAM="# versiond not configured"
+    export DEVSHARD_VERSIOND_LOCATION="# versiond not configured"
 fi
 
 if [ "$DASHBOARD_ENABLED" = "true" ]; then
@@ -596,6 +628,7 @@ ENVSUBST_VARS="${ENVSUBST_VARS},\$CHAIN_GRPC_CONNECT_TIMEOUT,\$CHAIN_GRPC_TRANSF
 ENVSUBST_VARS="${ENVSUBST_VARS},\$LIMIT_REQ_RULE_GLOBAL,\$LIMIT_REQ_RULE_GONKA_API"
 ENVSUBST_VARS="${ENVSUBST_VARS},\$LIMIT_REQ_RULE_CHAIN_RPC,\$LIMIT_REQ_RULE_CHAIN_API,\$LIMIT_REQ_RULE_CHAIN_GRPC"
 ENVSUBST_VARS="${ENVSUBST_VARS},\$BLOCKED_ROUTES_CONFIG,\$EXEMPT_ROUTES_CONFIG,\$API_VERSION_LOCATIONS"
+ENVSUBST_VARS="${ENVSUBST_VARS},\$VERSIOND_UPSTREAM,\$DEVSHARD_VERSIOND_LOCATION"
 
 echo "Rendering unified nginx configuration (mode: $NGINX_MODE, server_name: $SERVER_NAME)"
 envsubst "$ENVSUBST_VARS" < /etc/nginx/nginx.unified.conf.template | sed 's/\$\$/$/g' > /etc/nginx/nginx.conf

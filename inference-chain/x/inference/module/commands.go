@@ -103,6 +103,7 @@ Note: Chain ID will be auto-detected from the chain if not specified with --chai
 
 type settlementFileJSON struct {
 	EscrowID   string                    `json:"escrow_id"`
+	Version    string                    `json:"version"`
 	StateRoot  string                    `json:"state_root"`
 	Nonce      uint64                    `json:"nonce"`
 	Fees       uint64                    `json:"fees"`
@@ -125,10 +126,10 @@ type slotSignatureJSON struct {
 	Signature string `json:"signature"`
 }
 
-func SettleSubnetEscrowCmd() *cobra.Command {
+func SettleDevshardEscrowCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "settle-subnet-escrow <settlement-file.json>",
-		Short: "Settle a subnet escrow using a settlement JSON file produced by subnetctl",
+		Use:   "settle-devshard-escrow <settlement-file.json>",
+		Short: "Settle a devshard escrow using a settlement JSON file produced by devshardctl",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			clientCtx, err := client.GetClientTxContext(cmd)
@@ -144,6 +145,9 @@ func SettleSubnetEscrowCmd() *cobra.Command {
 			var sf settlementFileJSON
 			if err := json.Unmarshal(data, &sf); err != nil {
 				return fmt.Errorf("parse settlement JSON: %w", err)
+			}
+			if sf.Version == "" {
+				return fmt.Errorf("settlement JSON missing version")
 			}
 
 			escrowID, err := strconv.ParseUint(sf.EscrowID, 10, 64)
@@ -161,9 +165,9 @@ func SettleSubnetEscrowCmd() *cobra.Command {
 				return fmt.Errorf("decode rest_hash: %w", err)
 			}
 
-			hostStats := make([]*types.SubnetSettlementHostStats, len(sf.HostStats))
+			hostStats := make([]*types.DevshardSettlementHostStats, len(sf.HostStats))
 			for i, hs := range sf.HostStats {
-				hostStats[i] = &types.SubnetSettlementHostStats{
+				hostStats[i] = &types.DevshardSettlementHostStats{
 					SlotId:               hs.SlotID,
 					Missed:               hs.Missed,
 					Invalid:              hs.Invalid,
@@ -173,21 +177,22 @@ func SettleSubnetEscrowCmd() *cobra.Command {
 				}
 			}
 
-			sigs := make([]*types.SubnetSlotSignature, len(sf.Signatures))
+			sigs := make([]*types.DevshardSlotSignature, len(sf.Signatures))
 			for i, s := range sf.Signatures {
 				sigBytes, err := base64.StdEncoding.DecodeString(s.Signature)
 				if err != nil {
 					return fmt.Errorf("decode signature for slot %d: %w", s.SlotID, err)
 				}
-				sigs[i] = &types.SubnetSlotSignature{
+				sigs[i] = &types.DevshardSlotSignature{
 					SlotId:    s.SlotID,
 					Signature: sigBytes,
 				}
 			}
 
-			msg := &types.MsgSettleSubnetEscrow{
+			msg := &types.MsgSettleDevshardEscrow{
 				Settler:    clientCtx.GetFromAddress().String(),
 				EscrowId:   escrowID,
+				Version:    sf.Version,
 				StateRoot:  stateRoot,
 				Nonce:      sf.Nonce,
 				Fees:       sf.Fees,

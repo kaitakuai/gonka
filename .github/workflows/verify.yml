@@ -193,15 +193,15 @@ jobs:
           path: versioned/junit-report.xml
           reporter: java-junit
 
-  build-and-test-subnet:
+  build-and-test-devshard:
     runs-on: ubuntu-latest
-    name: Build and Test Subnet
+    name: Build and Test Devshard
     permissions:
       contents: read
       checks: write
     defaults:
       run:
-        working-directory: ./subnet
+        working-directory: ./devshard
 
     steps:
       - name: Checkout code
@@ -242,13 +242,13 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
         with:
-          name: subnet-junit-report
-          path: subnet/junit-report.xml
+          name: devshard-junit-report
+          path: devshard/junit-report.xml
 
       - name: Report Test Results in GitHub
         if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
         uses: dorny/test-reporter@v1
         with:
-          name: Subnet Tests
-          path: subnet/junit-report.xml
+          name: Devshard Tests
+          path: devshard/junit-report.xml
           reporter: java-junit

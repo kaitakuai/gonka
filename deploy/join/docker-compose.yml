@@ -77,7 +77,28 @@ services:
       - "9100:9100"
       - "127.0.0.1:9200:9200"
     restart: always
-  
+
+  versiond:
+    container_name: versiond
+    image: ghcr.io/product-science/versiond:0.2.11
+    environment:
+      - VERSIOND_ORACLE_URL=http://api:9100/versions
+      - VERSIOND_BINARY_NAME=devshardd
+      - NODE_MANAGER_ADDR=api:9400
+      - NODE_HOST=node
+      - KEY_NAME=${KEY_NAME}
+      - ACCOUNT_PUBKEY=${ACCOUNT_PUBKEY}
+      - KEYRING_BACKEND=${KEYRING_BACKEND:-file}
+      - KEYRING_PASSWORD=${KEYRING_PASSWORD}
+      - KEYRING_DIR=/root/.inference
+    volumes:
+      - .inference:/root/.inference:ro
+      - ./devshards/bin:/opt/versiond/bin
+      - ./devshards/data:/opt/versiond/data
+    depends_on:
+      - api
+    restart: always
+
   bridge:
     container_name: bridge
     image: ghcr.io/product-science/bridge:0.2.5-post5@sha256:8d2f217115c65b27fcb6fe1497471c30891534f18685bd3007d168aa7f1a9371
@@ -109,7 +130,7 @@ services:
       - NGINX_MODE=${NGINX_MODE:-http}
       - SERVER_NAME=${SERVER_NAME:-}
       - GONKA_API_PORT=9000
-      - GONKA_API_EXEMPT_ROUTES=chat inference poc/proofs subnet
+      - GONKA_API_EXEMPT_ROUTES=chat inference poc/proofs devshard
       - GONKA_API_BLOCKED_ROUTES=poc-batches training
       - CHAIN_RPC_PORT=26657
       - CHAIN_API_PORT=1317
@@ -118,6 +139,7 @@ services:
       # SSL enablement (entrypoint enables SSL if CERT_ISSUER_DOMAIN is set)
       - CERT_ISSUER_DOMAIN=${CERT_ISSUER_DOMAIN:-}
       - PROXY_ADD_NODE_PREFIX=${PROXY_ADD_NODE_PREFIX:-false}
+      - VERSIOND_SERVICE_NAME=versiond
       # Optional: override proxy-ssl discovery
       - PROXY_SSL_SERVICE_NAME=${PROXY_SSL_SERVICE_NAME:-proxy-ssl}
       - PROXY_SSL_PORT=${PROXY_SSL_PORT:-8080}
@@ -131,6 +153,8 @@ services:
       node:
         condition: service_started
       api:
+        condition: service_started
+      versiond:
         condition: service_started
       explorer:
         condition: service_started

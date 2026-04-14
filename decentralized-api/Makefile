@@ -4,6 +4,7 @@ BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 COMMIT := $(shell git log -1 --format='%H')
 
 VERSION ?= $(shell git describe --always)
+DEVSHARD_VERSION ?= $(VERSION)
 BLST_PORTABLE ?= 0
 SET_LATEST ?= 0
 SET_LATEST := $(shell if [ "$(SET_LATEST)" = "1" ]; then echo 1; else echo 0; fi)
@@ -40,6 +41,7 @@ define DOCKER_BUILD
 		--build-arg GOOS=$(GOOS) \
 		--build-arg GOARCH=$(GOARCH) \
 		--build-arg BLST_PORTABLE=$(BLST_PORTABLE) \
+		--build-arg DEVSHARD_VERSION=$(DEVSHARD_VERSION) \
 		-f $(DOCKER_FILE) \
 		.. \
 		-t $(DOCKER_TAG)
@@ -54,6 +56,7 @@ define DOCKER_BUILD_UPGRADE
 		--platform $(PLATFORM) \
 		--build-arg GOOS=$(GOOS) \
 		--build-arg GOARCH=$(GOARCH) \
+		--build-arg DEVSHARD_VERSION=$(DEVSHARD_VERSION) \
 		--target binary-exporter \
 		-f $(DOCKER_FILE) \
 		--output type=local,dest=./output \

@@ -21,7 +21,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "data directory")
 	flag.Parse()
 
-	prefix := os.Getenv("SUBNET_LOG_PREFIX")
+	prefix := os.Getenv("DEVSHARD_LOG_PREFIX")
 	nmAddr := os.Getenv("NODE_MANAGER_ADDR")
 	log.Printf("[%s] starting testapp on port %d, data-dir=%s, node-manager=%s", prefix, *port, *dataDir, nmAddr)
 

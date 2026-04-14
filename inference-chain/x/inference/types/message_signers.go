@@ -56,9 +56,9 @@ func (msg *MsgGovernanceCancelBridgeOperation) GetSignersStrings() []string {
 	return []string{msg.Authority}
 }
 
-// Subnet escrow messages
-func (msg *MsgCreateSubnetEscrow) GetSignersStrings() []string { return []string{msg.Creator} }
-func (msg *MsgSettleSubnetEscrow) GetSignersStrings() []string { return []string{msg.Settler} }
+// Devshard escrow messages
+func (msg *MsgCreateDevshardEscrow) GetSignersStrings() []string { return []string{msg.Creator} }
+func (msg *MsgSettleDevshardEscrow) GetSignersStrings() []string { return []string{msg.Settler} }
 
 // And one validator signed message?
 func (msg *MsgBridgeExchange) GetSignersStrings() []string { return []string{msg.Validator} }

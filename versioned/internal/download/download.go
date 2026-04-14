@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,13 @@ import (
 
 var client = &http.Client{
 	Timeout: 0, // no overall timeout; controlled by context
+}
+
+const InstallMetadataFilename = "install.json"
+
+type InstallMetadata struct {
+	ArchiveSHA256 string `json:"archive_sha256"`
+	BinarySHA256  string `json:"binary_sha256"`
 }
 
 // Download fetches a binary from url, verifies its SHA-256 checksum, and extracts
@@ -71,7 +79,27 @@ func Download(ctx context.Context, url, expectedSHA256, destDir, binaryName stri
 		return fmt.Errorf("create dest dir: %w", err)
 	}
 
-	return extractBinary(tmpPath, destDir, binaryName)
+	if err := extractBinary(tmpPath, destDir, binaryName); err != nil {
+		return err
+	}
+
+	binaryPath := filepath.Join(destDir, binaryName)
+	binaryHash, err := HashFile(binaryPath)
+	if err != nil {
+		_ = os.Remove(binaryPath)
+		return fmt.Errorf("hash extracted binary: %w", err)
+	}
+
+	if err := writeInstallMetadata(destDir, InstallMetadata{
+		ArchiveSHA256: gotHash,
+		BinarySHA256:  binaryHash,
+	}); err != nil {
+		_ = os.Remove(binaryPath)
+		_ = os.Remove(filepath.Join(destDir, InstallMetadataFilename))
+		return fmt.Errorf("write install metadata: %w", err)
+	}
+
+	return nil
 }
 
 // AtomicWriteFile writes data from r into destDir/filename via a temp file + chmod + rename.
@@ -103,6 +131,76 @@ func AtomicWriteFile(destDir, filename string, r io.Reader) error {
 		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
+}
+
+func ReadInstallMetadata(destDir string) (InstallMetadata, error) {
+	data, err := os.ReadFile(filepath.Join(destDir, InstallMetadataFilename))
+	if err != nil {
+		return InstallMetadata{}, err
+	}
+
+	var metadata InstallMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return InstallMetadata{}, fmt.Errorf("decode install metadata: %w", err)
+	}
+	if metadata.ArchiveSHA256 == "" {
+		return InstallMetadata{}, fmt.Errorf("install metadata missing archive sha256")
+	}
+	if metadata.BinarySHA256 == "" {
+		return InstallMetadata{}, fmt.Errorf("install metadata missing binary sha256")
+	}
+	return metadata, nil
+}
+
+func writeInstallMetadata(destDir string, metadata InstallMetadata) error {
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("marshal install metadata: %w", err)
+	}
+	return atomicWriteBytesFile(destDir, InstallMetadataFilename, data, 0644)
+}
+
+func atomicWriteBytesFile(destDir, filename string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(destDir, filename+".tmp.*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("chmod: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, filepath.Join(destDir, filename)); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
+func HashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func extractBinary(zipPath, destDir, binaryName string) error {

@@ -2,7 +2,7 @@
 
 ## Goal / Problem
 
-Subnet nodes need to run multiple binary versions concurrently behind a single endpoint. Cosmovisor handles this for chain nodes but is fragile, single-version-only, and not production-grade.
+Devshard nodes need to run multiple binary versions concurrently behind a single endpoint. Cosmovisor handles this for chain nodes but is fragile, single-version-only, and not production-grade.
 
 We need a lightweight version manager that:
 - Polls an oracle for which versions to run
@@ -13,16 +13,16 @@ We need a lightweight version manager that:
 
 ## On-Chain State
 
-Approved versions are stored in the inference module `Params` within `SubnetEscrowParams`.
+Approved versions are stored in the inference module `Params` within `DevshardEscrowParams`.
 
 ```proto
-message SubnetEscrowParams {
+message DevshardEscrowParams {
   option (gogoproto.equal) = true;
   // ... existing escrow fields ...
-  repeated SubnetApprovedVersion approved_versions = N;
+  repeated DevshardApprovedVersion approved_versions = N;
 }
 
-message SubnetApprovedVersion {
+message DevshardApprovedVersion {
   option (gogoproto.equal) = true;
   string name = 1;    // e.g. "v0.2.11"
   string binary = 2;  // download URL (GitHub releases, S3, mirror -- any HTTP source)
@@ -30,7 +30,7 @@ message SubnetApprovedVersion {
 }
 ```
 
-Changes only via governance proposal through the existing `MsgUpdateParams` flow. No dedicated query -- use the existing params query and read the approved versions from `SubnetEscrowParams`.
+Changes only via governance proposal through the existing `MsgUpdateParams` flow. No dedicated query -- use the existing params query and read the approved versions from `DevshardEscrowParams`.
 
 The `sha256` field is always required. sha256 is the sole identity for a binary -- the URL is a download hint only. Changing the URL while keeping the same hash is a no-op. Two governance proposals pointing to different mirrors but the same hash result in zero restarts.
 
@@ -43,16 +43,16 @@ The `sha256` field is always required. sha256 is the sole identity for a binary 
       "@type": "/inference.inference.MsgUpdateParams",
       "authority": "inference10d07y265gmmuvt4z0w9aw880jnsr700j2ghlke",
       "params": {
-        "subnet_escrow_params": {
+        "devshard_escrow_params": {
           "approved_versions": [
             {
               "name": "v0.2.11",
-              "binary": "https://github.com/gonka-ai/gonka/releases/download/release%2Fv0.2.11/subnet-amd64.zip",
+              "binary": "https://github.com/gonka-ai/gonka/releases/download/release%2Fv0.2.11/devshard-amd64.zip",
               "sha256": "e574c3d86189daf325cc7008603ee8e952efb028afda5bcd4a154dcd334192d4"
             },
             {
               "name": "v0.2.12",
-              "binary": "https://github.com/gonka-ai/gonka/releases/download/release%2Fv0.2.12/subnet-amd64.zip",
+              "binary": "https://github.com/gonka-ai/gonka/releases/download/release%2Fv0.2.12/devshard-amd64.zip",
               "sha256": "a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef1234567890"
             }
           ]
@@ -60,8 +60,8 @@ The `sha256` field is always required. sha256 is the sole identity for a binary 
       }
     }
   ],
-  "title": "Update subnet approved versions",
-  "summary": "Add v0.2.12 to approved subnet versions"
+  "title": "Update devshard approved versions",
+  "summary": "Add v0.2.12 to approved devshard versions"
 }
 ```
 
@@ -74,8 +74,8 @@ The decentralized-api reads approved versions from chain params and serves them 
 
 The block dispatcher (`new_block_dispatcher.go`) already queries chain params on every new block and caches them in `configManager`. The same pattern applies here:
 
-1. Dispatcher reads `params.subnet_escrow_params.approved_versions` from the chain params response
-2. Writes to a `SubnetVersions` cache field in `configManager` (same as `ValidationParams`, `BandwidthParams`, etc.)
+1. Dispatcher reads `params.devshard_escrow_params.approved_versions` from the chain params response
+2. Writes to a `DevshardVersions` cache field in `configManager` (same as `ValidationParams`, `BandwidthParams`, etc.)
 3. A single `GET /versions` handler on the ML server port (9100) reads from this cache and returns JSON
 
 No new goroutines, no polling intervals, no config flags. The existing block event loop drives updates.
@@ -98,7 +98,7 @@ The entire `internal/versioned/` package is deleted:
   "versions": [
     {
       "name": "v0.2.11",
-      "binary": "https://github.com/gonka-ai/gonka/releases/download/release%2Fv0.2.11/subnet-amd64.zip",
+      "binary": "https://github.com/gonka-ai/gonka/releases/download/release%2Fv0.2.11/devshard-amd64.zip",
       "sha256": "e574c3d86189daf325cc7008603ee8e952efb028afda5bcd4a154dcd334192d4"
     }
   ]
@@ -125,8 +125,8 @@ Responsibilities:
 ```
 /opt/versiond/
   bin/
-    v0.2.11/subnet        # extracted binary (or atomic copy from override)
-    v0.2.12/subnet
+    v0.2.11/devshard        # extracted binary (or atomic copy from override)
+    v0.2.12/devshard
   data/
     v0.2.11/              # version-specific data dir, passed as --data-dir to child
     v0.2.12/
@@ -197,8 +197,8 @@ Ports are assigned from a base port (5000) and persist for the manager's lifetim
 For development and debugging, operators can override specific version binaries via environment variables:
 
 ```
-VERSIOND_OVERRIDE_v0_2_11=/local/path/to/subnet
-VERSIOND_OVERRIDE_v0_2_12=/another/path/to/subnet
+VERSIOND_OVERRIDE_v0_2_11=/local/path/to/devshard
+VERSIOND_OVERRIDE_v0_2_12=/another/path/to/devshard
 ```
 
 Dots in version names become underscores in the env var name. When an override is set:
@@ -255,7 +255,7 @@ On SIGTERM/SIGINT:
 
 ### Logging
 
-Child processes tag their own log output via `SUBNET_LOG_PREFIX` env var set by versiond (e.g. `SUBNET_LOG_PREFIX=v0.2.11`). The subnet binary prepends this to each log line. Zero overhead in versiond -- child stdout/stderr connect directly to versiond's stdout/stderr. No interleaving issues because each line is already tagged at the source.
+Child processes tag their own log output via `DEVSHARD_LOG_PREFIX` env var set by versiond (e.g. `DEVSHARD_LOG_PREFIX=v0.2.11`). The devshard binary prepends this to each log line. Zero overhead in versiond -- child stdout/stderr connect directly to versiond's stdout/stderr. No interleaving issues because each line is already tagged at the source.
 
 ### Configuration
 
@@ -267,7 +267,7 @@ All via environment variables:
 | VERSIOND_POLL_INTERVAL | 30s | Oracle poll interval |
 | VERSIOND_BIN_DIR | /opt/versiond/bin | Binary storage |
 | VERSIOND_DATA_DIR | /opt/versiond/data | Per-version data directories |
-| VERSIOND_BINARY_NAME | subnet | Expected binary name inside zip |
+| VERSIOND_BINARY_NAME | devshard | Expected binary name inside zip |
 | VERSIOND_OVERRIDE_{VERSION} | (none) | Local binary path override per version |
 | VERSIOND_FORCE | (none) | Comma-separated version names to force-run |
 
@@ -280,7 +280,7 @@ Listen address is hardcoded to :8080. Base port is hardcoded to 5000.
 governance proposal
     |
     v
-chain params (SubnetEscrowParams.approved_versions)
+chain params (DevshardEscrowParams.approved_versions)
     |
     v
 dapi block dispatcher (every block) -> configManager cache
@@ -304,7 +304,7 @@ versiond (polls every 30s)
 
 ```
 /inference-chain/
-  proto/inference/inference/params.proto     -- add SubnetApprovedVersion to SubnetEscrowParams
+  proto/inference/inference/params.proto     -- add DevshardApprovedVersion to DevshardEscrowParams
   x/inference/types/params.go               -- validation, defaults
 
 /decentralized-api/
@@ -312,7 +312,7 @@ versiond (polls every 30s)
   internal/event_listener/
     new_block_dispatcher.go                 -- read approved_versions, write to configManager
   internal/server/ml/                       -- add GET /versions handler
-  apiconfig/                                -- add SubnetVersions cache field to configManager
+  apiconfig/                                -- add DevshardVersions cache field to configManager
 
 /versioned/
   internal/config/config.go                 -- ForceVersions, hardcoded BasePort/ListenAddr
@@ -333,7 +333,7 @@ versiond:
 ```ini
 # /etc/systemd/system/versiond.service
 [Unit]
-Description=Subnet Version Manager
+Description=Devshard Version Manager
 
 [Service]
 ExecStart=/usr/bin/versiond
@@ -352,7 +352,7 @@ versiond:
   environment:
     VERSIOND_ORACLE_URL: http://api:9100/versions
     # Optional: override a version for local testing
-    # VERSIOND_OVERRIDE_v0_2_11: /opt/local/subnet-dev
+    # VERSIOND_OVERRIDE_v0_2_11: /opt/local/devshard-dev
     # Optional: force versions not yet in governance
     # VERSIOND_FORCE: v0.2.13-rc1
   ports:

@@ -276,7 +276,7 @@ func setParameters(ctx context.Context, k keeper.Keeper) error {
 
 	params.ValidationParams.ClaimValidationEnabled = false
 
-	params.SubnetEscrowParams = &types.SubnetEscrowParams{
+	params.DevshardEscrowParams = &types.DevshardEscrowParams{
 		MinAmount:          50_000_000,      // 0.05 GNK
 		MaxAmount:          100_000_000_000, // 100 GNK
 		MaxEscrowsPerEpoch: 100,
@@ -313,7 +313,7 @@ func setPruningState(ctx context.Context, k keeper.Keeper) error {
 		return err
 	}
 	state.EpochGroupValidationsPrunedEpoch = 0
-	state.SubnetPrunedEpoch = 0
+	state.DevshardPrunedEpoch = 0
 	return k.PruningState.Set(ctx, state)
 }
 

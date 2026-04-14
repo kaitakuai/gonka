@@ -39,7 +39,8 @@ func createTestZip(t *testing.T, binaryName, content string) ([]byte, string) {
 }
 
 func TestDownload(t *testing.T) {
-	zipData, hash := createTestZip(t, "myapp", "#!/bin/sh\necho hello")
+	binaryContent := "#!/bin/sh\necho hello"
+	zipData, hash := createTestZip(t, "myapp", binaryContent)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write(zipData)
@@ -65,8 +66,20 @@ func TestDownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(content) != "#!/bin/sh\necho hello" {
+	if string(content) != binaryContent {
 		t.Errorf("content = %q", string(content))
+	}
+
+	metadata, err := ReadInstallMetadata(destDir)
+	if err != nil {
+		t.Fatalf("read install metadata: %v", err)
+	}
+	if metadata.ArchiveSHA256 != hash {
+		t.Errorf("archive hash = %q, want %q", metadata.ArchiveSHA256, hash)
+	}
+	binaryHash := sha256.Sum256([]byte(binaryContent))
+	if metadata.BinarySHA256 != hex.EncodeToString(binaryHash[:]) {
+		t.Errorf("binary hash = %q, want %q", metadata.BinarySHA256, hex.EncodeToString(binaryHash[:]))
 	}
 }
 

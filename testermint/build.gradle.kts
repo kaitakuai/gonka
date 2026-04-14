@@ -83,15 +83,19 @@ tasks.register("listAllTestClasses") {
 }
 
 /**
- * Helper function to extract class definitions from a Kotlin file
- * 
- * This function parses the file content to identify individual class definitions,
- * returning a list of pairs where each pair contains:
+ * Helper function to extract top-level test class definitions from a Kotlin file.
+ *
+ * Only plain `class` declarations are matched -- `data class`, `enum class`,
+ * `sealed class`, `inner class`, `value class`, and `annotation class` are
+ * excluded because they are never test classes and their presence (e.g. as
+ * local data classes inside a test method) would create spurious matrix entries.
+ *
+ * Returns a list of pairs where each pair contains:
  * 1. The class name (or null if it couldn't be determined)
  * 2. The full class content including annotations and methods
  */
 fun extractClassDefinitions(fileContent: String): List<Pair<String?, String>> {
-    val classRegex = Regex("""(?:@\w+(?:\(.*?\))?[\s\n]*)*class\s+(\w+)""", RegexOption.DOT_MATCHES_ALL)
+    val classRegex = Regex("""(?:@\w+(?:\(.*?\))?[\s\n]*)*(?<!data )(?<!enum )(?<!inner )(?<!sealed )(?<!value )(?<!annotation )class\s+(\w+)""", RegexOption.DOT_MATCHES_ALL)
     val matches = classRegex.findAll(fileContent)
     
     val classes = mutableListOf<Pair<String?, String>>()
