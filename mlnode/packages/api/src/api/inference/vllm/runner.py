@@ -128,7 +128,9 @@ class VLLMRunner(IVLLMRunner):
             command = ["sh", "-c", f"sleep {sleep_time} && exec {vllm_command_str}"]
 
             env = os.environ.copy()
-            env["VLLM_USE_V1"] = "0"
+            # VLLM_USE_V1=0 was a no-op on vLLM 0.15 (V0 fallback) and is
+            # silently ignored on 0.19+ where the V0 engine is removed.
+            # PoC v2 patches require V1, so we rely on the 0.19 default.
 
             start_gpu = i * gpus_per_instance
             if total_gpus > 0:

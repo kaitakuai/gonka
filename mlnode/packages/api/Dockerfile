@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 ################################################################################
-FROM ghcr.io/gonka-ai/vllm:v0.15.1 AS base
+FROM ghcr.io/kaitakuai/vllm:0.20.0-pocv2-0be8726de AS base
 
 RUN --mount=type=cache,target=/var/lib/apt/lists \
     --mount=type=cache,target=/root/.cache/pip \
@@ -63,8 +63,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m venv /app/packages/api/.venv \
     && . /app/packages/api/.venv/bin/activate \
     && cd /app/packages/api \
-    && poetry install --no-interaction \
-    && pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+    && poetry install --no-interaction
+# flash-attn install removed: the v2.8.3 cu12torch2.9 wheel is ABI-incompatible
+# with the new base image (torch 2.11.0+cu128 in vllm-openai:v0.20.0). mlnode
+# does not import flash_attn directly and the target deploy uses FLASHINFER_MLA
+# (flashinfer 0.6.8.post1 is already installed in the base image).
 
 ################################################################################
 FROM base AS app
