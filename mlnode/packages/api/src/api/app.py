@@ -61,10 +61,9 @@ async def lifespan(app: FastAPI):
         tee_info = detect_tee()
         app.state.tee_info = tee_info
 
-        # Step 2: Generate keys (only after TEE confirmed)
+        # Step 2: Generate keys + attestation (image_hash auto-computed from /app code)
         keys = TEEKeyManager()
-        image_hash = os.getenv("TEE_IMAGE_HASH", None)
-        attestation = generate_attestation(keys, tee_info, image_hash=image_hash)
+        attestation = generate_attestation(keys, tee_info)
         app.state.tee_keys = keys
         app.state.tee_attestation = attestation
         tee_logger.info("TEE attestation ready")
