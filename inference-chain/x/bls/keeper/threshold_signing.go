@@ -258,6 +258,7 @@ func (k Keeper) CancelThresholdSignature(ctx sdk.Context, requestID []byte) erro
 	}
 
 	request.Status = types.ThresholdSigningStatus_THRESHOLD_SIGNING_STATUS_CANCELLED
+	request.PartialSignatures = nil // status-only change; sub-keys already persisted
 	return k.storeThresholdSigningRequest(ctx, request)
 }
 
@@ -594,7 +595,7 @@ func (k Keeper) checkThresholdAndAggregate(ctx sdk.Context, request *types.Thres
 	// Remove from expiration index since it's no longer collecting signatures
 	k.removeFromExpirationIndex(ctx, request.DeadlineBlockHeight, request.RequestId)
 
-	// Persist terminal state before event emission
+	request.PartialSignatures = nil // terminal-state write; sub-keys already persisted
 	if err := k.storeThresholdSigningRequest(ctx, request); err != nil {
 		return err
 	}
@@ -842,6 +843,10 @@ func (k Keeper) finalizeFailedThresholdSigningRequest(
 ) error {
 	request.Status = status
 	request.FinalSignature = []byte{}
+	// Single failure funnel; both storeThresholdSigningRequest calls
+	// below (here and via maybeCloseRetryAfterFailedPostProcess) reuse
+	// this struct. Sub-keys stay as the submitters' audit trail.
+	request.PartialSignatures = nil
 
 	k.removeFromExpirationIndex(ctx, request.DeadlineBlockHeight, request.RequestId)
 

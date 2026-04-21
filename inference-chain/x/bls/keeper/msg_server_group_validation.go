@@ -221,10 +221,11 @@ func (ms msgServer) SubmitGroupKeyValidationSignature(goCtx context.Context, msg
 		validationState.FinalSignature = finalSignature
 		validationState.Status = types.GroupKeyValidationStatus_GROUP_KEY_VALIDATION_STATUS_VALIDATED
 
-		// Store the final signature in the new epoch's EpochBLSData and transition to SIGNED phase
+		// Only ValidationSignature and DkgPhase are changing; sub-keys
+		// are already persisted from the DKG phase.
 		newEpochBLSData.ValidationSignature = validationState.FinalSignature
 		newEpochBLSData.DkgPhase = types.DKGPhase_DKG_PHASE_SIGNED
-		if err := ms.SetEpochBLSData(ctx, newEpochBLSData); err != nil {
+		if err := ms.SetEpochBLSDataBaseOnly(ctx, newEpochBLSData); err != nil {
 			ms.Keeper.LogError("Failed to save updated epoch BLS data", "new_epoch_id", msg.NewEpochId, "error", err.Error())
 			return nil, fmt.Errorf("failed to save updated epoch %d BLS data: %w", msg.NewEpochId, err)
 		}
@@ -240,16 +241,9 @@ func (ms msgServer) SubmitGroupKeyValidationSignature(goCtx context.Context, msg
 		}
 	}
 
-	// Persist the updated base state (SlotsCovered, optional Status /
-	// FinalSignature on completion). Null out PartialSignatures before the
-	// call so SetGroupKeyValidationState's sync loop does NOT re-run for
-	// every accumulated partial: the new entry is already in its sub-key
-	// (line 186 above) and every other entry is already in its own sub-key
-	// from earlier txs. Without this null-out the sync loop calls
-	// SetGroupValidationPartialSignature for every rehydrated entry, whose
-	// merge path appends SlotIndices/Signature onto the existing sub-key,
-	// corrupting state and eventually failing aggregation with "duplicate
-	// slot index".
+	// Null PartialSignatures: the new entry is already in its sub-key
+	// (above), and SetGroupValidationPartialSignature's append-merge
+	// would otherwise double every rehydrated entry on every submission.
 	validationState.PartialSignatures = nil
 	if err := ms.SetGroupKeyValidationState(ctx, validationState); err != nil {
 		return nil, fmt.Errorf("failed to store validation state: %w", err)

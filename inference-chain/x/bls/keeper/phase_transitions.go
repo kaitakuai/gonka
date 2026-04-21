@@ -88,8 +88,8 @@ func (k Keeper) TransitionToVerifyingPhase(ctx sdk.Context, epochBLSData *types.
 		epochBLSData.DkgPhase = types.DKGPhase_DKG_PHASE_VERIFYING
 		epochBLSData.VerifyingPhaseDeadlineBlock = currentBlockHeight + params.VerificationPhaseDurationBlocks
 
-		// Store updated epoch data
-		if err := k.SetEpochBLSData(ctx, *epochBLSData); err != nil {
+		// Only base fields are changing; sub-keys are already persisted.
+		if err := k.SetEpochBLSDataBaseOnly(ctx, *epochBLSData); err != nil {
 			return fmt.Errorf("failed to set EpochBLSData for epoch %d: %w", epochBLSData.EpochId, err)
 		}
 
@@ -215,9 +215,20 @@ func (k Keeper) transitionFromVerifyingToDisputing(ctx sdk.Context, epochBLSData
 	epochBLSData.DkgPhase = types.DKGPhase_DKG_PHASE_DISPUTING
 	epochBLSData.DisputingPhaseDeadlineBlock = currentBlockHeight + params.DisputePhaseDurationBlocks
 
+	// NOT SetEpochBLSDataBaseOnly here: filteredComplaints above plus the
+	// DeleteDealerComplaintsForEpoch call cleared every complaint sub-key,
+	// so SetEpochBLSData's DealerComplaints sync loop MUST re-write the
+	// filtered subset. Null only the other two before Set; restore after
+	// so the event below still carries the full state.
+	dealerParts := epochBLSData.DealerParts
+	verSubs := epochBLSData.VerificationSubmissions
+	epochBLSData.DealerParts = nil
+	epochBLSData.VerificationSubmissions = nil
 	if err := k.SetEpochBLSData(ctx, *epochBLSData); err != nil {
 		return fmt.Errorf("failed to set EpochBLSData for epoch %d: %w", epochBLSData.EpochId, err)
 	}
+	epochBLSData.DealerParts = dealerParts
+	epochBLSData.VerificationSubmissions = verSubs
 
 	if err := ctx.EventManager().EmitTypedEvent(&types.EventDisputePhaseStarted{
 		EpochId:                     epochBLSData.EpochId,
@@ -296,7 +307,7 @@ func (k Keeper) finalizeDisputingPhase(ctx sdk.Context, epochBLSData *types.Epoc
 	}
 	epochBLSData.SlotPublicKeys = slotPublicKeys
 
-	if err := k.SetEpochBLSData(ctx, *epochBLSData); err != nil {
+	if err := k.SetEpochBLSDataBaseOnly(ctx, *epochBLSData); err != nil {
 		return fmt.Errorf("failed to set EpochBLSData for epoch %d: %w", epochBLSData.EpochId, err)
 	}
 
@@ -324,7 +335,7 @@ func (k Keeper) finalizeDisputingPhase(ctx sdk.Context, epochBLSData *types.Epoc
 func (k Keeper) MarkDKGAsFailed(ctx sdk.Context, epochBLSData *types.EpochBLSData, failureReason string) error {
 	epochBLSData.DkgPhase = types.DKGPhase_DKG_PHASE_FAILED
 
-	if err := k.SetEpochBLSData(ctx, *epochBLSData); err != nil {
+	if err := k.SetEpochBLSDataBaseOnly(ctx, *epochBLSData); err != nil {
 		return fmt.Errorf("failed to set EpochBLSData for epoch %d: %w", epochBLSData.EpochId, err)
 	}
 

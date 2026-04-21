@@ -77,10 +77,11 @@ func (ms msgServer) RespondDealerComplaints(ctx context.Context, msg *types.MsgR
 		complaint.ResponseShareBytes = response.ResponseShareBytes
 		complaint.ResponseOpeningMaterial = response.ResponseOpeningMaterial
 		epochBLSData.DealerComplaints[complaintIndex] = complaint
-	}
 
-	if err := ms.SetEpochBLSData(sdkCtx, epochBLSData); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to store updated epoch %d BLS data: %v", msg.EpochId, err))
+		// Per-complaint sub-key write; base struct has no changes to persist.
+		if err := ms.SetDealerComplaint(sdkCtx, msg.EpochId, &complaint); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to store updated dealer complaint for dealer %d and complainer %d in epoch %d: %v", msg.DealerIndex, response.ComplainerIndex, msg.EpochId, err))
+		}
 	}
 
 	for _, response := range msg.Responses {
