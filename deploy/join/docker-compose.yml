@@ -1,6 +1,6 @@
 services:
   tmkms:
-    image: ghcr.io/product-science/tmkms-softsign-with-keygen:0.2.11
+    image: ghcr.io/product-science/tmkms-softsign-with-keygen:0.2.12-alpha1
     container_name: tmkms
     restart: unless-stopped
     environment:
@@ -10,7 +10,7 @@ services:
 
   node:
     container_name: node
-    image: ghcr.io/product-science/inferenced:0.2.11
+    image: ghcr.io/product-science/inferenced:0.2.12-alpha1
     command: ["sh", "./init-docker.sh"]
     volumes:
       - .inference:/root/.inference
@@ -44,7 +44,7 @@ services:
 
   api:
     container_name: api
-    image: ghcr.io/product-science/api:0.2.11
+    image: ghcr.io/product-science/api:0.2.12-alpha1
     volumes:
       - .inference:/root/.inference
       - .dapi:/root/.dapi
@@ -80,7 +80,7 @@ services:
 
   versiond:
     container_name: versiond
-    image: ghcr.io/product-science/versiond:0.2.11
+    image: ghcr.io/product-science/versiond:0.2.12-alpha1
     environment:
       - VERSIOND_ORACLE_URL=http://api:9100/versions
       - VERSIOND_BINARY_NAME=devshardd
@@ -122,7 +122,7 @@ services:
   
   proxy:
     container_name: proxy
-    image: ghcr.io/product-science/proxy:0.2.11
+    image: ghcr.io/product-science/proxy:0.2.12-alpha1
     ports:
       - "${API_PORT:-8000}:80"
       - "${API_SSL_PORT:-8443}:443"
@@ -130,16 +130,17 @@ services:
       - NGINX_MODE=${NGINX_MODE:-http}
       - SERVER_NAME=${SERVER_NAME:-}
       - GONKA_API_PORT=9000
-      - GONKA_API_EXEMPT_ROUTES=chat inference poc/proofs devshard
+      - GONKA_API_EXEMPT_ROUTES=chat inference poc/proofs subnet devshard
+      - EXEMPT_CONN_LIMIT=200
       - GONKA_API_BLOCKED_ROUTES=poc-batches training
       - CHAIN_RPC_PORT=26657
       - CHAIN_API_PORT=1317
       - CHAIN_GRPC_PORT=9090
       - DASHBOARD_PORT=5173
+      - PROXY_REAL_IP_FROM=172.18.0.1
       # SSL enablement (entrypoint enables SSL if CERT_ISSUER_DOMAIN is set)
       - CERT_ISSUER_DOMAIN=${CERT_ISSUER_DOMAIN:-}
       - PROXY_ADD_NODE_PREFIX=${PROXY_ADD_NODE_PREFIX:-false}
-      - VERSIOND_SERVICE_NAME=versiond
       # Optional: override proxy-ssl discovery
       - PROXY_SSL_SERVICE_NAME=${PROXY_SSL_SERVICE_NAME:-proxy-ssl}
       - PROXY_SSL_PORT=${PROXY_SSL_PORT:-8080}
@@ -147,6 +148,8 @@ services:
       - DISABLE_CHAIN_API=${DISABLE_CHAIN_API:-true}
       - DISABLE_CHAIN_RPC=${DISABLE_CHAIN_RPC:-true}
       - DISABLE_CHAIN_GRPC=${DISABLE_CHAIN_GRPC:-true}
+      - DISABLE_VALIDATOR_WHITELIST=${DISABLE_VALIDATOR_WHITELIST:-true}
+      - DISABLE_FAIL2BAN=${DISABLE_FAIL2BAN:-true}
     volumes:
       - ${SSL_CERT_SOURCE:-./secrets/nginx-ssl}:/etc/nginx/ssl
     depends_on:
@@ -171,7 +174,7 @@ services:
 
   proxy-ssl:
     container_name: proxy-ssl
-    image: ghcr.io/product-science/proxy-ssl:0.2.11
+    image: ghcr.io/product-science/proxy-ssl:0.2.12-alpha1
     profiles:
       - ssl
     environment:
