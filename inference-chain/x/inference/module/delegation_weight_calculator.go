@@ -15,6 +15,20 @@ const (
 	ModeNone                              // No valid delegation, no refusal, no direct membership
 )
 
+func (m ParticipationMode) String() string {
+	switch m {
+	case ModeDirect:
+		return "DIRECT"
+	case ModeRefuse:
+		return "REFUSE"
+	case ModeDelegate:
+		return "DELEGATE"
+	case ModeNone:
+		return "NONE"
+	}
+	return "UNKNOWN"
+}
+
 // GroupData holds per-model group information.
 type GroupData struct {
 	Members          []string          // addresses of direct group members
@@ -283,10 +297,24 @@ func (wc *DelegationWeightCalculator) EligibleGroups() []string {
 	return eligible
 }
 
+type GroupSummary struct {
+	ModelID  string
+	Coeff    mathsdk.LegacyDec
+	RawTotal int64
+	Cap      int64
+	Scale    mathsdk.LegacyDec
+}
+
 // ComputeConsensusWeights produces final ActiveParticipant.Weight for each
 // participant across all eligible models, applying coefficients and caps.
-func (wc *DelegationWeightCalculator) ComputeConsensusWeights(eligibleModels []string) map[string]int64 {
+// Returns the per-participant weight and a per-group summary for diagnostics.
+func (wc *DelegationWeightCalculator) ComputeConsensusWeights(eligibleModels []string) (map[string]int64, []GroupSummary) {
 	result := make(map[string]int64)
+	summaries := make([]GroupSummary, 0, len(eligibleModels))
+
+	// A sole eligible group has nothing to cap against; treating it as capped
+	// collapses its weight to 0 when N-1 was also single-group.
+	soleGroup := len(eligibleModels) == 1
 
 	for _, modelID := range eligibleModels {
 		g := wc.Groups[modelID]
@@ -294,7 +322,6 @@ func (wc *DelegationWeightCalculator) ComputeConsensusWeights(eligibleModels []s
 			continue
 		}
 
-		// Compute raw group total: koeff * sum(pocWeight)
 		rawContributions := make(map[string]int64)
 		rawTotal := int64(0)
 		for _, m := range g.Members {
@@ -303,21 +330,30 @@ func (wc *DelegationWeightCalculator) ComputeConsensusWeights(eligibleModels []s
 			rawTotal += contrib
 		}
 
-		// Apply cap
-		cap := wc.ComputeGroupCap(modelID)
+		cap := int64(-1)
+		if !soleGroup {
+			cap = wc.ComputeGroupCap(modelID)
+		}
 		scaleFactor := mathsdk.LegacyOneDec()
 		if cap >= 0 && rawTotal > cap && rawTotal > 0 {
 			scaleFactor = mathsdk.LegacyNewDec(cap).Quo(mathsdk.LegacyNewDec(rawTotal))
 		}
 
-		// Add scaled contributions to result
 		for _, m := range sortedKeys(rawContributions) {
 			scaled := scaleFactor.MulInt64(rawContributions[m]).TruncateInt64()
 			result[m] += scaled
 		}
+
+		summaries = append(summaries, GroupSummary{
+			ModelID:  modelID,
+			Coeff:    g.ConsensusKoeff,
+			RawTotal: rawTotal,
+			Cap:      cap,
+			Scale:    scaleFactor,
+		})
 	}
 
-	return result
+	return result, summaries
 }
 
 // ComputeGroupVotingPowers resolves delegation for one model group and returns

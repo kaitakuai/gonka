@@ -3,10 +3,12 @@ package inference
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"math"
 	"math/bits"
 	"slices"
 	"strconv"
+	"strings"
 
 	mathsdk "cosmossdk.io/math"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -848,6 +850,77 @@ func (am AppModule) delegationAdjustmentParams(params types.Params) DelegationAd
 		RefusalPenalty:         protoDecToLegacy(dp.RefusalPenalty),
 		NoParticipationPenalty: protoDecToLegacy(dp.NoParticipationPenalty),
 		DelegationShare:        protoDecToLegacy(dp.DelegationShare),
+	}
+}
+
+type weightSummaryLogger interface {
+	LogInfo(msg string, subSystem types.SubSystem, keyvals ...interface{})
+}
+
+func formatModes(addr string, eligibleModels []string, modes map[string]map[string]ParticipationMode) string {
+	parts := make([]string, 0, len(eligibleModels))
+	for _, modelID := range eligibleModels {
+		mode, ok := modes[modelID][addr]
+		if !ok {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s", modelID, mode))
+	}
+	return strings.Join(parts, ",")
+}
+
+func formatVotingPowers(vps []*types.ModelVotingPower) string {
+	parts := make([]string, 0, len(vps))
+	for _, vp := range vps {
+		parts = append(parts, fmt.Sprintf("%s:%d", vp.ModelId, vp.VotingPower))
+	}
+	return strings.Join(parts, ",")
+}
+
+// emitWeightPipelineLogs prints one line per group and one line per
+// participant so any final weight can be reproduced from the log alone.
+// The gap between after_penalty and final is the combined effect of
+// collateral adjustment and power-cap (both rarely active).
+func emitWeightPipelineLogs(
+	logger weightSummaryLogger,
+	epoch uint64,
+	groups []GroupSummary,
+	eligibleModels []string,
+	participants []*types.ActiveParticipant,
+	modes map[string]map[string]ParticipationMode,
+	consensus, afterPenalty map[string]int64,
+	acc *PenaltyAccumulator,
+) {
+	for _, g := range groups {
+		logger.LogInfo("weight_group", types.PoC,
+			"epoch", epoch,
+			"model", g.ModelID,
+			"coeff", g.Coeff.String(),
+			"raw_total", g.RawTotal,
+			"cap", g.Cap,
+			"scale", g.Scale.String(),
+		)
+	}
+
+	sorted := make([]*types.ActiveParticipant, len(participants))
+	copy(sorted, participants)
+	slices.SortFunc(sorted, func(a, b *types.ActiveParticipant) int {
+		return cmp.Compare(a.Index, b.Index)
+	})
+
+	for _, p := range sorted {
+		logger.LogInfo("weight_pipeline", types.PoC,
+			"epoch", epoch,
+			"addr", p.Index,
+			"modes", formatModes(p.Index, eligibleModels, modes),
+			"consensus", consensus[p.Index],
+			"penalty", acc.AppliedFraction(p.Index).String(),
+			"transfer_in", acc.TransferIn(p.Index),
+			"transfer_out", acc.TransferOut(p.Index),
+			"after_penalty", afterPenalty[p.Index],
+			"final", p.Weight,
+			"vp", formatVotingPowers(p.VotingPowers),
+		)
 	}
 }
 

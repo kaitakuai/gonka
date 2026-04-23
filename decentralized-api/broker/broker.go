@@ -670,7 +670,7 @@ func (b *Broker) calculateNodesDiff(chainNodesMap map[string]*types.HardwareNode
 	diff.Creator = b.participantInfo.GetAddress()
 
 	for id, localNode := range localNodes {
-		localHWNode := convertInferenceNodeToHardwareNode(localNode)
+		localHWNode := convertInferenceNodeToHardwareNode(localNode, b.supportedNodeModels(localNode.Node.Models))
 
 		chainNode, exists := chainNodesMap[id]
 		if !exists {
@@ -689,7 +689,7 @@ func (b *Broker) calculateNodesDiff(chainNodesMap map[string]*types.HardwareNode
 }
 
 // convertInferenceNodeToHardwareNode converts a local InferenceNode into a HardwareNode.
-func convertInferenceNodeToHardwareNode(in *NodeWithState) *types.HardwareNode {
+func convertInferenceNodeToHardwareNode(in *NodeWithState, nodeModels map[string]ModelArgs) *types.HardwareNode {
 	node := in.Node
 	hardware := make([]*types.Hardware, 0, len(node.Hardware))
 	for _, hw := range node.Hardware {
@@ -700,7 +700,7 @@ func convertInferenceNodeToHardwareNode(in *NodeWithState) *types.HardwareNode {
 	}
 
 	modelNames := make([]string, 0)
-	for model := range node.Models {
+	for model := range nodeModels {
 		modelNames = append(modelNames, model)
 	}
 
@@ -1157,6 +1157,31 @@ func (b *Broker) resolvePoCModelForNode(
 	return apiconfig.PoCModelConfigCache{}, false
 }
 
+func filterNodeModelsByPoCParams(nodeModels map[string]ModelArgs, pocParams apiconfig.PoCParamsCache) map[string]ModelArgs {
+	if len(nodeModels) == 0 || len(pocParams.Models) == 0 {
+		return nodeModels
+	}
+
+	filtered := make(map[string]ModelArgs, len(nodeModels))
+	for modelID, modelArgs := range nodeModels {
+		if _, ok := pocParams.GetModelConfig(modelID); ok {
+			filtered[modelID] = modelArgs
+		}
+	}
+	return filtered
+}
+
+func (b *Broker) supportedNodeModels(nodeModels map[string]ModelArgs) map[string]ModelArgs {
+	if b == nil || b.configManager == nil {
+		return nodeModels
+	}
+	return filterNodeModelsByPoCParams(nodeModels, b.configManager.GetPoCParams())
+}
+
+func (b *Broker) resolveSupportedNodeModelID(epochMLNodes map[string]types.MLNodeInfo, nodeModels map[string]ModelArgs) (string, bool) {
+	return ResolveNodeModelID(epochMLNodes, b.supportedNodeModels(nodeModels))
+}
+
 func ResolveNodeModelID(epochMLNodes map[string]types.MLNodeInfo, nodeModels map[string]ModelArgs) (string, bool) {
 	if len(epochMLNodes) == 1 {
 		for modelID := range epochMLNodes {
@@ -1381,7 +1406,7 @@ func (b *Broker) queryNodeStatus(node Node, state NodeState) (*statusQueryResult
 		}
 		// Model check only if still INFERENCE (healthy)
 		if currentStatus == types.HardwareNodeStatus_INFERENCE {
-			expectedModel, ok := ResolveNodeModelID(state.EpochMLNodes, node.Models)
+			expectedModel, ok := b.resolveSupportedNodeModelID(state.EpochMLNodes, node.Models)
 			if ok && expectedModel != "" {
 				mctx, mcancel := context.WithTimeout(context.Background(), nodeStatusRequestTimeout)
 				defer mcancel()
@@ -1670,7 +1695,7 @@ func (b *Broker) populateNodeWithConfiguredModel(nodeId string) error {
 		b.mu.RUnlock()
 		return fmt.Errorf("node not found: %s", nodeId)
 	}
-	selectedModelID, ok := ResolveNodeModelID(node.State.EpochMLNodes, node.Node.Models)
+	selectedModelID, ok := b.resolveSupportedNodeModelID(node.State.EpochMLNodes, node.Node.Models)
 	b.mu.RUnlock()
 	if !ok || selectedModelID == "" {
 		return nil

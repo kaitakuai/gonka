@@ -290,6 +290,39 @@ func TestResolveNodeModelID_RejectsMultipleEpochEntries(t *testing.T) {
 	assert.Equal(t, "", modelID)
 }
 
+func TestResolveSupportedNodeModelID_FiltersConfiguredFallbackAgainstPoCParams(t *testing.T) {
+	broker := NewTestBroker()
+	require.NoError(t, broker.configManager.SetPoCParams(apiconfig.PoCParamsCache{
+		Models: []apiconfig.PoCModelConfigCache{
+			{ModelId: "model-b", SeqLen: 256},
+		},
+	}))
+
+	modelID, ok := broker.resolveSupportedNodeModelID(nil, map[string]ModelArgs{
+		"model-a": {},
+		"model-b": {},
+	})
+	require.True(t, ok)
+	assert.Equal(t, "model-b", modelID)
+}
+
+func TestResolveSupportedNodeModelID_NoRegressionWhenAllModelsSupported(t *testing.T) {
+	broker := NewTestBroker()
+	require.NoError(t, broker.configManager.SetPoCParams(apiconfig.PoCParamsCache{
+		Models: []apiconfig.PoCModelConfigCache{
+			{ModelId: "model-a", SeqLen: 128},
+			{ModelId: "model-b", SeqLen: 256},
+		},
+	}))
+
+	modelID, ok := broker.resolveSupportedNodeModelID(nil, map[string]ModelArgs{
+		"model-b": {},
+		"model-a": {},
+	})
+	require.True(t, ok)
+	assert.Equal(t, "model-a", modelID)
+}
+
 func TestGetCommandForState_UsesConfiguredFallbackForGeneration(t *testing.T) {
 	broker := NewTestBroker()
 	nodeState := &NodeState{
@@ -2091,9 +2124,31 @@ func TestConvertInferenceNodeToHardwareNode_Version(t *testing.T) {
 	node := createTestNode("node-1")
 	node.State.MlNodeVersion = "v2.3.4"
 
-	hw := convertInferenceNodeToHardwareNode(node)
+	hw := convertInferenceNodeToHardwareNode(node, node.Node.Models)
 
 	assert.Equal(t, "v2.3.4", hw.Version)
+}
+
+func TestCalculateNodesDiff_FiltersUnsupportedConfiguredModelsFromHardwareDiff(t *testing.T) {
+	broker := NewTestBroker()
+	require.NoError(t, broker.configManager.SetPoCParams(apiconfig.PoCParamsCache{
+		Models: []apiconfig.PoCModelConfigCache{
+			{ModelId: "model-a", SeqLen: 128},
+		},
+	}))
+
+	node := createTestNode("node-1")
+	node.Node.Models = map[string]ModelArgs{
+		"model-a": {},
+		"model-b": {},
+	}
+
+	diff := broker.calculateNodesDiff(map[string]*types.HardwareNode{}, map[string]*NodeWithState{
+		"node-1": node,
+	})
+
+	require.Len(t, diff.NewOrModified, 1)
+	assert.Equal(t, []string{"model-a"}, diff.NewOrModified[0].Models)
 }
 
 func TestSetNodesActualStatusCommand_MlNodeVersion(t *testing.T) {

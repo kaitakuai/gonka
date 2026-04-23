@@ -34,7 +34,6 @@ func GetBitcoinSettleAmounts(
 	settleParams *SettleParameters,
 	participantMLNodes map[string]map[string][]*types.MLNodeInfo,
 	coefficients map[string]mathsdk.LegacyDec,
-	collateralAdjustmentActive bool,
 	logger log.Logger,
 ) ([]*SettleResult, BitcoinResult, error) {
 	if participants == nil {
@@ -64,7 +63,6 @@ func GetBitcoinSettleAmounts(
 		validationParams,
 		participantMLNodes,
 		coefficients,
-		collateralAdjustmentActive,
 		logger,
 	)
 	if err != nil {
@@ -548,7 +546,6 @@ func CalculateParticipantBitcoinRewards(
 	validationParams *types.ValidationParams,
 	participantMLNodes map[string]map[string][]*types.MLNodeInfo,
 	coefficients map[string]mathsdk.LegacyDec,
-	collateralAdjustmentActive bool,
 	logger log.Logger,
 ) ([]*SettleResult, BitcoinResult, error) {
 	// Parameter validation
@@ -615,22 +612,21 @@ func CalculateParticipantBitcoinRewards(
 			continue
 		}
 
+		// Rescale ConfirmationWeight (raw MLNode scale) into fullWeight's
+		// (consensus-weight) scale so the numerator matches the denominator.
 		effectiveWeight := vw.ConfirmationWeight
 		if effectiveWeight < 0 {
 			effectiveWeight = 0
 		}
-
-		if collateralAdjustmentActive {
-			// vw.Weight reflects collateral+capping adjusted consensus weight.
-			// Compute coefficient-adjusted total (pre-collateral) as denominator.
-			modelNodes := participantMLNodes[participant.Address]
-			adjustedTotalWeight := CoefficientAdjustedWeight(modelNodes, coefficients, nil)
-			if adjustedTotalWeight > 0 && vw.Weight < adjustedTotalWeight {
-				ewBig := big.NewInt(effectiveWeight)
-				ewBig = ewBig.Mul(ewBig, big.NewInt(vw.Weight))
-				ewBig = ewBig.Div(ewBig, big.NewInt(adjustedTotalWeight))
-				effectiveWeight = ewBig.Int64()
-			}
+		rawTotal := CoefficientAdjustedWeight(participantMLNodes[participant.Address], coefficients, nil)
+		if rawTotal > 0 && vw.Weight < rawTotal {
+			ewBig := big.NewInt(effectiveWeight)
+			ewBig.Mul(ewBig, big.NewInt(vw.Weight))
+			ewBig.Div(ewBig, big.NewInt(rawTotal))
+			effectiveWeight = ewBig.Int64()
+		}
+		if effectiveWeight > int64(fullWeight) {
+			effectiveWeight = int64(fullWeight)
 		}
 
 		logger.Info("Bitcoin Rewards: Calculated effective weight",

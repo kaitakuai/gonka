@@ -40,6 +40,10 @@ type PenaltyAccumulator struct {
 	penalties      map[string]mathsdk.LegacyDec
 	transfers      []pendingTransfer
 	originalWeight map[string]int64
+
+	appliedFraction map[string]mathsdk.LegacyDec
+	transferIn      map[string]int64
+	transferOut     map[string]int64
 }
 
 func NewPenaltyAccumulator(participants []*types.ActiveParticipant) *PenaltyAccumulator {
@@ -48,10 +52,23 @@ func NewPenaltyAccumulator(participants []*types.ActiveParticipant) *PenaltyAccu
 		original[p.Index] = p.Weight
 	}
 	return &PenaltyAccumulator{
-		penalties:      make(map[string]mathsdk.LegacyDec),
-		originalWeight: original,
+		penalties:       make(map[string]mathsdk.LegacyDec),
+		originalWeight:  original,
+		appliedFraction: make(map[string]mathsdk.LegacyDec),
+		transferIn:      make(map[string]int64),
+		transferOut:     make(map[string]int64),
 	}
 }
+
+func (pa *PenaltyAccumulator) AppliedFraction(addr string) mathsdk.LegacyDec {
+	if f, ok := pa.appliedFraction[addr]; ok {
+		return f
+	}
+	return mathsdk.LegacyZeroDec()
+}
+
+func (pa *PenaltyAccumulator) TransferIn(addr string) int64  { return pa.transferIn[addr] }
+func (pa *PenaltyAccumulator) TransferOut(addr string) int64 { return pa.transferOut[addr] }
 
 func (pa *PenaltyAccumulator) AddPenalty(addr string, fraction mathsdk.LegacyDec) {
 	if existing, ok := pa.penalties[addr]; ok {
@@ -81,6 +98,7 @@ func (pa *PenaltyAccumulator) Apply(participants []*types.ActiveParticipant) {
 		if totalFrac.GT(one) {
 			totalFrac = one
 		}
+		pa.appliedFraction[addr] = totalFrac
 		penalty := totalFrac.MulInt64(pa.originalWeight[addr]).TruncateInt64()
 		p.Weight -= penalty
 		if p.Weight < 0 {
@@ -112,6 +130,8 @@ func (pa *PenaltyAccumulator) Apply(participants []*types.ActiveParticipant) {
 		}
 		from.Weight -= delta
 		to.Weight += delta
+		pa.transferOut[t.from] += delta
+		pa.transferIn[t.to] += delta
 	}
 }
 

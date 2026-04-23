@@ -676,7 +676,7 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 	}
 
 	// Compute consensus weights with caps applied and write to participants
-	consensusWeights := participationState.calculator.ComputeConsensusWeights(participationState.eligibleModels)
+	consensusWeights, groupSummaries := participationState.calculator.ComputeConsensusWeights(participationState.eligibleModels)
 	for _, p := range activeParticipants {
 		p.Weight = consensusWeights[p.Index]
 	}
@@ -705,6 +705,11 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 	)
 	acc.Apply(activeParticipants)
 
+	afterPenalty := make(map[string]int64, len(activeParticipants))
+	for _, p := range activeParticipants {
+		afterPenalty[p.Index] = p.Weight
+	}
+
 	// Adjust weights based on collateral after the grace period. This modifies the weights in-place.
 	if err := am.keeper.AdjustWeightsByCollateral(ctx, activeParticipants); err != nil {
 		am.LogError("onSetNewValidatorsStage: failed to adjust weights by collateral", types.Tokenomics, "error", err)
@@ -731,6 +736,11 @@ func (am AppModule) onEndOfPoCValidationStage(ctx context.Context, blockHeight i
 		participationState.participationByModel,
 		am.delegationVotingPowerCapParams(params),
 	)
+
+	emitWeightPipelineLogs(am, upcomingEpoch.Index, groupSummaries,
+		participationState.eligibleModels, activeParticipants,
+		participationState.participationByModel,
+		consensusWeights, afterPenalty, acc)
 
 	am.LogInfo("onEndOfPoCValidationStage: computed new weights", types.Stages,
 		"upcomingEpoch.Index", upcomingEpoch.Index,
