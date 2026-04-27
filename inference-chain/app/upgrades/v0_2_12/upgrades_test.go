@@ -174,7 +174,7 @@ func TestMigrateParams(t *testing.T) {
 	require.Equal(t, "0.750000000000000000", wsf.String())
 	require.NotNil(t, m.StatTest)
 	require.Equal(t, uint64(0), m.PenaltyStartEpoch)
-	requireKimiPoCModelConfig(t, got.PocParams.Models, params.PocParams.WeightScaleFactor, 11)
+	requireKimiPoCModelConfig(t, got.PocParams.Models, params.PocParams.WeightScaleFactor, 12)
 
 	require.NotNil(t, got.DelegationParams)
 	require.Equal(t, "founding-model", got.DelegationParams.InitialModelId)
@@ -196,7 +196,7 @@ func TestMigrateParams(t *testing.T) {
 	require.Len(t, got2.PocParams.Models, 2)
 	founder := requirePoCModelConfig(t, got2.PocParams.Models, "founding-model")
 	require.Equal(t, int64(512), founder.SeqLen)
-	requireKimiPoCModelConfig(t, got2.PocParams.Models, params.PocParams.WeightScaleFactor, 11)
+	requireKimiPoCModelConfig(t, got2.PocParams.Models, params.PocParams.WeightScaleFactor, 12)
 	requireDeprecatedPoCParamsCleared(t, got2.PocParams)
 }
 
@@ -552,7 +552,7 @@ func TestMigrationSequence(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got.PocParams.Models, 2)
 	requirePoCModelConfig(t, got.PocParams.Models, "founding-model")
-	requireKimiPoCModelConfig(t, got.PocParams.Models, params.PocParams.WeightScaleFactor, 7)
+	requireKimiPoCModelConfig(t, got.PocParams.Models, params.PocParams.WeightScaleFactor, 8)
 	require.NotNil(t, got.DelegationParams)
 	require.Equal(t, "founding-model", got.DelegationParams.InitialModelId)
 	requireDeprecatedPoCParamsCleared(t, got.PocParams)
