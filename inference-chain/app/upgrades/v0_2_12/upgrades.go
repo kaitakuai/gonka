@@ -36,6 +36,16 @@ const MigratedFeeAllowanceExpiration = 365 * 24 * time.Hour
 
 const kimiModelID = "moonshotai/Kimi-K2.6"
 
+// Initial approved devshard binary registered by the v0.2.12 upgrade so that
+// `versiond` has at least one approved version to download and run after the
+// upgrade goes live. Governance can append new versions later via
+// MsgUpdateParams.
+const (
+	DevshardV1Name   = "v1"
+	DevshardV1Binary = "https://github.com/product-science/race-releases/releases/download/release%2Fv0.2.12/devshardd.zip"
+	DevshardV1Sha256 = "15f722444e6545bc787f1ef6d1011557d25a8b05cb9f6aaf1a514349d36d4715"
+)
+
 const BountyCommunitySaleContractAddress = "gonka18pkq9mwxxlmyq7kr5txhm060wemg2s4u94wvsfd9w2kdc0u99d6spk8pz2"
 const DefaultBountyIbcUsdtDenom = "ibc/115F68FBA220A028C6F6ED08EA0C1A9C8C52798B14FB66E6C89D5D8C06A524D4"
 
@@ -193,6 +203,10 @@ func CreateUpgradeHandler(
 		}
 
 		if err := setFeeParams(ctx, k); err != nil {
+			return nil, err
+		}
+
+		if err := setDevshardApprovedVersions(ctx, k); err != nil {
 			return nil, err
 		}
 
@@ -828,6 +842,41 @@ func backfillVotingPower(ctx context.Context, k keeper.Keeper) error {
 			"epoch", epochIndex, "model_id", modelID, "entries", len(subgroupData.ValidationWeights))
 	}
 
+	return nil
+}
+
+func setDevshardApprovedVersions(ctx context.Context, k keeper.Keeper) error {
+	params, err := k.GetParams(ctx)
+	if err != nil {
+		return err
+	}
+
+	if params.DevshardEscrowParams == nil {
+		params.DevshardEscrowParams = types.DefaultDevshardEscrowParams()
+	}
+
+	for _, v := range params.DevshardEscrowParams.ApprovedVersions {
+		if v != nil && v.Name == DevshardV1Name {
+			k.LogInfo("devshard approved version already present, skipping", types.Upgrades,
+				"name", DevshardV1Name)
+			return nil
+		}
+	}
+
+	params.DevshardEscrowParams.ApprovedVersions = append(params.DevshardEscrowParams.ApprovedVersions,
+		&types.DevshardApprovedVersion{
+			Name:   DevshardV1Name,
+			Binary: DevshardV1Binary,
+			Sha256: DevshardV1Sha256,
+		},
+	)
+
+	if err := k.SetParams(ctx, params); err != nil {
+		k.LogError("failed to set devshard approved versions during upgrade", types.Upgrades, "error", err)
+		return err
+	}
+	k.LogInfo("registered initial devshard approved version", types.Upgrades,
+		"name", DevshardV1Name, "binary", DevshardV1Binary, "sha256", DevshardV1Sha256)
 	return nil
 }
 

@@ -32,6 +32,7 @@ Migrations:
 - Initializes `FeeParams` with `min_gas_price_ngonka = 0` (fees are effectively disabled at upgrade time, see Changes).
 - Migrates singular PoC model parameters into the new multi-model `PocParams.Models` list and initializes `DelegationParams`.
 - Adds the `moonshotai/Kimi-K2.6` governance model and its PoC model config (`seq_len=1024`, scaled weight coefficient, penalty start at effective epoch + 2).
+- Seeds `DevshardEscrowParams.ApprovedVersions` with the initial `v1` devshard binary (sha256 `15f72244...d36d4715`) so `versiond` has an approved version to download and run immediately after the upgrade.
 - Clears legacy PoC v2 data (which used old key layouts) and seeds new pruning state markers for the new multi-model collections.
 - Backfills `ActiveParticipant.VotingPowers` and `EpochGroupData` subgroup voting power for the current epoch to ensure seamless PoC validation post-upgrade.
 - Removes unused `TopMiners` and training states (training will be moved to an off-chain architecture similar to devshards).
