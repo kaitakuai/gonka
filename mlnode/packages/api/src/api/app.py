@@ -28,7 +28,7 @@ from api.service_management import (
 )
 from api.routes import router as api_router
 from api.watcher import watch_managers
-from api.proxy import ProxyMiddleware, start_vllm_proxy, stop_vllm_proxy, setup_vllm_proxy, start_backward_compatibility, stop_backward_compatibility
+from api.proxy import ContentTypeInjector, ProxyMiddleware, start_vllm_proxy, stop_vllm_proxy, setup_vllm_proxy, start_backward_compatibility, stop_backward_compatibility
 
 
 WATCH_INTERVAL = 2
@@ -84,6 +84,9 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(health_router)
 
 app.add_middleware(ProxyMiddleware)
+# Wrap ProxyMiddleware so Content-Type is injected before downstream parsing.
+# Last add_middleware = outermost = runs first on each request.
+app.add_middleware(ContentTypeInjector)
 
 app.include_router(
     pow_router,

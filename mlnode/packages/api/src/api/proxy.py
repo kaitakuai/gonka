@@ -38,6 +38,40 @@ compatibility_server: Optional[object] = None  # uvicorn.Server instance
 health_check_task: Optional[asyncio.Task] = None
 
 
+class ContentTypeInjector:
+    """Plain ASGI middleware: inject ``Content-Type: application/json`` for
+    ``POST /api/*`` requests when the header is missing.
+
+    Network DAPI (Go-http-client/1.1) does not set ``Content-Type`` on JSON
+    POSTs to ``/api/v1/inference/up`` and ``/api/v1/inference/pow/init/generate``.
+    Pydantic v2, shipped with the FastAPI/Starlette pin used by the vllm 0.20
+    base, requires ``Content-Type: application/json`` to interpret the body
+    as JSON; without it the bytes are surfaced to ``model_validate`` as a
+    string value, producing a 422 ``model_attributes_type`` error
+    (``Input should be a valid dictionary or object``).
+
+    The vllm 0.15.1 base predates Pydantic v2's strictness, which is why
+    production mlnode-009 accepts the same DAPI request shape unchanged and
+    only the vllm 0.20 mlnode image hits the regression.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "POST"
+            and scope.get("path", "").startswith("/api/")
+            and not any(h[0] == b"content-type" for h in scope["headers"])
+        ):
+            scope = dict(scope)
+            scope["headers"] = list(scope["headers"]) + [
+                (b"content-type", b"application/json")
+            ]
+        await self.app(scope, receive, send)
+
+
 class ProxyMiddleware(BaseHTTPMiddleware):
     """Middleware to handle routing between /api and /v1 endpoints."""
     
