@@ -114,6 +114,18 @@ var (
 	errRuntimePrivateKeyMissing = errors.New("private key missing")
 )
 
+type UnsupportedModelError struct {
+	Model     string
+	Supported []string
+}
+
+func (e *UnsupportedModelError) Error() string {
+	if len(e.Supported) == 0 {
+		return fmt.Sprintf("unsupported model %q", e.Model)
+	}
+	return fmt.Sprintf("unsupported model %q; supported models: %s", e.Model, strings.Join(e.Supported, ", "))
+}
+
 func newRuntimeMux(proxy *Proxy) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", proxy.handleSwaggerUI)
@@ -671,6 +683,11 @@ func (g *Gateway) handleDevshard(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusBadRequest)
 			return
 		}
+		if err := rt.validateRequestedModel(model); err != nil {
+			logRequestStage(ctx, "gateway_devshard_model_rejected", "escrow", devshardID, "model", model, "error", err)
+			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), gatewayStatusCodeForError(err))
+			return
+		}
 		if capacityAwareLimitsEnabled() || !relaxedPoCBypassActive() {
 			g.refreshCapacityScale()
 			limitModel := firstNonEmpty(model, rt.model, g.settings.DefaultModel)
@@ -731,6 +748,9 @@ func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64)
 		}
 		candidates = append(candidates, rt)
 	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no devshard runtimes available for new inferences")
+	}
 	if requestModel != "" {
 		var matching []*devshardRuntime
 		for _, rt := range candidates {
@@ -738,12 +758,10 @@ func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64)
 				matching = append(matching, rt)
 			}
 		}
-		if len(matching) > 0 {
-			candidates = matching
+		if len(matching) == 0 {
+			return nil, &UnsupportedModelError{Model: requestModel, Supported: supportedModels(candidates)}
 		}
-	}
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no devshard runtimes available for new inferences")
+		candidates = matching
 	}
 
 	bestScore := g.runtimeLoad(candidates[0], requestModel)
@@ -841,7 +859,29 @@ func (g *Gateway) releaseRuntime(rt *devshardRuntime, inputTokens int64) {
 	rt.reservedTokens.Add(-inputTokens)
 }
 
+func (rt *devshardRuntime) validateRequestedModel(requestModel string) error {
+	if rt == nil || requestModel == "" || requestModel == rt.model {
+		return nil
+	}
+	return &UnsupportedModelError{Model: requestModel, Supported: []string{rt.model}}
+}
+
+func supportedModels(runtimes []*devshardRuntime) []string {
+	models := make([]string, 0, len(runtimes))
+	for _, rt := range runtimes {
+		if rt == nil || rt.model == "" || slices.Contains(models, rt.model) {
+			continue
+		}
+		models = append(models, rt.model)
+	}
+	return models
+}
+
 func gatewayStatusCodeForError(err error) int {
+	var unsupportedModelErr *UnsupportedModelError
+	if errors.As(err, &unsupportedModelErr) {
+		return http.StatusBadRequest
+	}
 	if isParticipantRateLimitError(err) {
 		return http.StatusTooManyRequests
 	}

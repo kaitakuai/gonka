@@ -388,6 +388,56 @@ func TestGatewayHandlePooledChatSetsChosenDevshardHeader(t *testing.T) {
 	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
 }
 
+func TestGatewayHandlePooledChatRejectsUnsupportedModel(t *testing.T) {
+	var forwarded bool
+	rt := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded = true
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Nope/Unsupported","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), `unsupported model \"Nope/Unsupported\"`)
+	require.Contains(t, rec.Body.String(), "Qwen/Test")
+	require.False(t, forwarded)
+	require.EqualValues(t, 0, rt.activeRequests.Load())
+}
+
+func TestGatewayHandleDevshardChatRejectsUnsupportedModel(t *testing.T) {
+	var forwarded bool
+	rt := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded = true
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+
+	req := httptest.NewRequest(http.MethodPost, "/devshard/12/v1/chat/completions",
+		strings.NewReader(`{"model":"Nope/Unsupported","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+
+	g.handleDevshard(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), `unsupported model \"Nope/Unsupported\"`)
+	require.Contains(t, rec.Body.String(), "Qwen/Test")
+	require.False(t, forwarded)
+	require.EqualValues(t, 0, rt.activeRequests.Load())
+}
+
 func TestGatewayPooledChatRefreshesCapacityScaleBeforeAcquire(t *testing.T) {
 	limiter := NewParticipantRequestLimiter(1, 10)
 	rt := &devshardRuntime{
