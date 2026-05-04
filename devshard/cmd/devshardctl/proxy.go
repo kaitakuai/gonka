@@ -73,12 +73,6 @@ type Proxy struct {
 	phaseGate  *ChainPhaseGate
 }
 
-type chatRequest struct {
-	Model     string `json:"model"`
-	Stream    bool   `json:"stream"`
-	MaxTokens uint64 `json:"max_tokens"`
-}
-
 // normalizeContent converts multi-part content arrays to simple strings.
 // [{"type":"text","text":"A"},{"type":"text","text":"B"}] → "A\nB"
 func normalizeContent(body []byte) []byte {
@@ -149,19 +143,10 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, req, err := prepareChatRequestBody(r)
 	if err != nil {
 		logRequestStage(ctx, "proxy_read_body_failed", "error", err)
-		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	body = normalizeContent(body)
-
-	var req chatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		logRequestStage(ctx, "proxy_parse_failed", "error", err)
-		http.Error(w, "parse request: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
 		return
 	}
 
@@ -169,19 +154,11 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = p.model
 	}
-	maxTokens := req.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = DefaultRequestMaxTokens
-	}
-	if DefaultRequestMaxTokens > 0 && maxTokens > DefaultRequestMaxTokens {
-		maxTokens = DefaultRequestMaxTokens
-	}
-
 	params := user.InferenceParams{
 		Model:       model,
 		Prompt:      body,
 		InputLength: uint64(len(body)),
-		MaxTokens:   maxTokens,
+		MaxTokens:   req.MaxTokens,
 		StartedAt:   time.Now().Unix(),
 		Stream:      req.Stream,
 	}
@@ -416,6 +393,16 @@ func assembleSSEChunks(raw string) []byte {
 		return []byte(lastData)
 	}
 	return []byte(`{"error":{"message":"no response data"}}`)
+}
+
+func (p *Proxy) settlementJSON() (SettlementJSON, error) {
+	finalNonce := p.session.Nonce()
+	st := p.sm.SnapshotState()
+	payload, err := state.BuildSettlementForProtocol(p.escrowID, st, p.session.Signatures()[finalNonce], finalNonce, p.sm.ProtocolVersion())
+	if err != nil {
+		return SettlementJSON{}, err
+	}
+	return buildSettlementJSON(payload)
 }
 
 func (p *Proxy) writeSettlement(w http.ResponseWriter) {
@@ -728,8 +715,8 @@ func (p *Proxy) handleState(w http.ResponseWriter, r *http.Request) {
 	for slot, hs := range st.HostStats {
 		hostStats[fmt.Sprintf("%d", slot)] = map[string]any{
 			"missed":                hs.Missed,
-			"invalid":              hs.Invalid,
-			"cost":                 hs.Cost,
+			"invalid":               hs.Invalid,
+			"cost":                  hs.Cost,
 			"required_validations":  hs.RequiredValidations,
 			"completed_validations": hs.CompletedValidations,
 		}

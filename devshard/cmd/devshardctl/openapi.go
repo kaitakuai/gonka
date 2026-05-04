@@ -72,7 +72,8 @@ const openapiSpec = `{
     "/v1/state": {
       "get": {
         "summary": "Full session state",
-        "description": "Returns complete session state: config, group, all inferences with per-inference detail, host stats, revealed seeds, and warm keys.",
+        "description": "Admin endpoint. Returns complete session state: config, group, all inferences with per-inference detail, host stats, revealed seeds, and warm keys.",
+        "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": {
             "description": "Full state snapshot",
@@ -116,7 +117,8 @@ const openapiSpec = `{
     "/v1/finalize": {
       "post": {
         "summary": "Finalize session",
-        "description": "Finalizes the devshard session and returns the settlement payload for on-chain submission.",
+        "description": "Admin endpoint. Finalizes the devshard session and returns the settlement payload for on-chain submission.",
+        "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": { "description": "Settlement payload JSON" },
           "500": { "description": "Finalization failed" }
@@ -124,7 +126,8 @@ const openapiSpec = `{
       },
       "get": {
         "summary": "Retrieve settlement",
-        "description": "Returns the settlement payload after POST /v1/finalize has succeeded. Only available in the settlement phase.",
+        "description": "Admin endpoint. Returns the settlement payload after POST /v1/finalize has succeeded. Only available in the settlement phase.",
+        "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": { "description": "Settlement payload JSON" },
           "409": { "description": "Session not yet finalized" }
@@ -134,7 +137,8 @@ const openapiSpec = `{
     "/v1/debug/pending": {
       "get": {
         "summary": "Pending transactions",
-        "description": "Lists pending devshard transactions and warm keys.",
+        "description": "Admin endpoint. Lists pending devshard transactions and warm keys.",
+        "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": { "description": "Pending tx list" }
         }
@@ -143,7 +147,8 @@ const openapiSpec = `{
     "/v1/debug/state": {
       "get": {
         "summary": "Debug state summary",
-        "description": "Returns nonce, balance, total inferences, and status counts.",
+        "description": "Admin endpoint. Returns nonce, balance, total inferences, and status counts.",
+        "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": { "description": "Debug state summary" }
         }
@@ -152,7 +157,8 @@ const openapiSpec = `{
     "/v1/debug/signatures": {
       "get": {
         "summary": "Signature accumulation status",
-        "description": "Returns per-nonce signature weight and the highest nonce that reached 2/3+1 quorum. Useful for monitoring finalization progress.",
+        "description": "Admin endpoint. Returns per-nonce signature weight and the highest nonce that reached 2/3+1 quorum. Useful for monitoring finalization progress.",
+        "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": {
             "description": "Signature status",
@@ -189,7 +195,8 @@ const openapiSpec = `{
     "/v1/debug/signatures/collect": {
       "post": {
         "summary": "Collect signatures at nonce",
-        "description": "Actively polls all hosts to collect signatures for the given nonce. Tries fetching existing signatures first (cheap GET), then falls back to sending catch-up diffs.",
+        "description": "Admin endpoint. Actively polls all hosts to collect signatures for the given nonce. Tries fetching existing signatures first (cheap GET), then falls back to sending catch-up diffs.",
+        "security": [{ "AdminBearerAuth": [] }],
         "parameters": [
           {
             "name": "nonce",
@@ -219,6 +226,15 @@ const openapiSpec = `{
           },
           "400": { "description": "Missing or invalid nonce, or nonce ahead of current state" }
         }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "AdminBearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Admin bearer token from DEVSHARD_ADMIN_API_KEY."
       }
     }
   }

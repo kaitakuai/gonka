@@ -21,7 +21,7 @@ import (
 const (
 	defaultChainRESTURL          = "http://localhost:1317"
 	defaultPublicAPIURL          = "http://localhost:9000"
-	defaultModelName             = "Qwen/Qwen2.5-7B-Instruct"
+	defaultModelName             = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 	defaultListenPort            = "8080"
 	defaultMaxConcurrentRequests = 512
 )
@@ -158,6 +158,19 @@ func mustLoadBootstrapOptions(flags cliFlags, baseStorageDir string) bootstrapOp
 		DefaultRequestMaxTokens: uint64(readInt64Env("GATEWAY_DEFAULT_MAX_TOKENS", int64(DefaultRequestMaxTokens))),
 		MaxConcurrentRequests:   readInt64Env("GATEWAY_MAX_CONCURRENT_REQUESTS", defaultMaxConcurrentRequests),
 		MaxInputTokensInFlight:  readInt64Env("GATEWAY_MAX_INPUT_TOKENS_IN_FLIGHT", 0),
+		Disabled: GatewayDisabledSettings{
+			Enabled: readBoolEnv("DEVSHARD_GATEWAY_DISABLED", false),
+			Message: os.Getenv("DEVSHARD_GATEWAY_DISABLED_MESSAGE"),
+		},
+		EscrowRotation: EscrowRotationSettings{
+			Enabled:       readBoolEnv("DEVSHARD_ESCROW_ROTATION_ENABLED", false),
+			PrePoCBlocks:  readInt64Env("DEVSHARD_ESCROW_ROTATION_PRE_POC_BLOCKS", 300),
+			TempCount:     int(readInt64Env("DEVSHARD_ESCROW_ROTATION_TEMP_COUNT", 8)),
+			TargetCount:   int(readInt64Env("DEVSHARD_ESCROW_ROTATION_TARGET_COUNT", 16)),
+			Amount:        uint64(readInt64Env("DEVSHARD_ESCROW_ROTATION_AMOUNT", 0)),
+			ModelID:       os.Getenv("DEVSHARD_ESCROW_ROTATION_MODEL_ID"),
+			PrivateKeyEnv: os.Getenv("DEVSHARD_ESCROW_ROTATION_PRIVATE_KEY_ENV"),
+		},
 	}.WithTuningDefaults()
 	return opts
 }
@@ -458,6 +471,7 @@ func buildGatewayHandler(gateway *Gateway, opts runtimeOptions) http.Handler {
 		handler = bearerAuthMiddleware(opts.apiKeys, handler)
 	}
 	handler = adminAuthMiddleware(opts.adminAPIKey, handler)
+	handler = gateway.disabledMiddleware(handler)
 	return gateway.metrics.Wrap(handler)
 }
 
@@ -506,7 +520,20 @@ func isAuthExemptPath(path string) bool {
 	return path == "/metrics" ||
 		path == "/v1/status" ||
 		strings.HasSuffix(path, "/v1/status") ||
-		strings.HasPrefix(path, "/v1/admin/")
+		isAdminPath(path)
+}
+
+func isAdminPath(path string) bool {
+	if strings.HasPrefix(path, "/v1/admin/") ||
+		strings.HasPrefix(path, "/v1/debug/") ||
+		path == "/v1/finalize" ||
+		path == "/v1/state" {
+		return true
+	}
+	_, innerPath, ok := parseDevshardPath(path)
+	return ok && (innerPath == "/v1/finalize" ||
+		innerPath == "/v1/state" ||
+		strings.HasPrefix(innerPath, "/v1/debug/"))
 }
 
 func bearerAuthMiddleware(validKeys map[string]struct{}, next http.Handler) http.Handler {
@@ -538,7 +565,7 @@ func bearerAuthMiddleware(validKeys map[string]struct{}, next http.Handler) http
 
 func adminAuthMiddleware(adminKey string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/v1/admin/") {
+		if !isAdminPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -570,10 +597,26 @@ func readInt64Env(name string, fallback int64) int64 {
 	return v
 }
 
-func marshalSettlement(p *state.SettlementPayload) ([]byte, error) {
+func readBoolEnv(name string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		log.Printf("invalid %s=%q, using %t", name, raw, fallback)
+		return fallback
+	}
+}
+
+func buildSettlementJSON(p *state.SettlementPayload) (SettlementJSON, error) {
 	hsHash, err := state.ComputeHostStatsHash(p.HostStats)
 	if err != nil {
-		return nil, err
+		return SettlementJSON{}, err
 	}
 	root := state.ComputeSettlementStateRootForProtocol(p.ProtocolVersion, hsHash, p.RestHash, p.Fees, types.PhaseSettlement, p.Version)
 
@@ -591,9 +634,17 @@ func marshalSettlement(p *state.SettlementPayload) ([]byte, error) {
 		sigs = append(sigs, SlotSignatureJSON{SlotID: slot, Signature: base64.StdEncoding.EncodeToString(sig)})
 	}
 
-	return json.MarshalIndent(SettlementJSON{
+	return SettlementJSON{
 		EscrowID: p.EscrowID, Version: p.Version, StateRoot: base64.StdEncoding.EncodeToString(root),
 		Nonce: p.Nonce, Fees: p.Fees, RestHash: base64.StdEncoding.EncodeToString(p.RestHash),
 		HostStats: stats, Signatures: sigs,
-	}, "", "  ")
+	}, nil
+}
+
+func marshalSettlement(p *state.SettlementPayload) ([]byte, error) {
+	settlement, err := buildSettlementJSON(p)
+	if err != nil {
+		return nil, err
+	}
+	return json.MarshalIndent(settlement, "", "  ")
 }

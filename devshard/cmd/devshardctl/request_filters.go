@@ -1,0 +1,380 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+)
+
+const MaxChatRequestBodySize = 10 * 1024 * 1024
+
+type chatRequest struct {
+	Model               string `json:"model"`
+	Stream              bool   `json:"stream"`
+	MaxTokens           uint64 `json:"max_tokens"`
+	MaxCompletionTokens uint64 `json:"max_completion_tokens"`
+}
+
+type chatRequestFilterError struct {
+	status  int
+	message string
+}
+
+func (e *chatRequestFilterError) Error() string {
+	return e.message
+}
+
+func chatRequestErrorStatus(err error, fallback int) int {
+	var filterErr *chatRequestFilterError
+	if errors.As(err, &filterErr) {
+		return filterErr.status
+	}
+	return fallback
+}
+
+func badChatRequest(format string, args ...any) error {
+	return &chatRequestFilterError{
+		status:  http.StatusBadRequest,
+		message: fmt.Sprintf(format, args...),
+	}
+}
+
+func readLimitedChatRequestBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, badChatRequest("request body is required")
+	}
+	defer r.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxChatRequestBodySize+1))
+	if err != nil {
+		return nil, badChatRequest("read body: %v", err)
+	}
+	if len(body) > MaxChatRequestBodySize {
+		return nil, &chatRequestFilterError{
+			status:  http.StatusRequestEntityTooLarge,
+			message: "request body too large",
+		}
+	}
+	return body, nil
+}
+
+func prepareChatRequestBody(r *http.Request) ([]byte, chatRequest, error) {
+	body, err := readLimitedChatRequestBody(r)
+	if err != nil {
+		return nil, chatRequest{}, err
+	}
+	return normalizeChatRequest(normalizeContent(body))
+}
+
+func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
+	}
+	if err := validateUnsupportedChatRequestFields(raw); err != nil {
+		return nil, chatRequest{}, err
+	}
+	if err := validateOpenAICompatChatMessages(raw); err != nil {
+		return nil, chatRequest{}, err
+	}
+
+	var req chatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
+	}
+
+	req.MaxTokens = capOutputTokens(req.MaxTokens)
+	req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens)
+	raw["max_tokens"] = req.MaxTokens
+	raw["max_completion_tokens"] = req.MaxCompletionTokens
+	stripUnsupportedChatRequestParameters(raw)
+
+	updatedBody, err := json.Marshal(raw)
+	if err != nil {
+		return nil, chatRequest{}, badChatRequest("marshal request: %v", err)
+	}
+	return updatedBody, req, nil
+}
+
+func capOutputTokens(value uint64) uint64 {
+	if value == 0 {
+		return DefaultRequestMaxTokens
+	}
+	if DefaultRequestMaxTokens > 0 && value > DefaultRequestMaxTokens {
+		return DefaultRequestMaxTokens
+	}
+	return value
+}
+
+func stripUnsupportedChatRequestParameters(request map[string]any) {
+	delete(request, "presence_penalty")
+	delete(request, "frequency_penalty")
+}
+
+func validateUnsupportedChatRequestFields(request map[string]any) error {
+	if _, exists := request["enforced_tokens"]; exists {
+		return badChatRequest("field 'enforced_tokens' is not supported")
+	}
+	if responseFormat, ok := request["response_format"].(map[string]any); ok {
+		if typ, ok := responseFormat["type"].(string); ok && typ == "json_object" {
+			return badChatRequest("feature 'json_object' is temporarily unavailable")
+		}
+	}
+	if _, exists := request["guided_regex"]; exists {
+		return badChatRequest("feature 'guided_regex' is temporarily unavailable")
+	}
+	if _, exists := request["guided_grammar"]; exists {
+		return badChatRequest("feature 'guided_grammar' is temporarily unavailable")
+	}
+	if structuredOutputs, ok := request["structured_outputs"].(map[string]any); ok {
+		if _, exists := structuredOutputs["regex"]; exists {
+			return badChatRequest("feature 'guided_regex' is temporarily unavailable")
+		}
+	}
+	return nil
+}
+
+func validateOpenAICompatChatMessages(request map[string]any) error {
+	rawMessages, exists := request["messages"]
+	if !exists {
+		return badChatRequest("messages is required")
+	}
+	messages, ok := rawMessages.([]any)
+	if !ok {
+		return badChatRequest("messages must be an array")
+	}
+	if len(messages) == 0 {
+		return badChatRequest("messages must not be empty")
+	}
+
+	pendingToolCalls := map[string]struct{}{}
+	for i, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok {
+			return badChatRequest("messages[%d] must be an object", i)
+		}
+		role, err := requiredNonEmptyString(message, "role")
+		if err != nil {
+			return badChatRequest("messages[%d].role: %v", i, err)
+		}
+
+		switch role {
+		case "developer", "system", "user":
+			if err := ensureFieldsAbsent(message, "tool_calls", "tool_call_id", "function_call"); err != nil {
+				return badChatRequest("messages[%d]: %v", i, err)
+			}
+			if err := validateRequiredContent(message); err != nil {
+				return badChatRequest("messages[%d].content: %v", i, err)
+			}
+		case "assistant":
+			if err := ensureFieldsAbsent(message, "tool_call_id"); err != nil {
+				return badChatRequest("messages[%d]: %v", i, err)
+			}
+			toolCallIDs, hasToolCalls, err := validateToolCallsField(message, i)
+			if err != nil {
+				return err
+			}
+			hasFunctionCall, err := validateFunctionCallField(message, i)
+			if err != nil {
+				return err
+			}
+			if err := validateAssistantContent(message, hasToolCalls || hasFunctionCall); err != nil {
+				return badChatRequest("messages[%d].content: %v", i, err)
+			}
+			for _, id := range toolCallIDs {
+				pendingToolCalls[id] = struct{}{}
+			}
+		case "tool":
+			if err := ensureFieldsAbsent(message, "tool_calls", "function_call", "name"); err != nil {
+				return badChatRequest("messages[%d]: %v", i, err)
+			}
+			toolCallID, err := requiredNonEmptyString(message, "tool_call_id")
+			if err != nil {
+				return badChatRequest("messages[%d].tool_call_id: %v", i, err)
+			}
+			if _, ok := pendingToolCalls[toolCallID]; !ok {
+				return badChatRequest("messages[%d].tool_call_id does not match any previous assistant tool_calls", i)
+			}
+			delete(pendingToolCalls, toolCallID)
+			if err := validateRequiredContent(message); err != nil {
+				return badChatRequest("messages[%d].content: %v", i, err)
+			}
+		case "function":
+			if err := ensureFieldsAbsent(message, "tool_calls", "tool_call_id", "function_call"); err != nil {
+				return badChatRequest("messages[%d]: %v", i, err)
+			}
+			if _, err := requiredNonEmptyString(message, "name"); err != nil {
+				return badChatRequest("messages[%d].name: %v", i, err)
+			}
+			if err := validateRequiredContent(message); err != nil {
+				return badChatRequest("messages[%d].content: %v", i, err)
+			}
+		default:
+			return badChatRequest("messages[%d].role has unsupported value %q", i, role)
+		}
+	}
+	return nil
+}
+
+func validateToolCallsField(message map[string]any, messageIndex int) ([]string, bool, error) {
+	rawToolCalls, exists := message["tool_calls"]
+	if !exists {
+		return nil, false, nil
+	}
+	toolCalls, ok := rawToolCalls.([]any)
+	if !ok {
+		return nil, true, badChatRequest("messages[%d].tool_calls must be an array", messageIndex)
+	}
+	if len(toolCalls) == 0 {
+		return nil, true, badChatRequest("messages[%d].tool_calls must not be empty", messageIndex)
+	}
+
+	seen := map[string]struct{}{}
+	ids := make([]string, 0, len(toolCalls))
+	for callIndex, rawCall := range toolCalls {
+		call, ok := rawCall.(map[string]any)
+		if !ok {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d] must be an object", messageIndex, callIndex)
+		}
+		id, err := requiredNonEmptyString(call, "id")
+		if err != nil {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].id: %v", messageIndex, callIndex, err)
+		}
+		if _, exists := seen[id]; exists {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].id is duplicated", messageIndex, callIndex)
+		}
+		seen[id] = struct{}{}
+
+		callType, err := requiredNonEmptyString(call, "type")
+		if err != nil {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].type: %v", messageIndex, callIndex, err)
+		}
+		if callType != "function" {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].type must be \"function\"", messageIndex, callIndex)
+		}
+		function, ok := call["function"].(map[string]any)
+		if !ok {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].function must be an object", messageIndex, callIndex)
+		}
+		if _, err := requiredNonEmptyString(function, "name"); err != nil {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].function.name: %v", messageIndex, callIndex, err)
+		}
+		if err := optionalStringField(function, "arguments"); err != nil {
+			return nil, true, badChatRequest("messages[%d].tool_calls[%d].function.arguments: %v", messageIndex, callIndex, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, true, nil
+}
+
+func validateFunctionCallField(message map[string]any, messageIndex int) (bool, error) {
+	rawFunctionCall, exists := message["function_call"]
+	if !exists {
+		return false, nil
+	}
+	functionCall, ok := rawFunctionCall.(map[string]any)
+	if !ok {
+		return true, badChatRequest("messages[%d].function_call must be an object", messageIndex)
+	}
+	if _, err := requiredNonEmptyString(functionCall, "name"); err != nil {
+		return true, badChatRequest("messages[%d].function_call.name: %v", messageIndex, err)
+	}
+	if err := optionalStringField(functionCall, "arguments"); err != nil {
+		return true, badChatRequest("messages[%d].function_call.arguments: %v", messageIndex, err)
+	}
+	return true, nil
+}
+
+func validateAssistantContent(message map[string]any, canBeEmpty bool) error {
+	content, exists := message["content"]
+	if !exists || content == nil {
+		if canBeEmpty {
+			return nil
+		}
+		return fmt.Errorf("is required unless tool_calls or function_call is provided")
+	}
+	return validateNonEmptyContent(content)
+}
+
+func validateRequiredContent(message map[string]any) error {
+	content, exists := message["content"]
+	if !exists || content == nil {
+		return fmt.Errorf("is required")
+	}
+	return validateNonEmptyContent(content)
+}
+
+func validateNonEmptyContent(content any) error {
+	switch value := content.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("must not be empty")
+		}
+		return nil
+	case []any:
+		if len(value) == 0 {
+			return fmt.Errorf("must not be empty")
+		}
+		for i, rawPart := range value {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				return fmt.Errorf("[%d] must be an object", i)
+			}
+			partType, err := requiredNonEmptyString(part, "type")
+			if err != nil {
+				return fmt.Errorf("[%d].type: %w", i, err)
+			}
+			if partType != "text" {
+				continue
+			}
+			text, err := requiredNonEmptyString(part, "text")
+			if err != nil {
+				return fmt.Errorf("[%d].text: %w", i, err)
+			}
+			if strings.TrimSpace(text) == "" {
+				return fmt.Errorf("[%d].text must not be empty", i)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("must be a string or an array of typed content parts")
+	}
+}
+
+func ensureFieldsAbsent(values map[string]any, fields ...string) error {
+	for _, field := range fields {
+		if _, exists := values[field]; exists {
+			return fmt.Errorf("%s is not allowed for this role", field)
+		}
+	}
+	return nil
+}
+
+func requiredNonEmptyString(values map[string]any, field string) (string, error) {
+	rawValue, exists := values[field]
+	if !exists || rawValue == nil {
+		return "", fmt.Errorf("is required")
+	}
+	value, ok := rawValue.(string)
+	if !ok {
+		return "", fmt.Errorf("must be a string")
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("must not be empty")
+	}
+	return value, nil
+}
+
+func optionalStringField(values map[string]any, field string) error {
+	rawValue, exists := values[field]
+	if !exists || rawValue == nil {
+		return nil
+	}
+	if _, ok := rawValue.(string); !ok {
+		return fmt.Errorf("must be a string")
+	}
+	return nil
+}

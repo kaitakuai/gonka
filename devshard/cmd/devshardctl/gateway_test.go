@@ -148,6 +148,36 @@ func TestGatewayHandleDevshardRewritesInnerPath(t *testing.T) {
 	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
 }
 
+func TestGatewayDisabledStateReturnsChatCompletionMessage(t *testing.T) {
+	var forwarded bool
+	rt := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded = true
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(10, 1000), "Qwen/Test")
+	g.settings = GatewaySettings{
+		DefaultModel: "Qwen/Test",
+		Disabled: GatewayDisabledSettings{
+			Enabled: true,
+		},
+	}.WithTuningDefaults()
+	handler := buildGatewayHandler(g, runtimeOptions{apiKeys: map[string]struct{}{"secret": {}}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Qwen/Test","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `"object":"chat.completion"`)
+	require.Contains(t, rec.Body.String(), "please use ... base url")
+	require.False(t, forwarded)
+}
+
 func TestNewRESTBridgeForProtocolUsesLegacyEscrowEndpointForV0211(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +358,22 @@ func TestAdminAddDevshardWiresSharedPhaseGate(t *testing.T) {
 }
 
 func TestGatewayHandleDevshardFinalizeRequiresNoActiveRequests(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+	require.NoError(t, store.Initialize(GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		MaxInputTokensInFlight:  200,
+	}, []GatewayDevshardState{
+		{RuntimeConfig: RuntimeConfig{ID: "12", PrivateKeyHex: "secret", Model: "Qwen/Test"}, Active: true},
+	}))
+
 	var forwarded bool
 	rt := &devshardRuntime{
 		id:    "12",
@@ -339,6 +385,7 @@ func TestGatewayHandleDevshardFinalizeRequiresNoActiveRequests(t *testing.T) {
 	}
 	rt.activeRequests.Store(1)
 	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.store = store
 
 	req := httptest.NewRequest(http.MethodPost, "/devshard/12/v1/finalize", nil)
 	rec := httptest.NewRecorder()
@@ -346,14 +393,21 @@ func TestGatewayHandleDevshardFinalizeRequiresNoActiveRequests(t *testing.T) {
 
 	require.Equal(t, http.StatusConflict, rec.Code)
 	require.False(t, forwarded)
+	require.True(t, rt.active.Load())
 
 	rt.activeRequests.Store(0)
-	rt.active.Store(false)
 	rec = httptest.NewRecorder()
 	g.handleDevshard(rec, req)
 
 	require.Equal(t, http.StatusNoContent, rec.Code)
 	require.True(t, forwarded)
+	require.False(t, rt.active.Load())
+
+	state, ok, err := store.LoadState()
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, state.Devshards, 1)
+	require.False(t, state.Devshards[0].Active)
 }
 
 func TestGatewayHandlePooledChatSetsChosenDevshardHeader(t *testing.T) {
@@ -1081,10 +1135,14 @@ func TestAdminSettingsUpdatesLimiterAndDefaultTokens(t *testing.T) {
 		DefaultRequestMaxTokens: 1000,
 		MaxConcurrentRequests:   2,
 		MaxInputTokensInFlight:  200,
+		Disabled: GatewayDisabledSettings{
+			Enabled: true,
+			Message: "please use http://node4.gonka.ai/v1/ base url",
+		},
 	}, t.TempDir(), store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/settings",
-		strings.NewReader(`{"chain_rest":"http://node:2317","public_api":"http://api:9900","default_model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","max_concurrent_requests":7,"max_input_tokens_in_flight":700,"default_request_max_tokens":7777,"participant_throttle":{"request_burst":42,"recovery_per_minute":7,"http_quarantine_ms":1100,"transport_failure_quarantine_ms":1200,"empty_stream_quarantine_ms":1300,"stalled_winner_quarantine_ms":1400,"empty_stream_threshold":2},"redundancy":{"receipt_timeout_ms":1500,"first_token_timeout_floor_ms":1600,"per_input_token_first_token_lag_ms":17,"inter_chunk_stall_timeout_ms":1800,"non_stream_response_floor_ms":1900,"per_input_token_response_lag_ms":20,"secondary_wait_after_winner_ms":2100,"parallel_advantage_threshold":0.4,"unresponsive_threshold":0.8}}`))
+		strings.NewReader(`{"chain_rest":"http://node:2317","public_api":"http://api:9900","default_model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","max_concurrent_requests":7,"max_input_tokens_in_flight":700,"default_request_max_tokens":7777,"disabled":{"enabled":true,"message":"please use ... base url"},"participant_throttle":{"request_burst":42,"recovery_per_minute":7,"http_quarantine_ms":1100,"transport_failure_quarantine_ms":1200,"empty_stream_quarantine_ms":1300,"stalled_winner_quarantine_ms":1400,"empty_stream_threshold":2},"redundancy":{"receipt_timeout_ms":1500,"first_token_timeout_floor_ms":1600,"per_input_token_first_token_lag_ms":17,"inter_chunk_stall_timeout_ms":1800,"non_stream_response_floor_ms":1900,"per_input_token_response_lag_ms":20,"secondary_wait_after_winner_ms":2100,"parallel_advantage_threshold":0.4,"unresponsive_threshold":0.8}}`))
 	rec := httptest.NewRecorder()
 	g.handleAdminSettings(rec, req)
 
@@ -1104,6 +1162,8 @@ func TestAdminSettingsUpdatesLimiterAndDefaultTokens(t *testing.T) {
 	require.EqualValues(t, 7777, state.Settings.DefaultRequestMaxTokens)
 	require.EqualValues(t, 7, state.Settings.MaxConcurrentRequests)
 	require.EqualValues(t, 700, state.Settings.MaxInputTokensInFlight)
+	require.True(t, state.Settings.Disabled.Enabled)
+	require.Equal(t, "please use ... base url", state.Settings.Disabled.Message)
 	require.EqualValues(t, 42, state.Settings.ParticipantThrottle.RequestBurst)
 	require.EqualValues(t, 2, state.Settings.ParticipantThrottle.EmptyStreamQuarantineThreshold)
 	require.EqualValues(t, 1500, state.Settings.Redundancy.ReceiptTimeoutMS)

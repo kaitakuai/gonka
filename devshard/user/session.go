@@ -144,7 +144,6 @@ type SignatureFetcher interface {
 	GetSignatures(ctx context.Context, nonce uint64) (map[uint32][]byte, error)
 }
 
-
 type InProcessClient struct {
 	Host *host.Host
 }
@@ -309,19 +308,20 @@ func NewSession(
 		addrToSlots[s.ValidatorAddress] = append(addrToSlots[s.ValidatorAddress], s.SlotID)
 	}
 	sess := &Session{
-		sm:                 sm,
-		signer:             signer,
-		verifier:           verifier,
-		escrowID:           escrowID,
-		group:              group,
-		addrToSlots:        addrToSlots,
-		participantKeys:    make([]string, len(group)),
-		clients:            clients,
-		hostSyncNonce:      make(map[int]uint64),
-		pendingTxKeys:      make(map[string]struct{}),
-		signatures:         make(map[uint64]map[uint32][]byte),
-		nonceStates:        make(map[uint64]*nonceOutcome),
-		verifierQueue:      SharedVerifierQueue,
+		sm:              sm,
+		signer:          signer,
+		verifier:        verifier,
+		escrowID:        escrowID,
+		group:           group,
+		addrToSlots:     addrToSlots,
+		participantKeys: make([]string, len(group)),
+		clients:         clients,
+		hostSyncNonce:   make(map[int]uint64),
+		pendingTxKeys:   make(map[string]struct{}),
+		signatures:      make(map[uint64]map[uint32][]byte),
+		nonceStates:     make(map[uint64]*nonceOutcome),
+		verifierQueue:   SharedVerifierQueue,
+		//TODO: check if we should move it from Session
 		signatureCollectMaxRetries:  3,
 		signatureCollectBaseDelay:   2 * time.Second,
 		signatureCollectHostTimeout: 30 * time.Second,
@@ -1328,8 +1328,8 @@ func (s *Session) CollectSignatures(ctx context.Context, nonce uint64) (weight, 
 				fetchCancel()
 
 				if err := s.sendCatchUpWith(collectCtx, h.idx, finClients[h.idx]); err != nil {
-				logging.Warn("collect signatures: send catch-up error", "subsystem", "finalize", "escrow", s.escrowID,
-					"nonce", nonce, "host", h.idx, "attempt", attempt, "error", err)
+					logging.Warn("collect signatures: send catch-up error", "subsystem", "finalize", "escrow", s.escrowID,
+						"nonce", nonce, "host", h.idx, "attempt", attempt, "error", err)
 				}
 
 				if s.hasQuorum(nonce, threshold) {

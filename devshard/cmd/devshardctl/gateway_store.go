@@ -16,9 +16,11 @@ type GatewaySettings struct {
 	DefaultRequestMaxTokens uint64                      `json:"default_request_max_tokens"`
 	MaxConcurrentRequests   int64                       `json:"max_concurrent_requests"`
 	MaxInputTokensInFlight  int64                       `json:"max_input_tokens_in_flight"`
+	Disabled                GatewayDisabledSettings     `json:"disabled"`
 	ParticipantThrottle     ParticipantThrottleSettings `json:"participant_throttle"`
 	Redundancy              RedundancySettings          `json:"redundancy"`
 	Perf                    PerfSettings                `json:"perf"`
+	EscrowRotation          EscrowRotationSettings      `json:"escrow_rotation"`
 }
 
 type ParticipantThrottleSettings struct {
@@ -48,6 +50,18 @@ type PerfSettings struct {
 	WindowMS   int64 `json:"window_ms"`
 }
 
+type EscrowRotationSettings struct {
+	Enabled       bool   `json:"enabled"`
+	PrePoCBlocks  int64  `json:"pre_poc_blocks"`
+	TempCount     int    `json:"temp_count"`
+	TargetCount   int    `json:"target_count"`
+	Amount        uint64 `json:"amount"`
+	ModelID       string `json:"model_id,omitempty"`
+	PrivateKeyEnv string `json:"private_key_env,omitempty"`
+}
+
+const defaultEscrowRotationAmount uint64 = 5_000_000_000
+
 func DefaultGatewaySettingsTuning() (ParticipantThrottleSettings, RedundancySettings, PerfSettings) {
 	return DefaultParticipantThrottleSettings(), DefaultRedundancySettings(), PerfSettings{
 		SampleSize: 256,
@@ -57,6 +71,7 @@ func DefaultGatewaySettingsTuning() (ParticipantThrottleSettings, RedundancySett
 
 func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 	participantDefaults, redundancyDefaults, perfDefaults := DefaultGatewaySettingsTuning()
+	s.Disabled = s.Disabled.WithDefaults()
 	if s.ParticipantThrottle == (ParticipantThrottleSettings{}) {
 		s.ParticipantThrottle = participantDefaults
 	}
@@ -66,19 +81,36 @@ func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 	if s.Perf == (PerfSettings{}) {
 		s.Perf = perfDefaults
 	}
+	if s.EscrowRotation.PrePoCBlocks == 0 {
+		s.EscrowRotation.PrePoCBlocks = 300
+	}
+	if s.EscrowRotation.TempCount == 0 {
+		s.EscrowRotation.TempCount = 8
+	}
+	if s.EscrowRotation.TargetCount == 0 {
+		s.EscrowRotation.TargetCount = 16
+	}
+	if s.EscrowRotation.Amount == 0 {
+		s.EscrowRotation.Amount = defaultEscrowRotationAmount
+	}
+	if strings.TrimSpace(s.EscrowRotation.ModelID) == "" {
+		s.EscrowRotation.ModelID = s.DefaultModel
+	}
 	return s
 }
 
 type GatewayDevshardState struct {
 	RuntimeConfig
-	Active    bool   `json:"active"`
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	Active        bool   `json:"active"`
+	RotationRole  string `json:"rotation_role,omitempty"`
+	RotationEpoch uint64 `json:"rotation_epoch,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
 }
 
 type GatewayState struct {
-	Settings GatewaySettings      `json:"settings"`
-	Devshards  []GatewayDevshardState `json:"devshards"`
+	Settings  GatewaySettings        `json:"settings"`
+	Devshards []GatewayDevshardState `json:"devshards"`
 }
 
 type GatewayStore struct {
@@ -117,6 +149,15 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			redundancy_unresponsive_threshold REAL NOT NULL DEFAULT 1.0,
 			perf_sample_size INTEGER NOT NULL DEFAULT 256,
 			perf_window_ms INTEGER NOT NULL DEFAULT 3600000,
+			escrow_rotation_enabled INTEGER NOT NULL DEFAULT 0,
+			escrow_rotation_pre_poc_blocks INTEGER NOT NULL DEFAULT 300,
+			escrow_rotation_temp_count INTEGER NOT NULL DEFAULT 8,
+			escrow_rotation_target_count INTEGER NOT NULL DEFAULT 16,
+			escrow_rotation_amount INTEGER NOT NULL DEFAULT 5000000000,
+			escrow_rotation_model_id TEXT NOT NULL DEFAULT '',
+			escrow_rotation_private_key_env TEXT NOT NULL DEFAULT '',
+			gateway_disabled_enabled INTEGER NOT NULL DEFAULT 0,
+			gateway_disabled_message TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS gateway_devshards (
@@ -126,6 +167,8 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			model TEXT NOT NULL DEFAULT '',
 			storage_path TEXT NOT NULL DEFAULT '',
 			active INTEGER NOT NULL DEFAULT 1,
+			rotation_role TEXT NOT NULL DEFAULT '',
+			rotation_epoch INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
@@ -144,9 +187,25 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate gateway tuning settings: %w", err)
 	}
+	if err := ensureGatewaySettingsRotationColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway rotation settings: %w", err)
+	}
+	if err := ensureGatewaySettingsDisabledColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway disabled settings: %w", err)
+	}
 	if err := ensureGatewayDevshardsColumn(db, "protocol_version", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate gateway devshards: %w", err)
+	}
+	if err := ensureGatewayDevshardsColumn(db, "rotation_role", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway devshard role: %w", err)
+	}
+	if err := ensureGatewayDevshardsColumn(db, "rotation_epoch", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway devshard epoch: %w", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS participant_throttle_state (
 		participant_key TEXT PRIMARY KEY,
@@ -190,9 +249,15 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		       redundancy_per_input_token_first_token_lag_ms, redundancy_inter_chunk_stall_timeout_ms,
 		       redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
 		       redundancy_secondary_wait_after_winner_ms, redundancy_parallel_advantage_threshold,
-		       redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms
+		       redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms,
+		       escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_temp_count,
+		       escrow_rotation_target_count, escrow_rotation_amount, escrow_rotation_model_id,
+	       escrow_rotation_private_key_env,
+	       gateway_disabled_enabled, gateway_disabled_message
 		FROM gateway_settings
 		WHERE id = 1`)
+	var rotationEnabled int
+	var disabledEnabled int
 	err := row.Scan(
 		&state.Settings.ChainREST,
 		&state.Settings.PublicAPI,
@@ -218,6 +283,15 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.Redundancy.UnresponsiveThreshold,
 		&state.Settings.Perf.SampleSize,
 		&state.Settings.Perf.WindowMS,
+		&rotationEnabled,
+		&state.Settings.EscrowRotation.PrePoCBlocks,
+		&state.Settings.EscrowRotation.TempCount,
+		&state.Settings.EscrowRotation.TargetCount,
+		&state.Settings.EscrowRotation.Amount,
+		&state.Settings.EscrowRotation.ModelID,
+		&state.Settings.EscrowRotation.PrivateKeyEnv,
+		&disabledEnabled,
+		&state.Settings.Disabled.Message,
 	)
 	if err == sql.ErrNoRows {
 		return GatewayState{}, false, nil
@@ -225,10 +299,13 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 	if err != nil {
 		return GatewayState{}, false, fmt.Errorf("load gateway settings: %w", err)
 	}
+	state.Settings.EscrowRotation.Enabled = rotationEnabled != 0
+	state.Settings.Disabled.Enabled = disabledEnabled != 0
 	state.Settings = state.Settings.WithTuningDefaults()
 
 	rows, err := s.db.Query(`
-		SELECT id, private_key_hex, private_key_env, model, storage_path, active, created_at, updated_at, protocol_version
+		SELECT id, private_key_hex, private_key_env, model, storage_path, active, created_at, updated_at, protocol_version,
+		       rotation_role, rotation_epoch
 		FROM gateway_devshards
 		ORDER BY id`)
 	if err != nil {
@@ -248,6 +325,8 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 			&devshard.CreatedAt,
 			&devshard.UpdatedAt,
 			&devshard.ProtocolVersion,
+			&devshard.RotationRole,
+			&devshard.RotationEpoch,
 		); err != nil {
 			return GatewayState{}, false, fmt.Errorf("scan gateway devshard: %w", err)
 		}
@@ -289,8 +368,13 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 			redundancy_per_input_token_first_token_lag_ms, redundancy_inter_chunk_stall_timeout_ms,
 			redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
 			redundancy_secondary_wait_after_winner_ms, redundancy_parallel_advantage_threshold,
-			redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms, updated_at
-		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms,
+			escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_temp_count,
+			escrow_rotation_target_count, escrow_rotation_amount, escrow_rotation_model_id,
+			escrow_rotation_private_key_env,
+			gateway_disabled_enabled, gateway_disabled_message,
+			updated_at
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(settings.ChainREST),
 		strings.TrimSpace(settings.PublicAPI),
 		strings.TrimSpace(settings.DefaultModel),
@@ -315,6 +399,15 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 		settings.Redundancy.UnresponsiveThreshold,
 		settings.Perf.SampleSize,
 		settings.Perf.WindowMS,
+		gatewayBoolToInt(settings.EscrowRotation.Enabled),
+		settings.EscrowRotation.PrePoCBlocks,
+		settings.EscrowRotation.TempCount,
+		settings.EscrowRotation.TargetCount,
+		settings.EscrowRotation.Amount,
+		strings.TrimSpace(settings.EscrowRotation.ModelID),
+		strings.TrimSpace(settings.EscrowRotation.PrivateKeyEnv),
+		gatewayBoolToInt(settings.Disabled.Enabled),
+		strings.TrimSpace(settings.Disabled.Message),
 		now,
 	); err != nil {
 		return fmt.Errorf("insert gateway settings: %w", err)
@@ -356,6 +449,15 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    redundancy_unresponsive_threshold = ?,
 		    perf_sample_size = ?,
 		    perf_window_ms = ?,
+		    escrow_rotation_enabled = ?,
+		    escrow_rotation_pre_poc_blocks = ?,
+		    escrow_rotation_temp_count = ?,
+		    escrow_rotation_target_count = ?,
+		    escrow_rotation_amount = ?,
+		    escrow_rotation_model_id = ?,
+		    escrow_rotation_private_key_env = ?,
+		    gateway_disabled_enabled = ?,
+		    gateway_disabled_message = ?,
 		    updated_at = ?
 		WHERE id = 1`,
 		strings.TrimSpace(settings.ChainREST),
@@ -382,6 +484,15 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		settings.Redundancy.UnresponsiveThreshold,
 		settings.Perf.SampleSize,
 		settings.Perf.WindowMS,
+		gatewayBoolToInt(settings.EscrowRotation.Enabled),
+		settings.EscrowRotation.PrePoCBlocks,
+		settings.EscrowRotation.TempCount,
+		settings.EscrowRotation.TargetCount,
+		settings.EscrowRotation.Amount,
+		strings.TrimSpace(settings.EscrowRotation.ModelID),
+		strings.TrimSpace(settings.EscrowRotation.PrivateKeyEnv),
+		gatewayBoolToInt(settings.Disabled.Enabled),
+		strings.TrimSpace(settings.Disabled.Message),
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -415,8 +526,9 @@ func (s *GatewayStore) upsertDevshardTx(tx *sql.Tx, devshard GatewayDevshardStat
 	_ = tx.QueryRow(`SELECT created_at FROM gateway_devshards WHERE id = ?`, devshard.ID).Scan(&createdAt)
 	if _, err := tx.Exec(`
 		INSERT OR REPLACE INTO gateway_devshards (
-			id, private_key_hex, private_key_env, model, storage_path, active, created_at, updated_at, protocol_version
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, private_key_hex, private_key_env, model, storage_path, active, created_at, updated_at, protocol_version,
+			rotation_role, rotation_epoch
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(devshard.ID),
 		strings.TrimSpace(devshard.PrivateKeyHex),
 		strings.TrimSpace(devshard.PrivateKeyEnv),
@@ -426,6 +538,8 @@ func (s *GatewayStore) upsertDevshardTx(tx *sql.Tx, devshard GatewayDevshardStat
 		createdAt,
 		now,
 		strings.TrimSpace(devshard.ProtocolVersion),
+		strings.TrimSpace(devshard.RotationRole),
+		devshard.RotationEpoch,
 	); err != nil {
 		return fmt.Errorf("upsert gateway devshard %s: %w", devshard.ID, err)
 	}
@@ -582,6 +696,43 @@ func ensureGatewaySettingsTuningColumns(db *sql.DB) error {
 		{"redundancy_unresponsive_threshold", "REAL NOT NULL DEFAULT 1.0"},
 		{"perf_sample_size", "INTEGER NOT NULL DEFAULT 256"},
 		{"perf_window_ms", "INTEGER NOT NULL DEFAULT 3600000"},
+	}
+	for _, column := range columns {
+		if err := ensureGatewaySettingsColumn(db, column.name, column.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureGatewaySettingsRotationColumns(db *sql.DB) error {
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{"escrow_rotation_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"escrow_rotation_pre_poc_blocks", "INTEGER NOT NULL DEFAULT 300"},
+		{"escrow_rotation_temp_count", "INTEGER NOT NULL DEFAULT 8"},
+		{"escrow_rotation_target_count", "INTEGER NOT NULL DEFAULT 16"},
+		{"escrow_rotation_amount", "INTEGER NOT NULL DEFAULT 5000000000"},
+		{"escrow_rotation_model_id", "TEXT NOT NULL DEFAULT ''"},
+		{"escrow_rotation_private_key_env", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, column := range columns {
+		if err := ensureGatewaySettingsColumn(db, column.name, column.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureGatewaySettingsDisabledColumns(db *sql.DB) error {
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{"gateway_disabled_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"gateway_disabled_message", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if err := ensureGatewaySettingsColumn(db, column.name, column.ddl); err != nil {
