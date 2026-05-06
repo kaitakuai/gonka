@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,17 +11,32 @@ import (
 )
 
 type GatewaySettings struct {
-	ChainREST               string                      `json:"chain_rest"`
-	PublicAPI               string                      `json:"public_api"`
-	DefaultModel            string                      `json:"default_model"`
-	DefaultRequestMaxTokens uint64                      `json:"default_request_max_tokens"`
-	MaxConcurrentRequests   int64                       `json:"max_concurrent_requests"`
-	MaxInputTokensInFlight  int64                       `json:"max_input_tokens_in_flight"`
-	Disabled                GatewayDisabledSettings     `json:"disabled"`
-	ParticipantThrottle     ParticipantThrottleSettings `json:"participant_throttle"`
-	Redundancy              RedundancySettings          `json:"redundancy"`
-	Perf                    PerfSettings                `json:"perf"`
-	EscrowRotation          EscrowRotationSettings      `json:"escrow_rotation"`
+	ChainREST               string                       `json:"chain_rest"`
+	PublicAPI               string                       `json:"public_api"`
+	DefaultModel            string                       `json:"default_model"`
+	DefaultRequestMaxTokens uint64                       `json:"default_request_max_tokens"`
+	MaxConcurrentRequests   int64                        `json:"max_concurrent_requests"`
+	MaxInputTokensInFlight  int64                        `json:"max_input_tokens_in_flight"`
+	ModelLimits             []GatewayModelLimitSettings  `json:"model_limits,omitempty"`
+	ModelAccess             []GatewayModelAccessSettings `json:"model_access,omitempty"`
+	TxGasLimit              uint64                       `json:"tx_gas_limit,omitempty"`
+	Disabled                GatewayDisabledSettings      `json:"disabled"`
+	ParticipantThrottle     ParticipantThrottleSettings  `json:"participant_throttle"`
+	Redundancy              RedundancySettings           `json:"redundancy"`
+	Perf                    PerfSettings                 `json:"perf"`
+	EscrowRotation          EscrowRotationSettings       `json:"escrow_rotation"`
+}
+
+type GatewayModelLimitSettings struct {
+	ModelID                string `json:"model_id"`
+	MaxConcurrentRequests  int64  `json:"max_concurrent_requests"`
+	MaxInputTokensInFlight int64  `json:"max_input_tokens_in_flight"`
+}
+
+type GatewayModelAccessSettings struct {
+	ModelID string `json:"model_id"`
+	Enabled bool   `json:"enabled"`
+	Message string `json:"message,omitempty"`
 }
 
 type ParticipantThrottleSettings struct {
@@ -51,16 +67,18 @@ type PerfSettings struct {
 }
 
 type EscrowRotationSettings struct {
-	Enabled       bool   `json:"enabled"`
-	PrePoCBlocks  int64  `json:"pre_poc_blocks"`
+	Enabled      bool                          `json:"enabled"`
+	PrePoCBlocks int64                         `json:"pre_poc_blocks"`
+	Models       []EscrowRotationModelSettings `json:"models,omitempty"`
+}
+
+type EscrowRotationModelSettings struct {
+	ModelID       string `json:"model_id"`
 	TempCount     int    `json:"temp_count"`
 	TargetCount   int    `json:"target_count"`
 	Amount        uint64 `json:"amount"`
-	ModelID       string `json:"model_id,omitempty"`
-	PrivateKeyEnv string `json:"private_key_env,omitempty"`
+	PrivateKeyEnv string `json:"private_key_env"`
 }
-
-const defaultEscrowRotationAmount uint64 = 5_000_000_000
 
 func DefaultGatewaySettingsTuning() (ParticipantThrottleSettings, RedundancySettings, PerfSettings) {
 	return DefaultParticipantThrottleSettings(), DefaultRedundancySettings(), PerfSettings{
@@ -84,19 +102,57 @@ func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 	if s.EscrowRotation.PrePoCBlocks == 0 {
 		s.EscrowRotation.PrePoCBlocks = 300
 	}
-	if s.EscrowRotation.TempCount == 0 {
-		s.EscrowRotation.TempCount = 8
+	for i := range s.EscrowRotation.Models {
+		model := &s.EscrowRotation.Models[i]
+		model.ModelID = strings.TrimSpace(model.ModelID)
+		model.PrivateKeyEnv = strings.TrimSpace(model.PrivateKeyEnv)
 	}
-	if s.EscrowRotation.TargetCount == 0 {
-		s.EscrowRotation.TargetCount = 16
-	}
-	if s.EscrowRotation.Amount == 0 {
-		s.EscrowRotation.Amount = defaultEscrowRotationAmount
-	}
-	if strings.TrimSpace(s.EscrowRotation.ModelID) == "" {
-		s.EscrowRotation.ModelID = s.DefaultModel
-	}
+	s.ModelLimits = normalizeGatewayModelLimits(s.ModelLimits)
+	s.ModelAccess = normalizeGatewayModelAccess(s.ModelAccess)
 	return s
+}
+
+func normalizeGatewayModelLimits(limits []GatewayModelLimitSettings) []GatewayModelLimitSettings {
+	if len(limits) == 0 {
+		return nil
+	}
+	normalized := make([]GatewayModelLimitSettings, 0, len(limits))
+	seen := make(map[string]int, len(limits))
+	for _, limit := range limits {
+		limit.ModelID = strings.TrimSpace(limit.ModelID)
+		if limit.ModelID == "" {
+			continue
+		}
+		if idx, ok := seen[limit.ModelID]; ok {
+			normalized[idx] = limit
+			continue
+		}
+		seen[limit.ModelID] = len(normalized)
+		normalized = append(normalized, limit)
+	}
+	return normalized
+}
+
+func normalizeGatewayModelAccess(access []GatewayModelAccessSettings) []GatewayModelAccessSettings {
+	if len(access) == 0 {
+		return nil
+	}
+	normalized := make([]GatewayModelAccessSettings, 0, len(access))
+	seen := make(map[string]int, len(access))
+	for _, entry := range access {
+		entry.ModelID = strings.TrimSpace(entry.ModelID)
+		entry.Message = strings.TrimSpace(entry.Message)
+		if entry.ModelID == "" {
+			continue
+		}
+		if idx, ok := seen[entry.ModelID]; ok {
+			normalized[idx] = entry
+			continue
+		}
+		seen[entry.ModelID] = len(normalized)
+		normalized = append(normalized, entry)
+	}
+	return normalized
 }
 
 type GatewayDevshardState struct {
@@ -131,6 +187,9 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			default_request_max_tokens INTEGER NOT NULL,
 			max_concurrent_requests INTEGER NOT NULL DEFAULT 512,
 			max_input_tokens_in_flight INTEGER NOT NULL,
+			model_limits_json TEXT NOT NULL DEFAULT '',
+			model_access_json TEXT NOT NULL DEFAULT '',
+			tx_gas_limit INTEGER NOT NULL DEFAULT 0,
 			participant_request_burst INTEGER NOT NULL DEFAULT 600,
 			participant_recovery_per_minute INTEGER NOT NULL DEFAULT 10,
 			participant_http_quarantine_ms INTEGER NOT NULL DEFAULT 3600000,
@@ -151,13 +210,10 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			perf_window_ms INTEGER NOT NULL DEFAULT 3600000,
 			escrow_rotation_enabled INTEGER NOT NULL DEFAULT 0,
 			escrow_rotation_pre_poc_blocks INTEGER NOT NULL DEFAULT 300,
-			escrow_rotation_temp_count INTEGER NOT NULL DEFAULT 8,
-			escrow_rotation_target_count INTEGER NOT NULL DEFAULT 16,
-			escrow_rotation_amount INTEGER NOT NULL DEFAULT 5000000000,
-			escrow_rotation_model_id TEXT NOT NULL DEFAULT '',
-			escrow_rotation_private_key_env TEXT NOT NULL DEFAULT '',
+			escrow_rotation_models_json TEXT NOT NULL DEFAULT '',
 			gateway_disabled_enabled INTEGER NOT NULL DEFAULT 0,
 			gateway_disabled_message TEXT NOT NULL DEFAULT '',
+			gateway_disabled_new_url TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS gateway_devshards (
@@ -182,6 +238,18 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 	if err := ensureGatewaySettingsColumn(db, "public_api", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate gateway store: %w", err)
+	}
+	if err := ensureGatewaySettingsColumn(db, "tx_gas_limit", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway tx settings: %w", err)
+	}
+	if err := ensureGatewaySettingsColumn(db, "model_limits_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway model limits: %w", err)
+	}
+	if err := ensureGatewaySettingsColumn(db, "model_access_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway model access: %w", err)
 	}
 	if err := ensureGatewaySettingsTuningColumns(db); err != nil {
 		db.Close()
@@ -217,6 +285,25 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("init participant throttle table: %w", err)
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS gateway_rotation_status (
+		model_id TEXT NOT NULL,
+		stage TEXT NOT NULL,
+		epoch INTEGER NOT NULL,
+		role TEXT NOT NULL DEFAULT '',
+		target_count INTEGER NOT NULL DEFAULT 0,
+		existing_count INTEGER NOT NULL DEFAULT 0,
+		created_count INTEGER NOT NULL DEFAULT 0,
+		promoted_count INTEGER NOT NULL DEFAULT 0,
+		settled_count INTEGER NOT NULL DEFAULT 0,
+		settle_failed_count INTEGER NOT NULL DEFAULT 0,
+		create_error TEXT NOT NULL DEFAULT '',
+		completed INTEGER NOT NULL DEFAULT 0,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (model_id, stage, epoch)
+	)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init gateway rotation status table: %w", err)
+	}
 	if err := ensureColumn(db, "participant_throttle_state", "quarantine_until_utc", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate participant throttle: %w", err)
@@ -240,7 +327,7 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 	var state GatewayState
 	row := s.db.QueryRow(`
 		SELECT chain_rest, public_api, default_model, default_request_max_tokens,
-		       max_concurrent_requests, max_input_tokens_in_flight,
+		       max_concurrent_requests, max_input_tokens_in_flight, model_limits_json, model_access_json, tx_gas_limit,
 		       participant_request_burst, participant_recovery_per_minute,
 		       participant_http_quarantine_ms, participant_transport_failure_quarantine_ms,
 		       participant_empty_stream_quarantine_ms, participant_stalled_winner_quarantine_ms,
@@ -250,14 +337,15 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		       redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
 		       redundancy_secondary_wait_after_winner_ms, redundancy_parallel_advantage_threshold,
 		       redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms,
-		       escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_temp_count,
-		       escrow_rotation_target_count, escrow_rotation_amount, escrow_rotation_model_id,
-	       escrow_rotation_private_key_env,
-	       gateway_disabled_enabled, gateway_disabled_message
+		       escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_models_json,
+	       gateway_disabled_enabled, gateway_disabled_message, gateway_disabled_new_url
 		FROM gateway_settings
 		WHERE id = 1`)
 	var rotationEnabled int
 	var disabledEnabled int
+	var rotationModelsJSON string
+	var modelLimitsJSON string
+	var modelAccessJSON string
 	err := row.Scan(
 		&state.Settings.ChainREST,
 		&state.Settings.PublicAPI,
@@ -265,6 +353,9 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.DefaultRequestMaxTokens,
 		&state.Settings.MaxConcurrentRequests,
 		&state.Settings.MaxInputTokensInFlight,
+		&modelLimitsJSON,
+		&modelAccessJSON,
+		&state.Settings.TxGasLimit,
 		&state.Settings.ParticipantThrottle.RequestBurst,
 		&state.Settings.ParticipantThrottle.RecoveryPerMinute,
 		&state.Settings.ParticipantThrottle.HTTPQuarantineMS,
@@ -285,13 +376,10 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.Perf.WindowMS,
 		&rotationEnabled,
 		&state.Settings.EscrowRotation.PrePoCBlocks,
-		&state.Settings.EscrowRotation.TempCount,
-		&state.Settings.EscrowRotation.TargetCount,
-		&state.Settings.EscrowRotation.Amount,
-		&state.Settings.EscrowRotation.ModelID,
-		&state.Settings.EscrowRotation.PrivateKeyEnv,
+		&rotationModelsJSON,
 		&disabledEnabled,
 		&state.Settings.Disabled.Message,
+		&state.Settings.Disabled.NewURL,
 	)
 	if err == sql.ErrNoRows {
 		return GatewayState{}, false, nil
@@ -300,6 +388,21 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		return GatewayState{}, false, fmt.Errorf("load gateway settings: %w", err)
 	}
 	state.Settings.EscrowRotation.Enabled = rotationEnabled != 0
+	if strings.TrimSpace(rotationModelsJSON) != "" {
+		if err := json.Unmarshal([]byte(rotationModelsJSON), &state.Settings.EscrowRotation.Models); err != nil {
+			return GatewayState{}, false, fmt.Errorf("load gateway rotation models: %w", err)
+		}
+	}
+	if strings.TrimSpace(modelLimitsJSON) != "" {
+		if err := json.Unmarshal([]byte(modelLimitsJSON), &state.Settings.ModelLimits); err != nil {
+			return GatewayState{}, false, fmt.Errorf("load gateway model limits: %w", err)
+		}
+	}
+	if strings.TrimSpace(modelAccessJSON) != "" {
+		if err := json.Unmarshal([]byte(modelAccessJSON), &state.Settings.ModelAccess); err != nil {
+			return GatewayState{}, false, fmt.Errorf("load gateway model access: %w", err)
+		}
+	}
 	state.Settings.Disabled.Enabled = disabledEnabled != 0
 	state.Settings = state.Settings.WithTuningDefaults()
 
@@ -359,7 +462,7 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 	if _, err := tx.Exec(`
 		INSERT INTO gateway_settings (
 			id, chain_rest, public_api, default_model, default_request_max_tokens,
-			max_concurrent_requests, max_input_tokens_in_flight,
+			max_concurrent_requests, max_input_tokens_in_flight, model_limits_json, model_access_json, tx_gas_limit,
 			participant_request_burst, participant_recovery_per_minute,
 			participant_http_quarantine_ms, participant_transport_failure_quarantine_ms,
 			participant_empty_stream_quarantine_ms, participant_stalled_winner_quarantine_ms,
@@ -369,10 +472,8 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 			redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
 			redundancy_secondary_wait_after_winner_ms, redundancy_parallel_advantage_threshold,
 			redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms,
-			escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_temp_count,
-			escrow_rotation_target_count, escrow_rotation_amount, escrow_rotation_model_id,
-			escrow_rotation_private_key_env,
-			gateway_disabled_enabled, gateway_disabled_message,
+			escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_models_json,
+			gateway_disabled_enabled, gateway_disabled_message, gateway_disabled_new_url,
 			updated_at
 		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(settings.ChainREST),
@@ -381,6 +482,9 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 		settings.DefaultRequestMaxTokens,
 		settings.MaxConcurrentRequests,
 		settings.MaxInputTokensInFlight,
+		mustMarshalGatewayModelLimits(settings.ModelLimits),
+		mustMarshalGatewayModelAccess(settings.ModelAccess),
+		settings.TxGasLimit,
 		settings.ParticipantThrottle.RequestBurst,
 		settings.ParticipantThrottle.RecoveryPerMinute,
 		settings.ParticipantThrottle.HTTPQuarantineMS,
@@ -401,13 +505,10 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 		settings.Perf.WindowMS,
 		gatewayBoolToInt(settings.EscrowRotation.Enabled),
 		settings.EscrowRotation.PrePoCBlocks,
-		settings.EscrowRotation.TempCount,
-		settings.EscrowRotation.TargetCount,
-		settings.EscrowRotation.Amount,
-		strings.TrimSpace(settings.EscrowRotation.ModelID),
-		strings.TrimSpace(settings.EscrowRotation.PrivateKeyEnv),
+		mustMarshalEscrowRotationModels(settings.EscrowRotation.Models),
 		gatewayBoolToInt(settings.Disabled.Enabled),
 		strings.TrimSpace(settings.Disabled.Message),
+		strings.TrimSpace(settings.Disabled.NewURL),
 		now,
 	); err != nil {
 		return fmt.Errorf("insert gateway settings: %w", err)
@@ -431,6 +532,9 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    default_request_max_tokens = ?,
 		    max_concurrent_requests = ?,
 		    max_input_tokens_in_flight = ?,
+		    model_limits_json = ?,
+		    model_access_json = ?,
+		    tx_gas_limit = ?,
 		    participant_request_burst = ?,
 		    participant_recovery_per_minute = ?,
 		    participant_http_quarantine_ms = ?,
@@ -451,13 +555,10 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    perf_window_ms = ?,
 		    escrow_rotation_enabled = ?,
 		    escrow_rotation_pre_poc_blocks = ?,
-		    escrow_rotation_temp_count = ?,
-		    escrow_rotation_target_count = ?,
-		    escrow_rotation_amount = ?,
-		    escrow_rotation_model_id = ?,
-		    escrow_rotation_private_key_env = ?,
+		    escrow_rotation_models_json = ?,
 		    gateway_disabled_enabled = ?,
 		    gateway_disabled_message = ?,
+		    gateway_disabled_new_url = ?,
 		    updated_at = ?
 		WHERE id = 1`,
 		strings.TrimSpace(settings.ChainREST),
@@ -466,6 +567,9 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		settings.DefaultRequestMaxTokens,
 		settings.MaxConcurrentRequests,
 		settings.MaxInputTokensInFlight,
+		mustMarshalGatewayModelLimits(settings.ModelLimits),
+		mustMarshalGatewayModelAccess(settings.ModelAccess),
+		settings.TxGasLimit,
 		settings.ParticipantThrottle.RequestBurst,
 		settings.ParticipantThrottle.RecoveryPerMinute,
 		settings.ParticipantThrottle.HTTPQuarantineMS,
@@ -486,13 +590,10 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		settings.Perf.WindowMS,
 		gatewayBoolToInt(settings.EscrowRotation.Enabled),
 		settings.EscrowRotation.PrePoCBlocks,
-		settings.EscrowRotation.TempCount,
-		settings.EscrowRotation.TargetCount,
-		settings.EscrowRotation.Amount,
-		strings.TrimSpace(settings.EscrowRotation.ModelID),
-		strings.TrimSpace(settings.EscrowRotation.PrivateKeyEnv),
+		mustMarshalEscrowRotationModels(settings.EscrowRotation.Models),
 		gatewayBoolToInt(settings.Disabled.Enabled),
 		strings.TrimSpace(settings.Disabled.Message),
+		strings.TrimSpace(settings.Disabled.NewURL),
 		time.Now().UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -506,6 +607,104 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		return fmt.Errorf("gateway settings not initialized")
 	}
 	return nil
+}
+
+type GatewayRotationStatus struct {
+	ModelID           string `json:"model_id"`
+	Stage             string `json:"stage"`
+	Epoch             uint64 `json:"epoch"`
+	Role              string `json:"role,omitempty"`
+	TargetCount       int    `json:"target_count"`
+	ExistingCount     int    `json:"existing_count"`
+	CreatedCount      int    `json:"created_count"`
+	PromotedCount     int    `json:"promoted_count"`
+	SettledCount      int    `json:"settled_count"`
+	SettleFailedCount int    `json:"settle_failed_count"`
+	CreateError       string `json:"create_error,omitempty"`
+	Completed         bool   `json:"completed"`
+	UpdatedAt         string `json:"updated_at"`
+}
+
+func (s *GatewayStore) SaveRotationStatus(status GatewayRotationStatus) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if strings.TrimSpace(status.UpdatedAt) != "" {
+		now = strings.TrimSpace(status.UpdatedAt)
+	}
+	_, err := s.db.Exec(`
+		INSERT OR REPLACE INTO gateway_rotation_status (
+			model_id, stage, epoch, role, target_count, existing_count, created_count,
+			promoted_count, settled_count, settle_failed_count, create_error, completed, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.TrimSpace(status.ModelID),
+		strings.TrimSpace(status.Stage),
+		status.Epoch,
+		strings.TrimSpace(status.Role),
+		status.TargetCount,
+		status.ExistingCount,
+		status.CreatedCount,
+		status.PromotedCount,
+		status.SettledCount,
+		status.SettleFailedCount,
+		strings.TrimSpace(status.CreateError),
+		gatewayBoolToInt(status.Completed),
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("save gateway rotation status model=%q stage=%q epoch=%d: %w", status.ModelID, status.Stage, status.Epoch, err)
+	}
+	return nil
+}
+
+func (s *GatewayStore) LoadRotationStatuses(limit int) ([]GatewayRotationStatus, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+	query := `
+		SELECT model_id, stage, epoch, role, target_count, existing_count, created_count,
+		       promoted_count, settled_count, settle_failed_count, create_error, completed, updated_at
+		FROM gateway_rotation_status
+		ORDER BY updated_at DESC`
+	args := []any{}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load gateway rotation statuses: %w", err)
+	}
+	defer rows.Close()
+	var statuses []GatewayRotationStatus
+	for rows.Next() {
+		var status GatewayRotationStatus
+		var completed int
+		if err := rows.Scan(
+			&status.ModelID,
+			&status.Stage,
+			&status.Epoch,
+			&status.Role,
+			&status.TargetCount,
+			&status.ExistingCount,
+			&status.CreatedCount,
+			&status.PromotedCount,
+			&status.SettledCount,
+			&status.SettleFailedCount,
+			&status.CreateError,
+			&completed,
+			&status.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan gateway rotation status: %w", err)
+		}
+		status.Completed = completed != 0
+		statuses = append(statuses, status)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return statuses, nil
 }
 
 func (s *GatewayStore) UpsertDevshard(devshard GatewayDevshardState) error {
@@ -669,6 +868,41 @@ func gatewayBoolToInt(v bool) int {
 	return 0
 }
 
+func mustMarshalEscrowRotationModels(models []EscrowRotationModelSettings) string {
+	if len(models) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(models)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func mustMarshalGatewayModelLimits(limits []GatewayModelLimitSettings) string {
+	limits = normalizeGatewayModelLimits(limits)
+	if len(limits) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(limits)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+func mustMarshalGatewayModelAccess(access []GatewayModelAccessSettings) string {
+	access = normalizeGatewayModelAccess(access)
+	if len(access) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(access)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
 func ensureGatewaySettingsColumn(db *sql.DB, columnName, columnDDL string) error {
 	return ensureColumn(db, "gateway_settings", columnName, columnDDL)
 }
@@ -712,11 +946,7 @@ func ensureGatewaySettingsRotationColumns(db *sql.DB) error {
 	}{
 		{"escrow_rotation_enabled", "INTEGER NOT NULL DEFAULT 0"},
 		{"escrow_rotation_pre_poc_blocks", "INTEGER NOT NULL DEFAULT 300"},
-		{"escrow_rotation_temp_count", "INTEGER NOT NULL DEFAULT 8"},
-		{"escrow_rotation_target_count", "INTEGER NOT NULL DEFAULT 16"},
-		{"escrow_rotation_amount", "INTEGER NOT NULL DEFAULT 5000000000"},
-		{"escrow_rotation_model_id", "TEXT NOT NULL DEFAULT ''"},
-		{"escrow_rotation_private_key_env", "TEXT NOT NULL DEFAULT ''"},
+		{"escrow_rotation_models_json", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if err := ensureGatewaySettingsColumn(db, column.name, column.ddl); err != nil {
@@ -733,6 +963,7 @@ func ensureGatewaySettingsDisabledColumns(db *sql.DB) error {
 	}{
 		{"gateway_disabled_enabled", "INTEGER NOT NULL DEFAULT 0"},
 		{"gateway_disabled_message", "TEXT NOT NULL DEFAULT ''"},
+		{"gateway_disabled_new_url", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if err := ensureGatewaySettingsColumn(db, column.name, column.ddl); err != nil {

@@ -71,7 +71,7 @@ func (e *ParticipantRateLimitError) Error() string {
 // EscrowParticipantRateLimitError is returned when every candidate
 // escrow is at zero effective capacity. We deliberately don't carry
 // the list of "blocked" participant keys: a host can drop out of W(e)
-// for many reasons (chain weight 0, PoC exclusion, reactive throttle,
+// for many reasons (raw capacity 0, PoC exclusion, reactive throttle,
 // share rounding) and pinning the blame on the throttled subset would
 // mislead operators about the actual cause. The picker logs per-escrow
 // W(e) at the call site for diagnostics.
@@ -112,6 +112,19 @@ type participantRequestState struct {
 	lastRefill        time.Time
 	quarantineUntil   time.Time // non-zero: wall-clock unavailability
 	emptyStreamStreak int
+}
+
+type ParticipantThrottleSnapshot struct {
+	Tracked               bool    `json:"tracked"`
+	Quarantined           bool    `json:"quarantined"`
+	Blocked               bool    `json:"blocked"`
+	RequestAllowed        bool    `json:"request_allowed"`
+	AvailableForCapacity  bool    `json:"available_for_capacity"`
+	Tokens                float64 `json:"tokens"`
+	Burst                 float64 `json:"burst"`
+	QuarantineUntil       string  `json:"quarantine_until,omitempty"`
+	QuarantineRemainingMS int64   `json:"quarantine_remaining_ms,omitempty"`
+	EmptyStreamStreak     int     `json:"empty_stream_streak,omitempty"`
 }
 
 func NewParticipantRequestLimiter(burst int, recoveryPerMinute int) *ParticipantRequestLimiter {
@@ -530,6 +543,103 @@ func (l *ParticipantRequestLimiter) BlockedParticipants(participantKeys []string
 	}
 	sort.Strings(blocked)
 	return blocked
+}
+
+func (l *ParticipantRequestLimiter) Snapshot(participantKeys []string) map[string]ParticipantThrottleSnapshot {
+	snapshots := make(map[string]ParticipantThrottleSnapshot, len(participantKeys))
+	if l == nil {
+		for _, key := range participantKeys {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			snapshots[key] = ParticipantThrottleSnapshot{
+				RequestAllowed:       true,
+				AvailableForCapacity: true,
+			}
+		}
+		return snapshots
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	seen := make(map[string]struct{}, len(participantKeys))
+	for _, key := range participantKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		state, tracked := l.participants[key]
+		if !tracked {
+			snapshots[key] = ParticipantThrottleSnapshot{
+				Tracked:              false,
+				Quarantined:          false,
+				Blocked:              false,
+				RequestAllowed:       true,
+				AvailableForCapacity: true,
+				Tokens:               l.burst,
+				Burst:                l.burst,
+			}
+			continue
+		}
+		l.clearExpiredQuarantineIfAnyLocked(key, state, now)
+		state, tracked = l.participants[key]
+		if !tracked {
+			snapshots[key] = ParticipantThrottleSnapshot{
+				Tracked:              false,
+				Quarantined:          false,
+				Blocked:              false,
+				RequestAllowed:       true,
+				AvailableForCapacity: true,
+				Tokens:               l.burst,
+				Burst:                l.burst,
+			}
+			continue
+		}
+
+		quarantined := l.inQuarantineLocked(state, now)
+		if !quarantined {
+			l.refillLocked(state, now)
+			if state.tokens >= l.burst && state.emptyStreamStreak == 0 {
+				delete(l.participants, key)
+				l.persistDeleteLocked(key)
+				snapshots[key] = ParticipantThrottleSnapshot{
+					Tracked:              false,
+					Quarantined:          false,
+					Blocked:              false,
+					RequestAllowed:       true,
+					AvailableForCapacity: true,
+					Tokens:               l.burst,
+					Burst:                l.burst,
+				}
+				continue
+			}
+		}
+		blocked := quarantined || state.tokens < 1
+		available := !quarantined && (state.tokens >= l.burst || state.emptyStreamStreak > 0)
+		snapshot := ParticipantThrottleSnapshot{
+			Tracked:              true,
+			Quarantined:          quarantined,
+			Blocked:              blocked,
+			RequestAllowed:       !blocked,
+			AvailableForCapacity: available,
+			Tokens:               state.tokens,
+			Burst:                l.burst,
+			EmptyStreamStreak:    state.emptyStreamStreak,
+		}
+		if quarantined {
+			snapshot.QuarantineUntil = state.quarantineUntil.UTC().Format(time.RFC3339)
+			snapshot.QuarantineRemainingMS = state.quarantineUntil.Sub(now).Milliseconds()
+		}
+		snapshots[key] = snapshot
+	}
+	return snapshots
 }
 
 func (l *ParticipantRequestLimiter) refillLocked(state *participantRequestState, now time.Time) {

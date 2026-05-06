@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,8 @@ import (
 	"devshard/state"
 	"devshard/types"
 )
+
+type adminAuthContextKey struct{}
 
 const (
 	defaultChainRESTURL          = "http://localhost:1317"
@@ -158,21 +161,31 @@ func mustLoadBootstrapOptions(flags cliFlags, baseStorageDir string) bootstrapOp
 		DefaultRequestMaxTokens: uint64(readInt64Env("GATEWAY_DEFAULT_MAX_TOKENS", int64(DefaultRequestMaxTokens))),
 		MaxConcurrentRequests:   readInt64Env("GATEWAY_MAX_CONCURRENT_REQUESTS", defaultMaxConcurrentRequests),
 		MaxInputTokensInFlight:  readInt64Env("GATEWAY_MAX_INPUT_TOKENS_IN_FLIGHT", 0),
+		TxGasLimit:              uint64(readInt64Env("DEVSHARD_TX_GAS_LIMIT", 0)),
 		Disabled: GatewayDisabledSettings{
 			Enabled: readBoolEnv("DEVSHARD_GATEWAY_DISABLED", false),
 			Message: os.Getenv("DEVSHARD_GATEWAY_DISABLED_MESSAGE"),
+			NewURL:  os.Getenv("DEVSHARD_GATEWAY_DISABLED_NEW_URL"),
 		},
 		EscrowRotation: EscrowRotationSettings{
-			Enabled:       readBoolEnv("DEVSHARD_ESCROW_ROTATION_ENABLED", false),
-			PrePoCBlocks:  readInt64Env("DEVSHARD_ESCROW_ROTATION_PRE_POC_BLOCKS", 300),
-			TempCount:     int(readInt64Env("DEVSHARD_ESCROW_ROTATION_TEMP_COUNT", 8)),
-			TargetCount:   int(readInt64Env("DEVSHARD_ESCROW_ROTATION_TARGET_COUNT", 16)),
-			Amount:        uint64(readInt64Env("DEVSHARD_ESCROW_ROTATION_AMOUNT", 0)),
-			ModelID:       os.Getenv("DEVSHARD_ESCROW_ROTATION_MODEL_ID"),
-			PrivateKeyEnv: os.Getenv("DEVSHARD_ESCROW_ROTATION_PRIVATE_KEY_ENV"),
+			Enabled:      readBoolEnv("DEVSHARD_ESCROW_ROTATION_ENABLED", false),
+			PrePoCBlocks: readInt64Env("DEVSHARD_ESCROW_ROTATION_PRE_POC_BLOCKS", 300),
+			Models:       mustReadEscrowRotationModelsEnv(),
 		},
 	}.WithTuningDefaults()
 	return opts
+}
+
+func mustReadEscrowRotationModelsEnv() []EscrowRotationModelSettings {
+	raw := strings.TrimSpace(os.Getenv("DEVSHARD_ESCROW_ROTATION_MODELS_JSON"))
+	if raw == "" {
+		return nil
+	}
+	var models []EscrowRotationModelSettings
+	if err := json.Unmarshal([]byte(raw), &models); err != nil {
+		log.Fatalf("invalid DEVSHARD_ESCROW_ROTATION_MODELS_JSON: %v", err)
+	}
+	return models
 }
 
 func parseCLIFlags() cliFlags {
@@ -322,6 +335,11 @@ func mustBuildGateway(gatewayStore *GatewayStore, gatewayState GatewayState, bas
 	limiter := NewGatewayLimiter(
 		gatewayState.Settings.MaxConcurrentRequests,
 		gatewayState.Settings.MaxInputTokensInFlight,
+	)
+	limiter.UpdateLimits(
+		gatewayState.Settings.MaxConcurrentRequests,
+		gatewayState.Settings.MaxInputTokensInFlight,
+		gatewayState.Settings.ModelLimits,
 	)
 	gateway := NewManagedGateway(runtimes, limiter, gatewayState.Settings, baseStorageDir, gatewayStore, perf)
 	gateway.perfStore = perfStore
@@ -542,6 +560,10 @@ func bearerAuthMiddleware(validKeys map[string]struct{}, next http.Handler) http
 			next.ServeHTTP(w, r)
 			return
 		}
+		if requestHasAdminAuth(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -565,6 +587,13 @@ func bearerAuthMiddleware(validKeys map[string]struct{}, next http.Handler) http
 
 func adminAuthMiddleware(adminKey string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		adminAuthenticated := adminKey != "" &&
+			strings.HasPrefix(auth, "Bearer ") &&
+			strings.TrimPrefix(auth, "Bearer ") == adminKey
+		if adminAuthenticated {
+			r = r.WithContext(context.WithValue(r.Context(), adminAuthContextKey{}, true))
+		}
 		if !isAdminPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
@@ -573,8 +602,7 @@ func adminAuthMiddleware(adminKey string, next http.Handler) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != adminKey {
+		if !adminAuthenticated {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			fmt.Fprint(w, `{"error":{"message":"Invalid admin API key.","type":"invalid_request_error","code":"invalid_api_key"}}`)
@@ -582,6 +610,14 @@ func adminAuthMiddleware(adminKey string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func requestHasAdminAuth(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ok, _ := r.Context().Value(adminAuthContextKey{}).(bool)
+	return ok
 }
 
 func readInt64Env(name string, fallback int64) int64 {

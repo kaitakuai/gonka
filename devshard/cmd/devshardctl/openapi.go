@@ -10,6 +10,51 @@ const openapiSpec = `{
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/models": {
+      "get": {
+        "summary": "List models (OpenAI/OpenRouter-compatible)",
+        "description": "Returns models currently advertised by this devshard gateway. The response uses the OpenAI list envelope and includes OpenRouter-style model metadata when available.",
+        "responses": {
+          "200": {
+            "description": "Model list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": { "type": "string", "example": "list" },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": { "type": "string" },
+                          "object": { "type": "string", "example": "model" },
+                          "created": { "type": "integer" },
+                          "owned_by": { "type": "string", "example": "gonka" },
+                          "name": { "type": "string" },
+                          "description": { "type": "string" },
+                          "context_length": { "type": "integer" },
+                          "max_completion_tokens": { "type": "integer" },
+                          "architecture": { "type": "object" },
+                          "pricing": { "type": "object" },
+                          "top_provider": { "type": "object" },
+                          "supported_parameters": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "405": { "description": "Method not allowed" }
+        }
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "summary": "Chat completion (OpenAI-compatible)",
@@ -151,6 +196,16 @@ const openapiSpec = `{
         "security": [{ "AdminBearerAuth": [] }],
         "responses": {
           "200": { "description": "Debug state summary" }
+        }
+      }
+    },
+    "/v1/debug/rotation": {
+      "get": {
+        "summary": "Escrow rotation debug status",
+        "description": "Admin endpoint. Returns current escrow rotation settings, chain countdown to the next rotation window, and persisted latest rotation results per model.",
+        "security": [{ "AdminBearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Escrow rotation debug status" }
         }
       }
     },

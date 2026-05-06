@@ -154,6 +154,12 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = p.model
 	}
+	body, req, err = applyKimiRequestOverrides(body, req, model)
+	if err != nil {
+		logRequestStage(ctx, "proxy_request_filter_failed", "error", err)
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
+		return
+	}
 	params := user.InferenceParams{
 		Model:       model,
 		Prompt:      body,

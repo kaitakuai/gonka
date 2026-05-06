@@ -45,6 +45,50 @@ func TestChainPhaseGateFetchEpochInfoParsesConfirmationPoC(t *testing.T) {
 	require.Equal(t, "confirmation_poc", snapshot.BlockReason)
 }
 
+func TestChainPhaseGateDerivesEpochSwitchFromCurrentSetNewValidators(t *testing.T) {
+	resp := &chainEpochInfoResponse{
+		BlockHeight: jsonInt64(150),
+		Phase:       "PoCGenerate",
+		LatestEpoch: chainLatestEpoch{
+			Index:               jsonUint64(12),
+			PocStartBlockHeight: jsonInt64(100),
+		},
+		EpochStages: chainEpochStages{
+			SetNewValidators: jsonInt64(180),
+			NextPoCStart:     jsonInt64(200),
+		},
+		NextEpochStages: chainEpochStages{
+			EpochIndex:       jsonUint64(13),
+			SetNewValidators: jsonInt64(600),
+		},
+	}
+
+	snapshot := deriveChainPhaseSnapshot(resp)
+	require.Equal(t, int64(180), snapshot.epochSwitchBlockHeight)
+}
+
+func TestChainPhaseGateDerivesEpochSwitchFromNextSetNewValidatorsAfterCurrentSwitch(t *testing.T) {
+	resp := &chainEpochInfoResponse{
+		BlockHeight: jsonInt64(250),
+		Phase:       "Inference",
+		LatestEpoch: chainLatestEpoch{
+			Index:               jsonUint64(12),
+			PocStartBlockHeight: jsonInt64(100),
+		},
+		EpochStages: chainEpochStages{
+			SetNewValidators: jsonInt64(180),
+			NextPoCStart:     jsonInt64(200),
+		},
+		NextEpochStages: chainEpochStages{
+			EpochIndex:       jsonUint64(13),
+			SetNewValidators: jsonInt64(600),
+		},
+	}
+
+	snapshot := deriveChainPhaseSnapshot(resp)
+	require.Equal(t, int64(600), snapshot.epochSwitchBlockHeight)
+}
+
 func TestChainPhaseGateFetchEpochInfoParsesNumericConfirmationPoCGracePeriod(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/epochs/latest", r.URL.Path)
@@ -304,6 +348,51 @@ func TestChainPhaseGateUsesPreservedNodePoCWeightDuringPoC(t *testing.T) {
 	}, state.weightsByModel)
 }
 
+func TestChainPhaseGateUsesRawPoCWeightOutsidePoC(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/epochs/current/participants", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"active_participants": {
+				"participants": [
+					{
+						"index": "gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+						"weight": 999,
+						"models": ["Model/A", "Model/B"],
+						"ml_nodes": [
+							{"ml_nodes": [
+								{"node_id": "a1", "poc_weight": 40, "timeslot_allocation": [true, false]},
+								{"node_id": "a2", "poc_weight": 10, "timeslot_allocation": [true, false]}
+							]},
+							{"ml_nodes": [
+								{"node_id": "b1", "poc_weight": 60, "timeslot_allocation": [true, false]}
+							]}
+						]
+					}
+				]
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	gate := NewChainPhaseGate(server.URL, 0)
+	require.NotNil(t, gate)
+
+	state, err := gate.fetchParticipantsState(false, 0, false)
+	require.NoError(t, err)
+	require.Equal(t, map[string]float64{
+		"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 110,
+	}, state.weights)
+	require.Equal(t, map[string]map[string]float64{
+		"Model/A": {
+			"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 50,
+		},
+		"Model/B": {
+			"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 60,
+		},
+	}, state.weightsByModel)
+}
+
 func TestChainPhaseGateUsesPreservedSnapshotDuringPoC(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -519,11 +608,11 @@ func TestChainPhaseGateKeepsAllParticipantsAvailableDuringConfirmationGraceBefor
 	require.Equal(t, []string{"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"}, state.preserved)
 	require.Empty(t, state.excluded)
 	require.Equal(t, map[string]float64{
-		"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 100,
+		"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 40,
 	}, state.weights)
 	require.Equal(t, map[string]map[string]float64{
 		"Model/A": {
-			"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 100,
+			"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 40,
 		},
 	}, state.weightsByModel)
 }

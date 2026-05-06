@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -48,10 +50,9 @@ func TestGatewayStoreInitializeAndLoadState(t *testing.T) {
 	require.Equal(t, "/root/.devshardctl/escrow-12/state.db", state.Devshards[0].StoragePath)
 	require.Equal(t, rotationRoleRegular, state.Devshards[0].RotationRole)
 	require.EqualValues(t, 7, state.Devshards[0].RotationEpoch)
-	require.EqualValues(t, defaultEscrowRotationAmount, state.Settings.EscrowRotation.Amount)
-	require.Equal(t, "Qwen/Test", state.Settings.EscrowRotation.ModelID)
 	require.False(t, state.Settings.Disabled.Enabled)
 	require.Equal(t, defaultGatewayDisabledMessage, state.Settings.Disabled.Message)
+	require.Empty(t, state.Settings.Disabled.NewURL)
 }
 
 func TestAdminAuthMiddlewareRequiresAdminKey(t *testing.T) {
@@ -116,9 +117,18 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 		DefaultRequestMaxTokens: 2000,
 		MaxConcurrentRequests:   5,
 		MaxInputTokensInFlight:  500,
+		ModelLimits: []GatewayModelLimitSettings{
+			{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700},
+			{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300},
+		},
+		ModelAccess: []GatewayModelAccessSettings{
+			{ModelID: "Kimi/Rotate", Enabled: false, Message: "Kimi temporarily unavailable"},
+			{ModelID: "Qwen/Test", Enabled: true},
+		},
 		Disabled: GatewayDisabledSettings{
 			Enabled: true,
-			Message: "please use https://node4.gonka.ai/v1/ base url",
+			Message: "please use ... base url",
+			NewURL:  "https://.../v1/chat/completions",
 		},
 		ParticipantThrottle: ParticipantThrottleSettings{
 			RequestBurst:                   42,
@@ -141,13 +151,15 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 			UnresponsiveThreshold:        0.8,
 		},
 		EscrowRotation: EscrowRotationSettings{
-			Enabled:       true,
-			PrePoCBlocks:  123,
-			TempCount:     4,
-			TargetCount:   12,
-			Amount:        999,
-			ModelID:       "Qwen/Rotate",
-			PrivateKeyEnv: "DEVSHARD_ROTATION_KEY",
+			Enabled:      true,
+			PrePoCBlocks: 123,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Kimi/Rotate",
+				TempCount:     2,
+				TargetCount:   6,
+				Amount:        555,
+				PrivateKeyEnv: "KIMI_ROTATION_KEY",
+			}},
 		},
 	}))
 
@@ -157,8 +169,17 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 	require.EqualValues(t, 2000, state.Settings.DefaultRequestMaxTokens)
 	require.EqualValues(t, 5, state.Settings.MaxConcurrentRequests)
 	require.EqualValues(t, 500, state.Settings.MaxInputTokensInFlight)
+	require.Equal(t, []GatewayModelLimitSettings{
+		{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700},
+		{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300},
+	}, state.Settings.ModelLimits)
+	require.Equal(t, []GatewayModelAccessSettings{
+		{ModelID: "Kimi/Rotate", Enabled: false, Message: "Kimi temporarily unavailable"},
+		{ModelID: "Qwen/Test", Enabled: true},
+	}, state.Settings.ModelAccess)
 	require.True(t, state.Settings.Disabled.Enabled)
-	require.Equal(t, "please use https://node4.gonka.ai/v1/ base url", state.Settings.Disabled.Message)
+	require.Equal(t, "please use ... base url", state.Settings.Disabled.Message)
+	require.Equal(t, "https://.../v1/chat/completions", state.Settings.Disabled.NewURL)
 	require.EqualValues(t, 42, state.Settings.ParticipantThrottle.RequestBurst)
 	require.EqualValues(t, 1200, state.Settings.ParticipantThrottle.TransportFailureQuarantineMS)
 	require.EqualValues(t, 2, state.Settings.ParticipantThrottle.EmptyStreamQuarantineThreshold)
@@ -167,14 +188,16 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 	require.Equal(t, 0.4, state.Settings.Redundancy.ParallelAdvantageThreshold)
 	require.True(t, state.Settings.EscrowRotation.Enabled)
 	require.EqualValues(t, 123, state.Settings.EscrowRotation.PrePoCBlocks)
-	require.EqualValues(t, 4, state.Settings.EscrowRotation.TempCount)
-	require.EqualValues(t, 12, state.Settings.EscrowRotation.TargetCount)
-	require.EqualValues(t, 999, state.Settings.EscrowRotation.Amount)
-	require.Equal(t, "Qwen/Rotate", state.Settings.EscrowRotation.ModelID)
-	require.Equal(t, "DEVSHARD_ROTATION_KEY", state.Settings.EscrowRotation.PrivateKeyEnv)
+	require.Equal(t, []EscrowRotationModelSettings{{
+		ModelID:       "Kimi/Rotate",
+		TempCount:     2,
+		TargetCount:   6,
+		Amount:        555,
+		PrivateKeyEnv: "KIMI_ROTATION_KEY",
+	}}, state.Settings.EscrowRotation.Models)
 }
 
-func TestValidateGatewaySettingsRequiresRotationFunding(t *testing.T) {
+func TestValidateGatewaySettingsRequiresRotationModels(t *testing.T) {
 	settings := GatewaySettings{
 		ChainREST:               "http://node:1317",
 		PublicAPI:               "http://api:9000",
@@ -183,17 +206,374 @@ func TestValidateGatewaySettingsRequiresRotationFunding(t *testing.T) {
 		MaxConcurrentRequests:   2,
 	}.WithTuningDefaults()
 	settings.EscrowRotation.Enabled = true
-	settings.EscrowRotation.Amount = 0
 
 	err := validateGatewaySettings(settings)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "amount")
+	require.Contains(t, err.Error(), "models")
 
-	settings.EscrowRotation.Amount = 1000
+	settings.EscrowRotation.Models = []EscrowRotationModelSettings{{
+		ModelID:       "Kimi/Test",
+		TempCount:     8,
+		TargetCount:   16,
+		PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+	}}
 	err = validateGatewaySettings(settings)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "private_key_env")
+	require.Contains(t, err.Error(), "amount")
 
-	settings.EscrowRotation.PrivateKeyEnv = "DEVSHARD_PRIVATE_KEY"
+	settings.EscrowRotation.Models[0].Amount = 1000
 	require.NoError(t, validateGatewaySettings(settings))
+
+	settings.EscrowRotation.Models = []EscrowRotationModelSettings{{
+		ModelID:       "Kimi/Test",
+		TempCount:     8,
+		TargetCount:   16,
+		Amount:        1000,
+		PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+	}, {
+		ModelID:       "Kimi/Test",
+		TempCount:     8,
+		TargetCount:   16,
+		Amount:        1000,
+		PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+	}}
+	err = validateGatewaySettings(settings.WithTuningDefaults())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "duplicate model_id")
+}
+
+func TestEscrowRotationPreparePromotesRegularEscrowsOnTempCreateFailure(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+
+	settings := GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		EscrowRotation: EscrowRotationSettings{
+			Enabled: true,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Qwen/Test",
+				TempCount:     8,
+				TargetCount:   16,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}},
+		},
+	}.WithTuningDefaults()
+	require.NoError(t, store.Initialize(settings, []GatewayDevshardState{{
+		RuntimeConfig: RuntimeConfig{ID: "12", PrivateKeyHex: "secret", Model: "Qwen/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleRegular,
+		RotationEpoch: 9,
+	}, {
+		RuntimeConfig: RuntimeConfig{ID: "13", PrivateKeyHex: "secret", Model: "Kimi/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleRegular,
+		RotationEpoch: 9,
+	}}))
+
+	oldCreate := gatewayCreateRotationEscrow
+	oldSettle := gatewaySettleDevshardOnChain
+	createAttempts := 0
+	settleAttempts := 0
+	gatewayCreateRotationEscrow = func(*Gateway, context.Context, GatewaySettings, EscrowRotationModelSettings, string, uint64) (*CreateDevshardEscrowResult, error) {
+		createAttempts++
+		return nil, fmt.Errorf("epoch already has 100 escrows")
+	}
+	gatewaySettleDevshardOnChain = func(*Gateway, context.Context, string, adminSettleEscrowRequest) (*SettleDevshardEscrowResult, error) {
+		settleAttempts++
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		gatewayCreateRotationEscrow = oldCreate
+		gatewaySettleDevshardOnChain = oldSettle
+	})
+
+	g := &Gateway{store: store, rotationFailures: make(map[string]struct{})}
+	g.prepareBridgeEscrows(ChainPhaseSnapshot{EpochIndex: 10}, settings)
+	g.prepareBridgeEscrows(ChainPhaseSnapshot{EpochIndex: 10}, settings)
+
+	require.Equal(t, 1, createAttempts)
+	require.Equal(t, 0, settleAttempts)
+
+	state, ok, err := store.LoadState()
+	require.NoError(t, err)
+	require.True(t, ok)
+	byID := gatewayDevshardsByID(state.Devshards)
+	require.Equal(t, rotationRoleTemp, byID["12"].RotationRole)
+	require.EqualValues(t, 10, byID["12"].RotationEpoch)
+	require.Equal(t, rotationRoleRegular, byID["13"].RotationRole)
+}
+
+func TestEscrowRotationFinishDoesNotSettleTempWhenRegularCreateFails(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+
+	settings := GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		EscrowRotation: EscrowRotationSettings{
+			Enabled: true,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Qwen/Test",
+				TempCount:     1,
+				TargetCount:   16,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}},
+		},
+	}.WithTuningDefaults()
+	require.NoError(t, store.Initialize(settings, []GatewayDevshardState{{
+		RuntimeConfig: RuntimeConfig{ID: "12", PrivateKeyHex: "secret", Model: "Qwen/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleTemp,
+		RotationEpoch: 10,
+	}}))
+
+	oldCreate := gatewayCreateRotationEscrow
+	oldSettle := gatewaySettleDevshardOnChain
+	createAttempts := 0
+	settleAttempts := 0
+	gatewayCreateRotationEscrow = func(*Gateway, context.Context, GatewaySettings, EscrowRotationModelSettings, string, uint64) (*CreateDevshardEscrowResult, error) {
+		createAttempts++
+		return nil, fmt.Errorf("insufficient fees")
+	}
+	gatewaySettleDevshardOnChain = func(*Gateway, context.Context, string, adminSettleEscrowRequest) (*SettleDevshardEscrowResult, error) {
+		settleAttempts++
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		gatewayCreateRotationEscrow = oldCreate
+		gatewaySettleDevshardOnChain = oldSettle
+	})
+
+	g := &Gateway{store: store, rotationFailures: make(map[string]struct{})}
+	g.finishBridgeEscrows(ChainPhaseSnapshot{EpochIndex: 11}, settings)
+	g.finishBridgeEscrows(ChainPhaseSnapshot{EpochIndex: 11}, settings)
+
+	require.Equal(t, 1, createAttempts)
+	require.Equal(t, 0, settleAttempts)
+}
+
+func TestEscrowRotationFinishSettlesTempFromCurrentLatestEpoch(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+
+	settings := GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		EscrowRotation: EscrowRotationSettings{
+			Enabled: true,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Qwen/Test",
+				TempCount:     1,
+				TargetCount:   2,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}},
+		},
+	}.WithTuningDefaults()
+	require.NoError(t, store.Initialize(settings, []GatewayDevshardState{{
+		RuntimeConfig: RuntimeConfig{ID: "12", PrivateKeyHex: "secret", Model: "Qwen/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleTemp,
+		RotationEpoch: 10,
+	}}))
+
+	oldCreate := gatewayCreateRotationEscrow
+	oldSettle := gatewaySettleDevshardOnChain
+	createAttempts := 0
+	var settled []string
+	gatewayCreateRotationEscrow = func(*Gateway, context.Context, GatewaySettings, EscrowRotationModelSettings, string, uint64) (*CreateDevshardEscrowResult, error) {
+		createAttempts++
+		return &CreateDevshardEscrowResult{EscrowID: uint64(90 + createAttempts), TxHash: "OK"}, nil
+	}
+	gatewaySettleDevshardOnChain = func(_ *Gateway, _ context.Context, id string, _ adminSettleEscrowRequest) (*SettleDevshardEscrowResult, error) {
+		settled = append(settled, id)
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		gatewayCreateRotationEscrow = oldCreate
+		gatewaySettleDevshardOnChain = oldSettle
+	})
+
+	g := &Gateway{store: store, rotationFailures: make(map[string]struct{})}
+	g.finishBridgeEscrows(ChainPhaseSnapshot{EpochIndex: 10}, settings)
+
+	require.Equal(t, 2, createAttempts)
+	require.Equal(t, []string{"12"}, settled)
+	statuses, err := store.LoadRotationStatuses(1)
+	require.NoError(t, err)
+	require.Len(t, statuses, 1)
+	require.Equal(t, "finish_regular", statuses[0].Stage)
+	require.EqualValues(t, 2, statuses[0].CreatedCount)
+	require.EqualValues(t, 1, statuses[0].SettledCount)
+	require.True(t, statuses[0].Completed)
+}
+
+func TestEscrowRotationPrepareRotatesModelsIndependently(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+
+	settings := GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		EscrowRotation: EscrowRotationSettings{
+			Enabled: true,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Qwen/Test",
+				TempCount:     1,
+				TargetCount:   2,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}, {
+				ModelID:       "Kimi/Test",
+				TempCount:     1,
+				TargetCount:   2,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}},
+		},
+	}.WithTuningDefaults()
+	require.NoError(t, store.Initialize(settings, []GatewayDevshardState{{
+		RuntimeConfig: RuntimeConfig{ID: "12", PrivateKeyHex: "secret", Model: "Qwen/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleRegular,
+		RotationEpoch: 9,
+	}, {
+		RuntimeConfig: RuntimeConfig{ID: "13", PrivateKeyHex: "secret", Model: "Kimi/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleRegular,
+		RotationEpoch: 9,
+	}}))
+
+	oldCreate := gatewayCreateRotationEscrow
+	oldSettle := gatewaySettleDevshardOnChain
+	var settled []string
+	gatewayCreateRotationEscrow = func(_ *Gateway, _ context.Context, _ GatewaySettings, model EscrowRotationModelSettings, _ string, _ uint64) (*CreateDevshardEscrowResult, error) {
+		if model.ModelID == "Qwen/Test" {
+			return nil, fmt.Errorf("epoch already has 100 escrows")
+		}
+		return &CreateDevshardEscrowResult{EscrowID: 99, TxHash: "OK"}, nil
+	}
+	gatewaySettleDevshardOnChain = func(_ *Gateway, _ context.Context, id string, _ adminSettleEscrowRequest) (*SettleDevshardEscrowResult, error) {
+		settled = append(settled, id)
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		gatewayCreateRotationEscrow = oldCreate
+		gatewaySettleDevshardOnChain = oldSettle
+	})
+
+	g := &Gateway{store: store, rotationFailures: make(map[string]struct{})}
+	g.prepareBridgeEscrows(ChainPhaseSnapshot{EpochIndex: 10}, settings)
+
+	require.Equal(t, []string{"13"}, settled)
+	state, ok, err := store.LoadState()
+	require.NoError(t, err)
+	require.True(t, ok)
+	byID := gatewayDevshardsByID(state.Devshards)
+	require.Equal(t, rotationRoleTemp, byID["12"].RotationRole)
+	require.Equal(t, rotationRoleRegular, byID["13"].RotationRole)
+}
+
+func TestEscrowRotationUsesEpochSwitchHeightDuringPoC(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+
+	settings := GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		EscrowRotation: EscrowRotationSettings{
+			Enabled:      true,
+			PrePoCBlocks: 300,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Qwen/Test",
+				TempCount:     1,
+				TargetCount:   2,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}},
+		},
+	}.WithTuningDefaults()
+	require.NoError(t, store.Initialize(settings, []GatewayDevshardState{{
+		RuntimeConfig: RuntimeConfig{ID: "12", PrivateKeyHex: "secret", Model: "Qwen/Test"},
+		Active:        true,
+		RotationRole:  rotationRoleRegular,
+		RotationEpoch: 9,
+	}}))
+
+	oldCreate := gatewayCreateRotationEscrow
+	oldSettle := gatewaySettleDevshardOnChain
+	createAttempts := 0
+	settleAttempts := 0
+	gatewayCreateRotationEscrow = func(_ *Gateway, _ context.Context, _ GatewaySettings, _ EscrowRotationModelSettings, _ string, _ uint64) (*CreateDevshardEscrowResult, error) {
+		createAttempts++
+		return &CreateDevshardEscrowResult{EscrowID: 99, TxHash: "OK"}, nil
+	}
+	gatewaySettleDevshardOnChain = func(_ *Gateway, _ context.Context, _ string, _ adminSettleEscrowRequest) (*SettleDevshardEscrowResult, error) {
+		settleAttempts++
+		return nil, nil
+	}
+	t.Cleanup(func() {
+		gatewayCreateRotationEscrow = oldCreate
+		gatewaySettleDevshardOnChain = oldSettle
+	})
+
+	g := &Gateway{
+		store:            store,
+		settings:         settings,
+		phaseGate:        &ChainPhaseGate{},
+		rotationFailures: make(map[string]struct{}),
+	}
+	g.phaseGate.storeSnapshot(ChainPhaseSnapshot{
+		BlockHeight:            350,
+		EpochIndex:             10,
+		EpochPhase:             epochPhasePoCValidate,
+		pocStartBlockHeight:    100,
+		epochSwitchBlockHeight: 600,
+	})
+
+	g.rotateEscrowsOnce()
+
+	require.Equal(t, 1, createAttempts)
+	require.Equal(t, 1, settleAttempts)
+}
+
+func gatewayDevshardsByID(devshards []GatewayDevshardState) map[string]GatewayDevshardState {
+	byID := make(map[string]GatewayDevshardState, len(devshards))
+	for _, devshard := range devshards {
+		byID[devshard.ID] = devshard
+	}
+	return byID
 }

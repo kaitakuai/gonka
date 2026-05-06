@@ -148,7 +148,7 @@ func TestGatewayHandleDevshardRewritesInnerPath(t *testing.T) {
 	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
 }
 
-func TestGatewayDisabledStateReturnsChatCompletionMessage(t *testing.T) {
+func TestGatewayDisabledStateReturnsRedirectPayload(t *testing.T) {
 	var forwarded bool
 	rt := &devshardRuntime{
 		id:    "12",
@@ -163,6 +163,8 @@ func TestGatewayDisabledStateReturnsChatCompletionMessage(t *testing.T) {
 		DefaultModel: "Qwen/Test",
 		Disabled: GatewayDisabledSettings{
 			Enabled: true,
+			Message: "please use https://.../v1/ base url",
+			NewURL:  "https://.../v1/chat/completions",
 		},
 	}.WithTuningDefaults()
 	handler := buildGatewayHandler(g, runtimeOptions{apiKeys: map[string]struct{}{"secret": {}}})
@@ -172,10 +174,220 @@ func TestGatewayDisabledStateReturnsChatCompletionMessage(t *testing.T) {
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusOK, rec.Code)
-	require.Contains(t, rec.Body.String(), `"object":"chat.completion"`)
-	require.Contains(t, rec.Body.String(), "please use ... base url")
+	require.Equal(t, http.StatusPermanentRedirect, rec.Code)
+	require.JSONEq(t, `{"status":308,"message":"please use https://.../v1/ base url","new_url":"https://.../v1/chat/completions"}`, rec.Body.String())
 	require.False(t, forwarded)
+}
+
+func TestGatewayModelAccessDisablesPooledAndDirectChat(t *testing.T) {
+	var forwarded bool
+	rt := &devshardRuntime{
+		id:                    "12",
+		model:                 "Kimi/Test",
+		participantSlotCounts: map[string]int{"host-k": 1},
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded = true
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	other := &devshardRuntime{
+		id:                    "13",
+		model:                 "Qwen/Test",
+		participantSlotCounts: map[string]int{"host-q": 1},
+	}
+	g := NewGateway([]*devshardRuntime{rt, other}, NewGatewayLimiter(10, 1000), "Kimi/Test")
+	g.settings = GatewaySettings{
+		DefaultModel: "Kimi/Test",
+		ModelAccess: []GatewayModelAccessSettings{{
+			ModelID: "Kimi/Test",
+			Enabled: false,
+			Message: "Kimi is temporarily unavailable",
+		}},
+	}.WithTuningDefaults()
+	g.capacity.SetEscrowMembership("12", map[string]int{"host-k": 1})
+	g.capacity.SetHostWeightsByModel(map[string]map[string]float64{
+		"Kimi/Test": {"host-k": 50},
+	}, false)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Body.String(), "Kimi is temporarily unavailable")
+	require.False(t, forwarded)
+
+	req = httptest.NewRequest(http.MethodPost, "/devshard/12/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	rec = httptest.NewRecorder()
+	g.handleDevshard(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Body.String(), "Kimi is temporarily unavailable")
+	require.False(t, forwarded)
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	statusRec := httptest.NewRecorder()
+	g.handlePooledStatus(statusRec, statusReq)
+
+	require.Equal(t, http.StatusOK, statusRec.Code)
+	var body struct {
+		Limiter  LimiterSnapshot       `json:"limiter"`
+		Capacity gatewayCapacityStatus `json:"capacity"`
+	}
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &body))
+	require.InDelta(t, 0.0, body.Capacity.Models["Kimi/Test"].CurrentWeight, 1e-9)
+	require.InDelta(t, 50.0, body.Capacity.Models["Kimi/Test"].FullWeight, 1e-9)
+	require.InDelta(t, 0.0, body.Capacity.Models["Kimi/Test"].ScaleFactor, 1e-9)
+	require.False(t, body.Capacity.Models["Kimi/Test"].AccessEnabled)
+	require.Equal(t, "Kimi is temporarily unavailable", body.Capacity.Models["Kimi/Test"].AccessMessage)
+	require.False(t, body.Capacity.Models["Kimi/Test"].Routable)
+	require.Equal(t, 1, body.Capacity.Models["Kimi/Test"].ActiveDevshards)
+	require.Equal(t, 0, body.Capacity.Models["Kimi/Test"].RoutableDevshards)
+}
+
+func TestGatewayModelAccessAllowsAdminAuthenticatedInference(t *testing.T) {
+	var forwarded int
+	rt := &devshardRuntime{
+		id:                    "12",
+		model:                 "Kimi/Test",
+		participantSlotCounts: map[string]int{"host-k": 1},
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded++
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(10, 1000), "Kimi/Test")
+	g.settings = GatewaySettings{
+		DefaultModel: "Kimi/Test",
+		ModelAccess: []GatewayModelAccessSettings{{
+			ModelID: "Kimi/Test",
+			Enabled: false,
+			Message: "Kimi is temporarily unavailable",
+		}},
+	}.WithTuningDefaults()
+	g.capacity.SetEscrowMembership("12", map[string]int{"host-k": 1})
+	g.capacity.SetHostWeightsByModel(map[string]map[string]float64{
+		"Kimi/Test": {"host-k": 50},
+	}, false)
+
+	handler := buildGatewayHandler(g, runtimeOptions{
+		apiKeys:     map[string]struct{}{"user-key": {}},
+		adminAPIKey: "admin-key",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer user-key")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Contains(t, rec.Body.String(), "Kimi is temporarily unavailable")
+	require.Equal(t, 0, forwarded)
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, 1, forwarded)
+
+	req = httptest.NewRequest(http.MethodPost, "/devshard/12/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, 2, forwarded)
+}
+
+func TestGatewayModelsEndpointListsActiveModels(t *testing.T) {
+	qwenA := &devshardRuntime{id: "12", model: "Qwen/Test"}
+	qwenB := &devshardRuntime{id: "13", model: "Qwen/Test"}
+	kimi := &devshardRuntime{id: "14", model: "Kimi/Test"}
+	inactive := &devshardRuntime{id: "15", model: "Inactive/Test"}
+	g := NewGateway([]*devshardRuntime{qwenA, qwenB, kimi, inactive}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	inactive.active.Store(false)
+	g.settings.DefaultRequestMaxTokens = 8192
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	g.Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID                  string `json:"id"`
+			Object              string `json:"object"`
+			OwnedBy             string `json:"owned_by"`
+			Name                string `json:"name"`
+			ContextLength       uint64 `json:"context_length"`
+			MaxCompletionTokens uint64 `json:"max_completion_tokens"`
+			Architecture        struct {
+				Modality         string   `json:"modality"`
+				InputModalities  []string `json:"input_modalities"`
+				OutputModalities []string `json:"output_modalities"`
+			} `json:"architecture"`
+			Pricing struct {
+				Prompt     string `json:"prompt"`
+				Completion string `json:"completion"`
+				Request    string `json:"request"`
+			} `json:"pricing"`
+			TopProvider struct {
+				ContextLength       uint64 `json:"context_length"`
+				MaxCompletionTokens uint64 `json:"max_completion_tokens"`
+				IsModerated         bool   `json:"is_moderated"`
+			} `json:"top_provider"`
+			SupportedParameters []string `json:"supported_parameters"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, "list", resp.Object)
+	require.Len(t, resp.Data, 2)
+	require.Equal(t, "Qwen/Test", resp.Data[0].ID)
+	require.Equal(t, "Kimi/Test", resp.Data[1].ID)
+	require.Equal(t, "model", resp.Data[0].Object)
+	require.Equal(t, "gonka", resp.Data[0].OwnedBy)
+	require.Equal(t, resp.Data[0].ID, resp.Data[0].Name)
+	require.EqualValues(t, 8192, resp.Data[0].ContextLength)
+	require.EqualValues(t, 8192, resp.Data[0].MaxCompletionTokens)
+	require.Equal(t, "text->text", resp.Data[0].Architecture.Modality)
+	require.Equal(t, []string{"text"}, resp.Data[0].Architecture.InputModalities)
+	require.Equal(t, []string{"text"}, resp.Data[0].Architecture.OutputModalities)
+	require.Equal(t, "0", resp.Data[0].Pricing.Prompt)
+	require.Equal(t, "0", resp.Data[0].Pricing.Completion)
+	require.Equal(t, "0", resp.Data[0].Pricing.Request)
+	require.EqualValues(t, 8192, resp.Data[0].TopProvider.ContextLength)
+	require.EqualValues(t, 8192, resp.Data[0].TopProvider.MaxCompletionTokens)
+	require.False(t, resp.Data[0].TopProvider.IsModerated)
+	require.Contains(t, resp.Data[0].SupportedParameters, "stream")
+}
+
+func TestRuntimeModelsEndpointListsSingleModel(t *testing.T) {
+	handler := newRuntimeMux(&Proxy{model: "Qwen/Test"})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `"object": "list"`)
+	require.Contains(t, rec.Body.String(), `"id": "Qwen/Test"`)
+}
+
+func TestGatewayModelsEndpointRejectsUnsupportedMethod(t *testing.T) {
+	rt := &devshardRuntime{id: "12", model: "Qwen/Test"}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	g.Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	require.Equal(t, "GET, HEAD", rec.Header().Get("Allow"))
 }
 
 func TestNewRESTBridgeForProtocolUsesLegacyEscrowEndpointForV0211(t *testing.T) {
@@ -276,6 +488,74 @@ func TestAdminDeactivateDevshardAllowsActiveRequestsAndStopsNewChat(t *testing.T
 
 	require.Equal(t, http.StatusConflict, chatRec.Code)
 	require.False(t, forwarded)
+}
+
+func TestAdminDevshardParticipantsShowsQuarantineState(t *testing.T) {
+	limiter := NewParticipantRequestLimiter(10, 10)
+	limiter.ObserveResult("dead-host", "/sessions/12/chat/completions", http.StatusServiceUnavailable)
+
+	rt := &devshardRuntime{
+		id:                    "12",
+		model:                 "Qwen/Test",
+		participantKeys:       []string{"healthy-host", "dead-host"},
+		participantSlotCounts: map[string]int{"healthy-host": 1, "dead-host": 2},
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.participantLimiter = limiter
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/devshards/12/participants", nil)
+	rec := httptest.NewRecorder()
+	g.handleAdminDevshardAction(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var body struct {
+		ID               string `json:"id"`
+		Model            string `json:"model"`
+		ParticipantCount int    `json:"participant_count"`
+		AvailableCount   int    `json:"available_count"`
+		BlockedCount     int    `json:"blocked_count"`
+		QuarantinedCount int    `json:"quarantined_count"`
+		Participants     []struct {
+			ParticipantKey      string  `json:"participant_key"`
+			SlotCount           int     `json:"slot_count"`
+			Tracked             bool    `json:"tracked"`
+			Quarantined         bool    `json:"quarantined"`
+			Blocked             bool    `json:"blocked"`
+			RequestAllowed      bool    `json:"request_allowed"`
+			AvailableForCap     bool    `json:"available_for_capacity"`
+			Tokens              float64 `json:"tokens"`
+			Burst               float64 `json:"burst"`
+			QuarantineUntil     string  `json:"quarantine_until"`
+			QuarantineRemaining int64   `json:"quarantine_remaining_ms"`
+		} `json:"participants"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "12", body.ID)
+	require.Equal(t, "Qwen/Test", body.Model)
+	require.Equal(t, 2, body.ParticipantCount)
+	require.Equal(t, 1, body.AvailableCount)
+	require.Equal(t, 1, body.BlockedCount)
+	require.Equal(t, 1, body.QuarantinedCount)
+	require.Len(t, body.Participants, 2)
+
+	require.Equal(t, "dead-host", body.Participants[0].ParticipantKey)
+	require.Equal(t, 2, body.Participants[0].SlotCount)
+	require.True(t, body.Participants[0].Tracked)
+	require.True(t, body.Participants[0].Quarantined)
+	require.True(t, body.Participants[0].Blocked)
+	require.False(t, body.Participants[0].RequestAllowed)
+	require.False(t, body.Participants[0].AvailableForCap)
+	require.Equal(t, 0.0, body.Participants[0].Tokens)
+	require.Equal(t, 10.0, body.Participants[0].Burst)
+	require.NotEmpty(t, body.Participants[0].QuarantineUntil)
+	require.Greater(t, body.Participants[0].QuarantineRemaining, int64(0))
+
+	require.Equal(t, "healthy-host", body.Participants[1].ParticipantKey)
+	require.Equal(t, 1, body.Participants[1].SlotCount)
+	require.False(t, body.Participants[1].Tracked)
+	require.False(t, body.Participants[1].Blocked)
+	require.True(t, body.Participants[1].RequestAllowed)
+	require.True(t, body.Participants[1].AvailableForCap)
 }
 
 func TestAdminAddDevshardWiresSharedPhaseGate(t *testing.T) {
@@ -565,6 +845,69 @@ func TestGatewayStatusExposesCapacityLossAndEffectiveLimits(t *testing.T) {
 	require.Equal(t, 1, body.Capacity.UnavailableHostCount)
 	require.Equal(t, 2, body.Capacity.CurrentWeightMatched)
 	require.Equal(t, 0, body.Capacity.CurrentWeightFallback)
+	require.InDelta(t, 1.0, body.Capacity.Models["Qwen/Test"].TotalWeight, 1e-9)
+	require.InDelta(t, 1.0, body.Capacity.Models["Qwen/Test"].CurrentWeight, 1e-9)
+	require.InDelta(t, 2.0, body.Capacity.Models["Qwen/Test"].FullWeight, 1e-9)
+	require.InDelta(t, 2.0, body.Capacity.Models["Qwen/Test"].BaselineWeight, 1e-9)
+	require.InDelta(t, 0.5, body.Capacity.Models["Qwen/Test"].LimitShare, 1e-9)
+	require.EqualValues(t, 2, body.Limiter.Models["Qwen/Test"].EffectiveMaxConcurrent)
+	require.EqualValues(t, 50, body.Limiter.Models["Qwen/Test"].EffectiveMaxInputTokens)
+	require.EqualValues(t, 4, body.Limiter.Models["Qwen/Test"].CapacityCapRequests)
+	require.EqualValues(t, 2, body.Limiter.Models["Qwen/Test"].CurrentCapacityCapRequests)
+	require.EqualValues(t, 100, body.Limiter.Models["Qwen/Test"].CapacityCapInputTokens)
+	require.EqualValues(t, 50, body.Limiter.Models["Qwen/Test"].CurrentCapacityCapInputTokens)
+}
+
+func TestGatewayStatusZerosModelCapacityWithoutRoutableDevshards(t *testing.T) {
+	qwen := &devshardRuntime{
+		id:                    "qwen",
+		model:                 "Qwen/Test",
+		participantSlotCounts: map[string]int{"host-q": 1},
+	}
+	kimi := &devshardRuntime{
+		id:                    "kimi",
+		model:                 "Kimi/Test",
+		participantSlotCounts: map[string]int{"host-k": 1},
+	}
+	limiter := NewGatewayLimiter(0, 0)
+	limiter.UpdateLimits(0, 0, []GatewayModelLimitSettings{
+		{ModelID: "Qwen/Test", MaxConcurrentRequests: 1024},
+		{ModelID: "Kimi/Test", MaxConcurrentRequests: 64},
+	})
+	g := NewGateway([]*devshardRuntime{qwen, kimi}, limiter, "Qwen/Test")
+	kimi.active.Store(false)
+	g.capacity.SetHostWeightsByModel(map[string]map[string]float64{
+		"Qwen/Test": {"host-q": 100},
+		"Kimi/Test": {"host-k": 50},
+	}, false)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	rec := httptest.NewRecorder()
+	g.handlePooledStatus(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Limiter  LimiterSnapshot       `json:"limiter"`
+		Capacity gatewayCapacityStatus `json:"capacity"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+
+	require.InDelta(t, 100.0, body.Capacity.Models["Qwen/Test"].CurrentWeight, 1e-9)
+	require.InDelta(t, 100.0, body.Capacity.Models["Qwen/Test"].FullWeight, 1e-9)
+	require.EqualValues(t, 1024, body.Limiter.Models["Qwen/Test"].CurrentCapacityCapRequests)
+	require.True(t, body.Capacity.Models["Qwen/Test"].Routable)
+	require.Equal(t, 1, body.Capacity.Models["Qwen/Test"].ActiveDevshards)
+	require.Equal(t, 1, body.Capacity.Models["Qwen/Test"].RoutableDevshards)
+
+	require.InDelta(t, 0.0, body.Capacity.Models["Kimi/Test"].CurrentWeight, 1e-9)
+	require.InDelta(t, 50.0, body.Capacity.Models["Kimi/Test"].FullWeight, 1e-9)
+	require.InDelta(t, 0.0, body.Capacity.Models["Kimi/Test"].ScaleFactor, 1e-9)
+	require.InDelta(t, 100.0, body.Capacity.Models["Kimi/Test"].LostPercent, 1e-9)
+	require.EqualValues(t, 0, body.Limiter.Models["Kimi/Test"].CurrentCapacityCapRequests)
+	require.False(t, body.Capacity.Models["Kimi/Test"].Routable)
+	require.Equal(t, 0, body.Capacity.Models["Kimi/Test"].ActiveDevshards)
+	require.Equal(t, 0, body.Capacity.Models["Kimi/Test"].RoutableDevshards)
 }
 
 func TestGatewayWiresQuarantineIntoCapacityWithoutPhaseGate(t *testing.T) {
@@ -1088,6 +1431,12 @@ func TestNormalizeChatRequestDefaultsAndCapsMaxTokens(t *testing.T) {
 	require.EqualValues(t, 10_000, req.MaxTokens)
 	require.Contains(t, string(body), `"max_tokens":10000`)
 
+	body, req, err = normalizeChatRequest([]byte(`{"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`))
+	require.NoError(t, err)
+	require.EqualValues(t, 64, req.MaxTokens)
+	require.Contains(t, string(body), `"max_tokens":64`)
+	require.NotContains(t, string(body), `"max_completion_tokens"`)
+
 	body, req, err = normalizeChatRequest([]byte(`{"max_tokens":10001,"messages":[{"role":"user","content":"hello"}]}`))
 	require.NoError(t, err)
 	require.EqualValues(t, 10_000, req.MaxTokens)
@@ -1137,12 +1486,13 @@ func TestAdminSettingsUpdatesLimiterAndDefaultTokens(t *testing.T) {
 		MaxInputTokensInFlight:  200,
 		Disabled: GatewayDisabledSettings{
 			Enabled: true,
-			Message: "please use http://node4.gonka.ai/v1/ base url",
+			Message: "please use http://.../v1/ base url",
+			NewURL:  "http://.../v1/chat/completions",
 		},
 	}, t.TempDir(), store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/settings",
-		strings.NewReader(`{"chain_rest":"http://node:2317","public_api":"http://api:9900","default_model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","max_concurrent_requests":7,"max_input_tokens_in_flight":700,"default_request_max_tokens":7777,"disabled":{"enabled":true,"message":"please use ... base url"},"participant_throttle":{"request_burst":42,"recovery_per_minute":7,"http_quarantine_ms":1100,"transport_failure_quarantine_ms":1200,"empty_stream_quarantine_ms":1300,"stalled_winner_quarantine_ms":1400,"empty_stream_threshold":2},"redundancy":{"receipt_timeout_ms":1500,"first_token_timeout_floor_ms":1600,"per_input_token_first_token_lag_ms":17,"inter_chunk_stall_timeout_ms":1800,"non_stream_response_floor_ms":1900,"per_input_token_response_lag_ms":20,"secondary_wait_after_winner_ms":2100,"parallel_advantage_threshold":0.4,"unresponsive_threshold":0.8}}`))
+		strings.NewReader(`{"chain_rest":"http://node:2317","public_api":"http://api:9900","default_model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","max_concurrent_requests":7,"max_input_tokens_in_flight":700,"default_request_max_tokens":7777,"tx_gas_limit":700000,"model_access":[{"model_id":"moonshotai/Kimi-K2.6","enabled":false,"message":"Kimi temporarily unavailable"}],"disabled":{"enabled":true,"message":"please use ... base url","new_url":"https://.../v1/chat/completions"},"participant_throttle":{"request_burst":42,"recovery_per_minute":7,"http_quarantine_ms":1100,"transport_failure_quarantine_ms":1200,"empty_stream_quarantine_ms":1300,"stalled_winner_quarantine_ms":1400,"empty_stream_threshold":2},"redundancy":{"receipt_timeout_ms":1500,"first_token_timeout_floor_ms":1600,"per_input_token_first_token_lag_ms":17,"inter_chunk_stall_timeout_ms":1800,"non_stream_response_floor_ms":1900,"per_input_token_response_lag_ms":20,"secondary_wait_after_winner_ms":2100,"parallel_advantage_threshold":0.4,"unresponsive_threshold":0.8}}`))
 	rec := httptest.NewRecorder()
 	g.handleAdminSettings(rec, req)
 
@@ -1162,8 +1512,15 @@ func TestAdminSettingsUpdatesLimiterAndDefaultTokens(t *testing.T) {
 	require.EqualValues(t, 7777, state.Settings.DefaultRequestMaxTokens)
 	require.EqualValues(t, 7, state.Settings.MaxConcurrentRequests)
 	require.EqualValues(t, 700, state.Settings.MaxInputTokensInFlight)
+	require.EqualValues(t, 700000, state.Settings.TxGasLimit)
+	require.Equal(t, []GatewayModelAccessSettings{{
+		ModelID: "moonshotai/Kimi-K2.6",
+		Enabled: false,
+		Message: "Kimi temporarily unavailable",
+	}}, state.Settings.ModelAccess)
 	require.True(t, state.Settings.Disabled.Enabled)
 	require.Equal(t, "please use ... base url", state.Settings.Disabled.Message)
+	require.Equal(t, "https://.../v1/chat/completions", state.Settings.Disabled.NewURL)
 	require.EqualValues(t, 42, state.Settings.ParticipantThrottle.RequestBurst)
 	require.EqualValues(t, 2, state.Settings.ParticipantThrottle.EmptyStreamQuarantineThreshold)
 	require.EqualValues(t, 1500, state.Settings.Redundancy.ReceiptTimeoutMS)
@@ -1206,6 +1563,79 @@ func TestAdminSettingsRejectsInvalidTuning(t *testing.T) {
 
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "empty_stream_threshold")
+}
+
+func TestDebugRotationReportsCountdownAndLatestStatus(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+	settings := GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		MaxInputTokensInFlight:  200,
+		EscrowRotation: EscrowRotationSettings{
+			Enabled:      true,
+			PrePoCBlocks: 300,
+			Models: []EscrowRotationModelSettings{{
+				ModelID:       "Qwen/Test",
+				TempCount:     4,
+				TargetCount:   8,
+				Amount:        1000,
+				PrivateKeyEnv: "DEVSHARD_PRIVATE_KEY",
+			}},
+		},
+	}.WithTuningDefaults()
+	require.NoError(t, store.Initialize(settings, nil))
+	require.NoError(t, store.SaveRotationStatus(GatewayRotationStatus{
+		ModelID:           "Qwen/Test",
+		Stage:             "prepare_temp",
+		Epoch:             10,
+		Role:              rotationRoleTemp,
+		TargetCount:       4,
+		ExistingCount:     1,
+		CreatedCount:      3,
+		SettledCount:      8,
+		SettleFailedCount: 0,
+		Completed:         true,
+		UpdatedAt:         "2026-05-04T00:00:00Z",
+	}))
+	g := &Gateway{
+		store:     store,
+		settings:  settings,
+		phaseGate: &ChainPhaseGate{},
+	}
+	g.phaseGate.storeSnapshot(ChainPhaseSnapshot{
+		BlockHeight:            1000,
+		EpochIndex:             10,
+		EpochPhase:             epochPhaseInference,
+		epochSwitchBlockHeight: 1400,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/debug/rotation", nil)
+	rec := httptest.NewRecorder()
+	g.handleDebugRotation(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Chain struct {
+			BlocksToEpochSwitch     int64 `json:"blocks_to_epoch_switch"`
+			BlocksUntilNextRotation int64 `json:"blocks_until_next_rotation"`
+		} `json:"chain"`
+		Latest []GatewayRotationStatus `json:"latest"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.EqualValues(t, 400, body.Chain.BlocksToEpochSwitch)
+	require.EqualValues(t, 100, body.Chain.BlocksUntilNextRotation)
+	require.Len(t, body.Latest, 1)
+	require.Equal(t, "prepare_temp", body.Latest[0].Stage)
+	require.EqualValues(t, 3, body.Latest[0].CreatedCount)
+	require.EqualValues(t, 8, body.Latest[0].SettledCount)
+	require.True(t, body.Latest[0].Completed)
 }
 
 func TestGatewayMetricsEndpointExposedAndUpdated(t *testing.T) {

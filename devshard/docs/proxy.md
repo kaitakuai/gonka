@@ -26,17 +26,14 @@ All settings can be passed as flags or environment variables. Flags take precede
 | - | `DEVSHARD_CHAIN_ID` | no | queried from REST | Chain ID used when signing admin-created escrow transactions |
 | - | `DEVSHARD_TX_FEE_AMOUNT` | no | `1000000` | Fee amount for admin-created escrow transactions |
 | - | `DEVSHARD_TX_FEE_DENOM` | no | `ngonka` | Fee denom for admin-created escrow transactions |
-| - | `DEVSHARD_TX_GAS_LIMIT` | no | `500000` | Gas limit for admin-created escrow transactions |
+| - | `DEVSHARD_TX_GAS_LIMIT` | no | `500000` | Fallback gas limit for admin-created escrow and settlement transactions |
 | - | `DEVSHARD_TX_POLL_TIMEOUT_MS` | no | `45000` | How long to wait for the create-escrow transaction result |
-| - | `DEVSHARD_GATEWAY_DISABLED` | no | `false` | Return a synthetic chat completion response for all requests |
+| - | `DEVSHARD_GATEWAY_DISABLED` | no | `false` | Return a 308 redirect-shaped JSON response for all non-admin requests |
 | - | `DEVSHARD_GATEWAY_DISABLED_MESSAGE` | no | `please use ... base url` | Message shown while the gateway is disabled |
+| - | `DEVSHARD_GATEWAY_DISABLED_NEW_URL` | no | - | Replacement chat completions URL returned while the gateway is disabled |
 | - | `DEVSHARD_ESCROW_ROTATION_ENABLED` | no | `false` | Enable automatic epoch escrow rotation |
-| - | `DEVSHARD_ESCROW_ROTATION_PRIVATE_KEY_ENV` | when rotation enabled | - | Environment variable holding the creator/settler key |
-| - | `DEVSHARD_ESCROW_ROTATION_AMOUNT` | no | `5000000000` | Amount locked in each automatically created escrow, in ngonka (5 GNK) |
-| - | `DEVSHARD_ESCROW_ROTATION_MODEL_ID` | no | `DEVSHARD_MODEL` | Model used for automatically created escrows; defaults to the gateway Qwen model |
-| - | `DEVSHARD_ESCROW_ROTATION_PRE_POC_BLOCKS` | no | `300` | Blocks before PoC to create temp bridge escrows |
-| - | `DEVSHARD_ESCROW_ROTATION_TEMP_COUNT` | no | `8` | Number of temp bridge escrows |
-| - | `DEVSHARD_ESCROW_ROTATION_TARGET_COUNT` | no | `16` | Number of regular escrows to create after PoC |
+| - | `DEVSHARD_ESCROW_ROTATION_PRE_POC_BLOCKS` | no | `300` | Blocks before the next epoch switch at `set_new_validators` to create temp bridge escrows |
+| - | `DEVSHARD_ESCROW_ROTATION_MODELS_JSON` | when rotation enabled | - | JSON array of per-model rotation configs: `model_id`, `temp_count`, `target_count`, `amount`, `private_key_env` |
 
 ## Quick start
 
@@ -88,6 +85,28 @@ curl -X 'POST' http://localhost:8080/v1/finalize \
 
 ## Endpoints
 
+### GET /v1/models
+
+Lists the models currently advertised by the devshard gateway. The response
+uses the OpenAI list envelope and includes OpenRouter-style metadata fields
+(`name`, `description`, `context_length`, `architecture`, `pricing`,
+`top_provider`, and `supported_parameters`) where the gateway can provide
+stable values.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+      "object": "model",
+      "owned_by": "gonka",
+      "name": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+    }
+  ]
+}
+```
+
 ### POST /v1/chat/completions
 
 Standard OpenAI chat completion format. The full request body is forwarded as the inference prompt.
@@ -121,6 +140,58 @@ Phase values: `active`, `finalizing`, `settlement`.
 Admin endpoint. Returns the full session state and requires
 `Authorization: Bearer $DEVSHARD_ADMIN_API_KEY`.
 
+### POST /v1/admin/settings
+
+Admin endpoint. Updates persisted gateway settings. Global request/token caps
+remain the fallback, and `model_limits` overrides them per model before the
+gateway applies the model's current capacity scale factor. `model_access`
+temporarily enables or disables non-admin inference access for a model without
+removing its devshards or changing on-chain state.
+
+```bash
+curl -X POST http://localhost:8080/v1/admin/settings \
+  -H "Authorization: Bearer $DEVSHARD_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "max_concurrent_requests": 20,
+    "max_input_tokens_in_flight": 200000,
+    "model_limits": [
+      {
+        "model_id": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+        "max_concurrent_requests": 20,
+        "max_input_tokens_in_flight": 200000
+      },
+      {
+        "model_id": "moonshotai/Kimi-K2-Instruct",
+        "max_concurrent_requests": 8,
+        "max_input_tokens_in_flight": 80000
+      }
+    ],
+    "model_access": [
+      {
+        "model_id": "moonshotai/Kimi-K2-Instruct",
+        "enabled": false,
+        "message": "Kimi is temporarily unavailable"
+      }
+    ]
+  }'
+```
+
+When a model is disabled through `model_access`, `/v1/chat/completions` and
+`/devshard/{id}/v1/chat/completions` return `503` with the configured message.
+Admin endpoints remain available so operators can re-enable the model:
+
+```bash
+curl -X POST http://localhost:8080/v1/admin/settings \
+  -H "Authorization: Bearer $DEVSHARD_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model_access":[{"model_id":"moonshotai/Kimi-K2-Instruct","enabled":true}]}'
+```
+
+`/v1/status` reports `access_enabled`, `active_devshards`,
+`routable_devshards`, and `routable` per model. Disabled models have
+`current_weight`, `scale_factor`, and current limiter caps set to `0`.
+
 ### POST /v1/admin/escrows
 
 Admin endpoint. Creates a new on-chain devshard escrow by signing
@@ -137,6 +208,23 @@ curl -X POST http://localhost:8080/v1/admin/escrows \
 
 Set `"register": false` to create the escrow on-chain without adding it to the
 local runtime pool.
+
+### GET /v1/admin/devshards/{id}/participants
+
+Admin endpoint. Returns the participant host keys in a devshard escrow and the
+reactive throttle state used by gateway routing.
+
+```bash
+curl http://localhost:8080/v1/admin/devshards/42/participants \
+  -H "Authorization: Bearer $DEVSHARD_ADMIN_API_KEY"
+```
+
+Each participant entry includes `participant_key`, `slot_count`, `tracked`,
+`quarantined`, `blocked`, `request_allowed`, `available_for_capacity`, `tokens`,
+`burst`, and, when quarantined, `quarantine_until` and
+`quarantine_remaining_ms`. `blocked` means the gateway would reject a request to
+that host now; `available_for_capacity` is stricter and only becomes true once
+the host is fully recovered for capacity-weighted routing.
 
 ### POST /v1/admin/devshards/{id}/settle
 
@@ -191,18 +279,25 @@ curl -X POST http://localhost:8080/v1/admin/settings \
       "pre_poc_blocks": 300,
       "temp_count": 8,
       "target_count": 16
-    }
+    },
+    "tx_gas_limit": 700000
   }'
 ```
+
+`tx_gas_limit` is persisted in `gateway.db` and used by automatic escrow
+rotation for both create and settle transactions. A per-request `gas_limit` on
+`POST /v1/admin/escrows` or `POST /v1/admin/devshards/{id}/settle` still takes
+precedence. If `tx_gas_limit` is `0`, the gateway falls back to
+`DEVSHARD_TX_GAS_LIMIT` and then the built-in default.
 
 ### Gateway disabled state
 
 Set `DEVSHARD_GATEWAY_DISABLED=true` on first boot, or update
 `disabled.enabled` through `POST /v1/admin/settings`, to make the gateway return
-a normal OpenAI-compatible chat completion response for every request:
+a redirect-shaped JSON response for every non-admin request:
 
 ```json
-{"id":"chatcmpl-gateway-disabled-...","object":"chat.completion","created":...,"model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","choices":[{"index":0,"message":{"role":"assistant","content":"please use ... base url"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":5,"total_tokens":5}}
+{"status":308,"message":"please use https://.../v1/ base url","new_url":"https://.../v1/chat/completions"}
 ```
 
 The disabled settings are persisted in `gateway.db`:
@@ -211,7 +306,7 @@ The disabled settings are persisted in `gateway.db`:
 curl -X POST http://localhost:8080/v1/admin/settings \
   -H "Authorization: Bearer $DEVSHARD_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"disabled":{"enabled":true,"message":"please use ... base url"}}'
+  -d '{"disabled":{"enabled":true,"message":"please use https://.../v1/ base url","new_url":"https://.../v1/chat/completions"}}'
 ```
 
 ### GET /metrics

@@ -118,6 +118,38 @@ func TestCapacityStateUsesModelSpecificPoCWeights(t *testing.T) {
 	require.InDelta(t, 90.0/300.0, m.ScaleFactorAcrossModels(), 1e-9)
 }
 
+func TestGatewayLimiterModelScalesUseIndependentModelCapacity(t *testing.T) {
+	g := NewGateway(nil, NewGatewayLimiter(4, 100), "Model/A")
+	g.limiter.UpdateLimits(4, 100, []GatewayModelLimitSettings{
+		{ModelID: "Model/A", MaxConcurrentRequests: 8, MaxInputTokensInFlight: 200},
+		{ModelID: "Model/B", MaxConcurrentRequests: 2, MaxInputTokensInFlight: 50},
+	})
+	g.capacity.SetEscrowMembership("A", map[string]int{"host-a": 1})
+	g.capacity.SetEscrowMembership("B", map[string]int{"host-b": 1})
+	g.capacity.SetHostWeights(map[string]float64{"host-a": 100, "host-b": 100}, false)
+	g.capacity.SetHostWeightsByModel(map[string]map[string]float64{
+		"Model/A": {"host-a": 100},
+		"Model/B": {"host-b": 100},
+	}, false)
+
+	scales := g.limiterModelScales([]string{"Model/A", "Model/B"}, map[string]gatewayModelRuntimeStatus{
+		"Model/A": {active: 1, routable: 1},
+		"Model/B": {active: 1, routable: 1},
+	})
+	require.InDelta(t, 1.0, scales["Model/A"], 1e-9)
+	require.InDelta(t, 1.0, scales["Model/B"], 1e-9)
+
+	snap := g.limiter.SnapshotWithModelScales(scales)
+	require.EqualValues(t, 8, snap.Models["Model/A"].EffectiveMaxConcurrent)
+	require.EqualValues(t, 2, snap.Models["Model/B"].EffectiveMaxConcurrent)
+	require.EqualValues(t, 200, snap.Models["Model/A"].EffectiveMaxInputTokens)
+	require.EqualValues(t, 50, snap.Models["Model/B"].EffectiveMaxInputTokens)
+	require.EqualValues(t, 8, snap.Models["Model/A"].CapacityCapRequests)
+	require.EqualValues(t, 8, snap.Models["Model/A"].CurrentCapacityCapRequests)
+	require.EqualValues(t, 200, snap.Models["Model/A"].CapacityCapInputTokens)
+	require.EqualValues(t, 200, snap.Models["Model/A"].CurrentCapacityCapInputTokens)
+}
+
 func TestCapacityStateScaleFactorClampedTo01(t *testing.T) {
 	m := NewCapacityState()
 	m.SetEscrowMembership("X", map[string]int{"A": 1})
@@ -213,6 +245,22 @@ func TestGatewayLimiterTracksIndependentModelCounters(t *testing.T) {
 	l.ReleaseForModel("Model/A", 1)
 	require.NoError(t, l.AcquireForModel("Model/A", 1, 0.5))
 	require.ErrorContains(t, l.AcquireForModel("Model/B", 1, 0.5), "too many concurrent requests")
+}
+
+func TestGatewayLimiterUsesPerModelConfiguredCaps(t *testing.T) {
+	l := NewGatewayLimiter(4, 100)
+	l.UpdateLimits(4, 100, []GatewayModelLimitSettings{
+		{ModelID: "Model/A", MaxConcurrentRequests: 2, MaxInputTokensInFlight: 20},
+		{ModelID: "Model/B", MaxConcurrentRequests: 6, MaxInputTokensInFlight: 60},
+	})
+
+	require.NoError(t, l.AcquireForModel("Model/A", 10, 1))
+	require.NoError(t, l.AcquireForModel("Model/A", 10, 1))
+	require.ErrorContains(t, l.AcquireForModel("Model/A", 1, 1), "too many concurrent requests")
+
+	require.NoError(t, l.AcquireForModel("Model/B", 10, 1))
+	require.NoError(t, l.AcquireForModel("Model/B", 10, 1))
+	require.NoError(t, l.AcquireForModel("Model/B", 10, 1))
 }
 
 func TestGatewayLimiterAcquireBlocksWhenScaledToZero(t *testing.T) {

@@ -27,6 +27,7 @@ type GatewayLimiter struct {
 	inFlightRequests        int64
 	inFlightInputToks       int64
 	models                  map[string]limiterModelCounter
+	modelLimits             map[string]limiterModelLimits
 }
 
 type limiterModelCounter struct {
@@ -34,14 +35,34 @@ type limiterModelCounter struct {
 	inFlightInputToks int64
 }
 
+type limiterModelLimits struct {
+	maxConcurrent  int64
+	maxInputTokens int64
+}
+
 type LimiterSnapshot struct {
-	InFlightRequests        int64   `json:"in_flight_requests"`
-	InFlightInputTokens     int64   `json:"in_flight_input_tokens"`
-	MaxConcurrent           int64   `json:"max_concurrent_requests"`
-	MaxInputTokens          int64   `json:"max_input_tokens_in_flight"`
-	EffectiveMaxConcurrent  int64   `json:"effective_max_concurrent_requests"`
-	EffectiveMaxInputTokens int64   `json:"effective_max_input_tokens_in_flight"`
-	ScaleFactor             float64 `json:"scale_factor"`
+	InFlightRequests        int64                           `json:"in_flight_requests"`
+	InFlightInputTokens     int64                           `json:"in_flight_input_tokens"`
+	MaxConcurrent           int64                           `json:"max_concurrent_requests"`
+	MaxInputTokens          int64                           `json:"max_input_tokens_in_flight"`
+	EffectiveMaxConcurrent  int64                           `json:"effective_max_concurrent_requests"`
+	EffectiveMaxInputTokens int64                           `json:"effective_max_input_tokens_in_flight"`
+	ScaleFactor             float64                         `json:"scale_factor"`
+	Models                  map[string]LimiterModelSnapshot `json:"models,omitempty"`
+}
+
+type LimiterModelSnapshot struct {
+	InFlightRequests              int64   `json:"in_flight_requests"`
+	InFlightInputTokens           int64   `json:"in_flight_input_tokens"`
+	MaxConcurrent                 int64   `json:"max_concurrent_requests"`
+	MaxInputTokens                int64   `json:"max_input_tokens_in_flight"`
+	EffectiveMaxConcurrent        int64   `json:"effective_max_concurrent_requests"`
+	EffectiveMaxInputTokens       int64   `json:"effective_max_input_tokens_in_flight"`
+	CapacityCapRequests           int64   `json:"capacity_cap_requests"`
+	CurrentCapacityCapRequests    int64   `json:"current_capacity_cap_requests"`
+	CapacityCapInputTokens        int64   `json:"capacity_cap_input_tokens"`
+	CurrentCapacityCapInputTokens int64   `json:"current_capacity_cap_input_tokens"`
+	ScaleFactor                   float64 `json:"scale_factor"`
 }
 
 func NewGatewayLimiter(maxConcurrent, maxInputTokens int64) *GatewayLimiter {
@@ -52,6 +73,7 @@ func NewGatewayLimiter(maxConcurrent, maxInputTokens int64) *GatewayLimiter {
 		effectiveMaxInputTokens: maxInputTokens,
 		currentScale:            1,
 		models:                  map[string]limiterModelCounter{},
+		modelLimits:             map[string]limiterModelLimits{},
 	}
 }
 
@@ -69,10 +91,60 @@ func (l *GatewayLimiter) Snapshot() LimiterSnapshot {
 	}
 }
 
+func (l *GatewayLimiter) SnapshotWithModelScales(scales map[string]float64) LimiterSnapshot {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	snap := LimiterSnapshot{
+		InFlightRequests:        l.inFlightRequests,
+		InFlightInputTokens:     l.inFlightInputToks,
+		MaxConcurrent:           l.maxConcurrent,
+		MaxInputTokens:          l.maxInputTokens,
+		EffectiveMaxConcurrent:  l.effectiveMaxConcurrent,
+		EffectiveMaxInputTokens: l.effectiveMaxInputTokens,
+		ScaleFactor:             l.currentScale,
+	}
+	if len(scales) == 0 {
+		return snap
+	}
+	snap.Models = make(map[string]LimiterModelSnapshot, len(scales))
+	for model, scale := range scales {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		counter := l.models[model]
+		limits := l.limitsForModelLocked(model)
+		effectiveMaxConcurrent := scaleClampLimit(limits.maxConcurrent, scale)
+		effectiveMaxInputTokens := scaleClampLimit(limits.maxInputTokens, scale)
+		snap.Models[model] = LimiterModelSnapshot{
+			InFlightRequests:              counter.inFlightRequests,
+			InFlightInputTokens:           counter.inFlightInputToks,
+			MaxConcurrent:                 limits.maxConcurrent,
+			MaxInputTokens:                limits.maxInputTokens,
+			EffectiveMaxConcurrent:        effectiveMaxConcurrent,
+			EffectiveMaxInputTokens:       effectiveMaxInputTokens,
+			CapacityCapRequests:           limits.maxConcurrent,
+			CurrentCapacityCapRequests:    effectiveMaxConcurrent,
+			CapacityCapInputTokens:        limits.maxInputTokens,
+			CurrentCapacityCapInputTokens: effectiveMaxInputTokens,
+			ScaleFactor:                   scale,
+		}
+	}
+	return snap
+}
+
 func (l *GatewayLimiter) HasConfiguredLimits() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.maxConcurrent > 0 || l.maxInputTokens > 0
+	if l.maxConcurrent > 0 || l.maxInputTokens > 0 {
+		return true
+	}
+	for _, limits := range l.modelLimits {
+		if limits.maxConcurrent > 0 || limits.maxInputTokens > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateLimits replaces the baseline caps and re-derives the
@@ -80,13 +152,31 @@ func (l *GatewayLimiter) HasConfiguredLimits() bool {
 // preserved across config reloads so an operator changing the cap
 // during a deep PoC scale-down doesn't inadvertently restore full
 // capacity at exactly the worst moment.
-func (l *GatewayLimiter) UpdateLimits(maxConcurrent, maxInputTokens int64) {
+func (l *GatewayLimiter) UpdateLimits(maxConcurrent, maxInputTokens int64, modelLimits ...[]GatewayModelLimitSettings) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.maxConcurrent = maxConcurrent
 	l.maxInputTokens = maxInputTokens
+	if len(modelLimits) > 0 {
+		l.modelLimits = limiterModelLimitsByID(modelLimits[0])
+	}
 	l.effectiveMaxConcurrent = scaleClampLimit(l.maxConcurrent, l.currentScale)
 	l.effectiveMaxInputTokens = scaleClampLimit(l.maxInputTokens, l.currentScale)
+}
+
+func limiterModelLimitsByID(settings []GatewayModelLimitSettings) map[string]limiterModelLimits {
+	settings = normalizeGatewayModelLimits(settings)
+	if len(settings) == 0 {
+		return map[string]limiterModelLimits{}
+	}
+	limits := make(map[string]limiterModelLimits, len(settings))
+	for _, setting := range settings {
+		limits[setting.ModelID] = limiterModelLimits{
+			maxConcurrent:  setting.MaxConcurrentRequests,
+			maxInputTokens: setting.MaxInputTokensInFlight,
+		}
+	}
+	return limits
 }
 
 // ApplyScaleFactor scales the configured baseline caps by `scale`,
@@ -139,10 +229,9 @@ func (l *GatewayLimiter) Acquire(inputTokens int64) error {
 }
 
 // AcquireForModel uses an independent in-flight counter for model while
-// deriving that model's cap from the same operator-configured global
-// limits. The supplied scale is usually W_current(model) / W_ref(all
-// models), so models share the configured gateway limit by available
-// capacity.
+// deriving that model's cap from the same operator-configured baseline.
+// The supplied scale is usually W_current(model) / W_ref(model), so each
+// model gets its own scaled request/token budget.
 func (l *GatewayLimiter) AcquireForModel(model string, inputTokens int64, scale float64) error {
 	if inputTokens <= 0 {
 		inputTokens = 1
@@ -158,12 +247,13 @@ func (l *GatewayLimiter) acquireLocked(model string, inputTokens int64, scale fl
 		l.models = map[string]limiterModelCounter{}
 	}
 	counter := l.models[model]
-	effectiveMaxConcurrent := scaleClampLimit(l.maxConcurrent, scale)
-	effectiveMaxInputTokens := scaleClampLimit(l.maxInputTokens, scale)
-	if l.maxConcurrent > 0 && counter.inFlightRequests+1 > effectiveMaxConcurrent {
+	limits := l.limitsForModelLocked(model)
+	effectiveMaxConcurrent := scaleClampLimit(limits.maxConcurrent, scale)
+	effectiveMaxInputTokens := scaleClampLimit(limits.maxInputTokens, scale)
+	if limits.maxConcurrent > 0 && counter.inFlightRequests+1 > effectiveMaxConcurrent {
 		return fmt.Errorf("rate limit exceeded: too many concurrent requests")
 	}
-	if l.maxInputTokens > 0 && counter.inFlightInputToks+inputTokens > effectiveMaxInputTokens {
+	if limits.maxInputTokens > 0 && counter.inFlightInputToks+inputTokens > effectiveMaxInputTokens {
 		return fmt.Errorf("rate limit exceeded: too many input tokens in flight")
 	}
 
@@ -173,6 +263,15 @@ func (l *GatewayLimiter) acquireLocked(model string, inputTokens int64, scale fl
 	l.inFlightRequests++
 	l.inFlightInputToks += inputTokens
 	return nil
+}
+
+func (l *GatewayLimiter) limitsForModelLocked(model string) limiterModelLimits {
+	if l.modelLimits != nil {
+		if limits, ok := l.modelLimits[strings.TrimSpace(model)]; ok {
+			return limits
+		}
+	}
+	return limiterModelLimits{maxConcurrent: l.maxConcurrent, maxInputTokens: l.maxInputTokens}
 }
 
 func (l *GatewayLimiter) Release(inputTokens int64) {

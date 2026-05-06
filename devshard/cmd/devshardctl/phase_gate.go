@@ -40,6 +40,7 @@ type ChainPhaseSnapshot struct {
 	LastError            string    `json:"last_error,omitempty"`
 
 	pocStartBlockHeight          int64
+	epochSwitchBlockHeight       int64
 	confirmationPoCTriggerHeight int64
 }
 
@@ -73,6 +74,8 @@ type chainEpochInfoResponse struct {
 	BlockHeight             jsonInt64                         `json:"block_height"`
 	Phase                   string                            `json:"phase"`
 	LatestEpoch             chainLatestEpoch                  `json:"latest_epoch"`
+	EpochStages             chainEpochStages                  `json:"epoch_stages"`
+	NextEpochStages         chainEpochStages                  `json:"next_epoch_stages"`
 	IsConfirmationPoCActive bool                              `json:"is_confirmation_poc_active"`
 	ActiveConfirmationPoC   *chainConfirmationPoCEventPayload `json:"active_confirmation_poc_event,omitempty"`
 }
@@ -80,6 +83,12 @@ type chainEpochInfoResponse struct {
 type chainLatestEpoch struct {
 	Index               jsonUint64 `json:"index"`
 	PocStartBlockHeight jsonInt64  `json:"poc_start_block_height"`
+}
+
+type chainEpochStages struct {
+	EpochIndex       jsonUint64 `json:"epoch_index"`
+	SetNewValidators jsonInt64  `json:"set_new_validators"`
+	NextPoCStart     jsonInt64  `json:"next_poc_start"`
 }
 
 type chainConfirmationPoCEventPayload struct {
@@ -443,10 +452,10 @@ func (g *ChainPhaseGate) fetchEpochInfo() (*chainEpochInfoResponse, error) {
 // `Index`); the InferenceURL is intentionally NOT used as an identity
 // -- the chain address is the canonical participant key everywhere
 // downstream (CapacityState, ParticipantRequestLimiter, Session,
-// transport admission). Outside PoC, weights holds the chain-reported
-// participant weight. During active PoC, weights holds the sum of
-// preserved ML-node poc_weight values, so partially preserved
-// participants only contribute preserved hardware capacity.
+// transport admission). Weights are derived from raw ML-node poc_weight
+// values rather than the chain's coefficient-adjusted participant.Weight:
+// outside PoC every ML node contributes, while during active PoC only
+// preserved ML nodes contribute.
 type participantsState struct {
 	preserved      []string
 	excluded       []string
@@ -816,11 +825,12 @@ func deriveChainPhaseSnapshot(resp *chainEpochInfoResponse) ChainPhaseSnapshot {
 	}
 
 	snapshot := ChainPhaseSnapshot{
-		BlockHeight:         int64(resp.BlockHeight),
-		EpochIndex:          uint64(resp.LatestEpoch.Index),
-		EpochPhase:          deriveEpochPhase(resp),
-		LastUpdatedAt:       time.Now().UTC(),
-		pocStartBlockHeight: int64(resp.LatestEpoch.PocStartBlockHeight),
+		BlockHeight:            int64(resp.BlockHeight),
+		EpochIndex:             uint64(resp.LatestEpoch.Index),
+		EpochPhase:             deriveEpochPhase(resp),
+		LastUpdatedAt:          time.Now().UTC(),
+		pocStartBlockHeight:    int64(resp.LatestEpoch.PocStartBlockHeight),
+		epochSwitchBlockHeight: deriveEpochSwitchBlockHeight(resp),
 	}
 
 	if resp.ActiveConfirmationPoC != nil {
@@ -831,6 +841,23 @@ func deriveChainPhaseSnapshot(resp *chainEpochInfoResponse) ChainPhaseSnapshot {
 	snapshot.BlockReason = reason
 	snapshot.RequestsBlocked = rawBlocked && !relaxedPoCModeEnabled()
 	return snapshot
+}
+
+func deriveEpochSwitchBlockHeight(resp *chainEpochInfoResponse) int64 {
+	if resp == nil {
+		return 0
+	}
+	blockHeight := int64(resp.BlockHeight)
+	if resp.EpochStages.SetNewValidators > 0 && int64(resp.EpochStages.SetNewValidators) >= blockHeight {
+		return int64(resp.EpochStages.SetNewValidators)
+	}
+	if resp.NextEpochStages.SetNewValidators > 0 {
+		return int64(resp.NextEpochStages.SetNewValidators)
+	}
+	if resp.EpochStages.NextPoCStart > 0 {
+		return int64(resp.EpochStages.NextPoCStart)
+	}
+	return int64(resp.LatestEpoch.PocStartBlockHeight)
 }
 
 func deriveEpochPhase(resp *chainEpochInfoResponse) string {
@@ -887,52 +914,51 @@ func participantHasPreservedNode(participant chainActiveParticipant, snapshot *p
 	return false
 }
 
-// participantWeight returns the weight CapacityState should ingest for
-// one participant. Outside PoC this is the chain-reported participant
-// weight, used as the steady-state baseline. During PoC this is only
-// the sum of preserved ML-node poc_weight values, so a participant with
-// partial preserved hardware does not contribute its full capacity.
+// participantWeight returns the raw poc_weight CapacityState should ingest
+// for one participant. Outside PoC every ML node contributes to the
+// steady-state baseline. During PoC only preserved ML nodes contribute,
+// so a participant with partial preserved hardware does not contribute
+// its full raw capacity.
 //
-// A zero or missing API weight is propagated as 0. The phase gate does
+// Missing ML-node poc_weight data is propagated as 0. The phase gate does
 // not invent capacity from ML-node counts or default weights; the chain
-// API is the source of truth. CapacityState's own missing-key fallback
-// only applies to hosts the gate has not observed at all.
+// API's per-node poc_weight values are the source of truth.
 func participantWeight(participant chainActiveParticipant, pocActive bool, snapshot *preservedSnapshotState, preservation preservationMode) float64 {
-	if pocActive && preservation == preservationModeAll {
-		return float64(participant.Weight)
-	}
-	if pocActive {
-		return preservedNodePoCWeight(participant, snapshot, preservation)
-	}
-	return float64(participant.Weight)
-}
-
-func preservedNodePoCWeight(participant chainActiveParticipant, snapshot *preservedSnapshotState, preservation preservationMode) float64 {
 	var weight uint64
 	for i, modelNodes := range participant.MLNodes {
-		weight += modelPreservedNodePoCWeight(participant.Index, participantModelAt(participant, i), modelNodes, snapshot, preservation)
+		weight += modelNodePoCWeight(
+			participant.Index,
+			participantModelAt(participant, i),
+			modelNodes,
+			snapshot,
+			effectivePreservationMode(pocActive, preservation),
+		)
 	}
 	return float64(weight)
 }
 
 func participantWeightsByModel(participant chainActiveParticipant, pocActive bool, snapshot *preservedSnapshotState, preservation preservationMode) map[string]float64 {
 	weights := make(map[string]float64, len(participant.Models))
+	preservation = effectivePreservationMode(pocActive, preservation)
 	for i, rawModel := range participant.Models {
 		model := strings.TrimSpace(rawModel)
 		if model == "" {
-			continue
-		}
-		if !pocActive || preservation == preservationModeAll {
-			weights[model] = float64(participant.Weight)
 			continue
 		}
 		if i >= len(participant.MLNodes) {
 			weights[model] = 0
 			continue
 		}
-		weights[model] = float64(modelPreservedNodePoCWeight(participant.Index, model, participant.MLNodes[i], snapshot, preservation))
+		weights[model] = float64(modelNodePoCWeight(participant.Index, model, participant.MLNodes[i], snapshot, preservation))
 	}
 	return weights
+}
+
+func effectivePreservationMode(pocActive bool, preservation preservationMode) preservationMode {
+	if !pocActive {
+		return preservationModeAll
+	}
+	return preservation
 }
 
 func participantModelAt(participant chainActiveParticipant, index int) string {
@@ -942,7 +968,7 @@ func participantModelAt(participant chainActiveParticipant, index int) string {
 	return strings.TrimSpace(participant.Models[index])
 }
 
-func modelPreservedNodePoCWeight(participantID, model string, modelNodes chainModelMLNodes, snapshot *preservedSnapshotState, preservation preservationMode) uint64 {
+func modelNodePoCWeight(participantID, model string, modelNodes chainModelMLNodes, snapshot *preservedSnapshotState, preservation preservationMode) uint64 {
 	var weight uint64
 	for _, node := range modelNodes.MLNodes {
 		if nodePreserved(participantID, model, node, snapshot, preservation) {

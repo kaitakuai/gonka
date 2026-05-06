@@ -12,6 +12,7 @@ import (
 
 	"devshard/host"
 	"devshard/types"
+	"devshard/user"
 )
 
 func TestSseChunkHasContent(t *testing.T) {
@@ -38,8 +39,13 @@ func TestSseChunkHasContent(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "delta_reasoning",
+			name: "delta_reasoning_content",
 			body: `data: {"id":"a","choices":[{"delta":{"reasoning_content":"hmm"},"index":0}]}` + "\n\n",
+			want: true,
+		},
+		{
+			name: "delta_reasoning",
+			body: `data: {"id":"a","choices":[{"delta":{"reasoning":"hmm"},"index":0}]}` + "\n\n",
 			want: true,
 		},
 		{
@@ -71,13 +77,23 @@ func TestSseChunkHasContent(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "message_reasoning_rejected",
+			name: "message_reasoning_content_convertible",
 			body: `data: {"choices":[{"message":{"reasoning_content":"stub"}}]}` + "\n\n",
-			want: false,
+			want: true,
 		},
 		{
-			name: "message_tool_calls_rejected",
+			name: "message_reasoning_convertible",
+			body: `data: {"choices":[{"message":{"reasoning":"stub"}}]}` + "\n\n",
+			want: true,
+		},
+		{
+			name: "message_tool_calls_convertible",
 			body: `data: {"choices":[{"message":{"tool_calls":[{"id":"x"}]}}]}` + "\n\n",
+			want: true,
+		},
+		{
+			name: "message_tool_calls_empty_array",
+			body: `data: {"choices":[{"message":{"tool_calls":[]}}]}` + "\n\n",
 			want: false,
 		},
 		{
@@ -89,6 +105,11 @@ func TestSseChunkHasContent(t *testing.T) {
 		{
 			name: "malformed_json",
 			body: "data: {not_json}\n\n",
+			want: false,
+		},
+		{
+			name: "openai_error_not_content",
+			body: `data: {"error":{"code":400,"message":"bad request","type":"BadRequestError"}}` + "\n\n",
 			want: false,
 		},
 		{
@@ -128,9 +149,15 @@ func TestSseChunkContentSource(t *testing.T) {
 			wantOK:     true,
 		},
 		{
-			name:       "delta_reasoning",
+			name:       "delta_reasoning_content",
 			body:       `data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}` + "\n\n",
 			wantSource: "delta.reasoning_content",
+			wantOK:     true,
+		},
+		{
+			name:       "delta_reasoning",
+			body:       `data: {"choices":[{"delta":{"reasoning":"thinking"}}]}` + "\n\n",
+			wantSource: "delta.reasoning",
 			wantOK:     true,
 		},
 		{
@@ -151,6 +178,24 @@ func TestSseChunkContentSource(t *testing.T) {
 			name:       "message_content_convertible",
 			body:       `data: {"choices":[{"message":{"content":"stub"}}]}` + "\n\n",
 			wantSource: "message.content",
+			wantOK:     true,
+		},
+		{
+			name:       "message_reasoning_convertible",
+			body:       `data: {"choices":[{"message":{"reasoning":"stub"}}]}` + "\n\n",
+			wantSource: "message.reasoning",
+			wantOK:     true,
+		},
+		{
+			name:       "message_reasoning_content_convertible",
+			body:       `data: {"choices":[{"message":{"reasoning_content":"stub"}}]}` + "\n\n",
+			wantSource: "message.reasoning_content",
+			wantOK:     true,
+		},
+		{
+			name:       "message_tool_calls_convertible",
+			body:       `data: {"choices":[{"message":{"tool_calls":[{"id":"x"}]}}]}` + "\n\n",
+			wantSource: "message.tool_calls",
 			wantOK:     true,
 		},
 		{
@@ -179,6 +224,58 @@ func TestSseChunkContentSource(t *testing.T) {
 			require.Equal(t, tc.wantSource, src)
 		})
 	}
+}
+
+func TestSseChunkErrorSource(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantSource string
+		wantOK     bool
+	}{
+		{
+			name:       "openai_error_with_type",
+			body:       `data: {"error":{"code":400,"message":"bad request","type":"BadRequestError"}}` + "\n\n",
+			wantSource: "error.BadRequestError",
+			wantOK:     true,
+		},
+		{
+			name:       "openai_error_without_type",
+			body:       `data: {"error":{"code":500,"message":"backend failed"}}` + "\n\n",
+			wantSource: "error",
+			wantOK:     true,
+		},
+		{
+			name:       "done_only",
+			body:       "data: [DONE]\n\n",
+			wantSource: "",
+			wantOK:     false,
+		},
+		{
+			name:       "content_not_error",
+			body:       `data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\n",
+			wantSource: "",
+			wantOK:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src, ok := sseChunkErrorSource([]byte(tc.body))
+			require.Equal(t, tc.wantOK, ok)
+			require.Equal(t, tc.wantSource, src)
+		})
+	}
+}
+
+func TestSseChunkErrorDetails(t *testing.T) {
+	body := []byte(`data: {"error":{"code":400,"message":"bad request","type":"BadRequestError"}}` + "\n\n")
+
+	details, ok := sseChunkErrorDetails(body)
+
+	require.True(t, ok)
+	require.Equal(t, "400", details.Code)
+	require.Equal(t, "BadRequestError", details.Type)
+	require.Equal(t, "bad request", details.Message)
 }
 
 // TestRaceWriter_RecordsContentSourceAndSample verifies that the forensic
@@ -215,6 +312,66 @@ func TestRaceWriter_RecordsContentSourceAndSample(t *testing.T) {
 	_, err = rw.Write(more)
 	require.NoError(t, err)
 	require.Equal(t, "delta.content", inf.contentSource, "first content source wins")
+}
+
+func TestBodySampleForLog(t *testing.T) {
+	sample, truncated := bodySampleForLog([]byte("data: [DONE]\n\n"), 1024)
+	require.False(t, truncated)
+	require.Equal(t, "data: [DONE]\n\n", sample)
+
+	sample, truncated = bodySampleForLog([]byte("abcdef"), 3)
+	require.True(t, truncated)
+	require.Equal(t, "abc", sample)
+}
+
+func TestEmptyStreamBodySampleDefaultLimitIs256KB(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), emptyStreamBodySampleLimit+1)
+	sample, truncated := bodySampleForLog(payload, 0)
+
+	require.True(t, truncated)
+	require.Len(t, sample, emptyStreamBodySampleLimit)
+}
+
+func TestEmptyStreamRequestBodySampleUsesOriginalPrompt(t *testing.T) {
+	params := user.InferenceParams{
+		Model:  "Kimi/Test",
+		Prompt: []byte(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`),
+	}
+
+	sample, truncated := requestBodySampleForLog(params)
+
+	require.False(t, truncated)
+	require.JSONEq(t, `{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`, sample)
+}
+
+func TestRequestFlagsForLogOmitsPromptBody(t *testing.T) {
+	params := user.InferenceParams{
+		Model:       "moonshotai/Kimi-K2.6",
+		Prompt:      []byte(`{"model":"moonshotai/Kimi-K2.6","stream":true,"max_tokens":1024,"max_completion_tokens":10000,"tool_choice":"auto","tools":[{"type":"function"},{"type":"function"}],"messages":[{"role":"user","content":"secret prompt"}],"parallel_tool_calls":false,"temperature":0.2}`),
+		InputLength: 123,
+		MaxTokens:   1024,
+		StartedAt:   1777975740,
+	}
+
+	flags := requestFlagsForLog(params)
+
+	require.JSONEq(t, `{
+		"model":"moonshotai/Kimi-K2.6",
+		"stream":true,
+		"max_tokens":1024,
+		"max_completion_tokens":10000,
+		"tool_choice":"auto",
+		"tools_count":2,
+		"messages_count":1,
+		"parallel_tool_calls":false,
+		"temperature":0.2,
+		"input_tokens":123,
+		"signed_max_tokens":1024,
+		"started_at":1777975740
+	}`, flags)
+	require.NotContains(t, flags, "secret prompt")
+	require.NotContains(t, flags, "messages\":[")
+	require.NotContains(t, flags, "tools\":[")
 }
 
 func TestRaceWriter_MessageContentCountsAsConvertibleContent(t *testing.T) {
@@ -264,6 +421,13 @@ func TestIsEmptyStreamAttempt(t *testing.T) {
 		inf := &inflight{receiptTime: time.Now()}
 		inf.outputChunks.Store(2)
 		require.True(t, isEmptyStreamAttempt(inf))
+	})
+	t.Run("receipt_error_stream_not_empty", func(t *testing.T) {
+		inf := &inflight{receiptTime: time.Now(), errorSource: "error.BadRequestError"}
+		inf.outputChunks.Store(2)
+		require.False(t, isEmptyStreamAttempt(inf))
+		require.True(t, isErrorStreamAttempt(inf))
+		require.False(t, isFailedStreamAttempt(inf))
 	})
 	t.Run("receipt_no_bytes_at_all_stall", func(t *testing.T) {
 		// Stall pattern (369pqtgx-class): host got the receipt, then
@@ -359,6 +523,41 @@ func TestRaceWriter_EmptyAttemptDoesNotWin(t *testing.T) {
 	require.True(t, isEmptyStreamAttempt(inf))
 }
 
+func TestRaceWriter_ErrorStreamWinsAndDoesNotCountAsEmpty(t *testing.T) {
+	ctx := context.Background()
+	var sink bytes.Buffer
+	rg := newRaceGroup(ctx, ctx, "escrow-x", &sink)
+
+	inf := &inflight{
+		hostID:       "error-host",
+		escrowID:     "escrow-x",
+		nonce:        1,
+		receiptTime:  time.Now(),
+		done:         make(chan struct{}),
+		receiptCh:    make(chan struct{}),
+		firstTokenCh: make(chan struct{}),
+	}
+	rw := &raceWriter{group: rg, nonce: 1, inf: inf}
+
+	payload := []byte(`data: {"error":{"code":400,"message":"bad request","type":"BadRequestError"}}` + "\n\n" +
+		"data: [DONE]\n\n")
+	_, err := rw.Write(payload)
+	require.NoError(t, err)
+
+	require.Equal(t, uint64(1), rg.winnerNonce(), "error stream is a valid terminal response")
+	require.Contains(t, sink.String(), `"error"`)
+	require.Contains(t, sink.String(), "[DONE]")
+	require.Equal(t, int64(1), inf.outputChunks.Load())
+	require.Equal(t, int64(1), inf.contentChunks.Load())
+	require.Equal(t, "error.BadRequestError", inf.errorSource)
+	require.Equal(t, "400", inf.errorCode)
+	require.Equal(t, "BadRequestError", inf.errorType)
+	require.Equal(t, "bad request", inf.errorMessage)
+	require.Contains(t, string(inf.errorBodySample), "BadRequestError")
+	require.False(t, isEmptyStreamAttempt(inf))
+	require.True(t, isErrorStreamAttempt(inf))
+}
+
 // TestRaceWriter_ContentProducerWinsOverEmpty verifies that when one attempt
 // streams only role/DONE and a competing attempt streams real content, the
 // content-producing attempt wins, its bytes are forwarded, and the empty
@@ -437,6 +636,18 @@ func TestInflightFinished_StallHostNotFinished(t *testing.T) {
 	good.contentChunks.Store(1)
 	require.False(t, isEmptyStreamAttempt(good))
 	require.True(t, inflightFinished(good), "real producer must count as finished")
+
+	errorStream := &inflight{
+		hostID:      "error-host",
+		nonce:       7,
+		receiptTime: time.Now(),
+		resp:        resp,
+		errorSource: "error.BadRequestError",
+	}
+	errorStream.outputChunks.Store(2)
+	require.False(t, isEmptyStreamAttempt(errorStream))
+	require.True(t, inflightFinished(errorStream),
+		"error response with finish marker is a valid terminal response")
 
 	noReceipt := &inflight{
 		hostID: "in-process",

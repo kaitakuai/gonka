@@ -14,17 +14,17 @@ import (
 //   - W(e)   per-escrow effective weight, used by the gateway picker to
 //     route the next request to the escrow with the most spare
 //     effective capacity.
-//   - W_tot  gateway-wide weight using current chain weights (each host
-//     counted once, no escrow split). Reflects PoC-induced
+//   - W_tot  gateway-wide weight using current raw poc_weight capacity
+//     (each host counted once, no escrow split). Reflects PoC-induced
 //     capacity reductions.
-//   - W_ref  gateway-wide baseline using full (steady-state) chain
-//     weights, ignoring throttle and PoC. Recomputed live; the
+//   - W_ref  gateway-wide baseline using full (steady-state) raw
+//     poc_weight capacity, ignoring throttle and PoC. Recomputed live; the
 //     scale factor is W_tot / W_ref.
 //
-// Per-host weights are kept in two flavors -- full (last value seen
-// during steady-state Inference) and current (latest poll, possibly
-// reduced during PoC). The phase-gate decides which fields to update
-// via SetHostWeights' pocActive argument.
+// Per-host weights are raw poc_weight totals kept in two flavors -- full
+// (last value seen during steady-state Inference) and current (latest
+// poll, possibly reduced during PoC). The phase-gate decides which fields
+// to update via SetHostWeights' pocActive argument.
 //
 // Availability is binary: a host is either available (full weight
 // counts toward W(e)) or unavailable (drops out of W(e) and the picker
@@ -34,13 +34,13 @@ import (
 // drops W(e) on the very next request without waiting for a phase
 // poll).
 //
-// All inputs are pushed in by external owners (chain weight ingestion,
+// All inputs are pushed in by external owners (chain capacity ingestion,
 // PoC machinery, ParticipantRequestLimiter). The state never blocks on
 // I/O and is safe for concurrent use.
 type CapacityState struct {
 	mu sync.RWMutex
 
-	// Per-host chain weights. fullWeights is the last value seen
+	// Per-host raw poc_weight capacity. fullWeights is the last value seen
 	// outside PoC (steady-state baseline). currentWeights is the
 	// latest poll (matches fullWeights outside PoC, may be reduced
 	// during PoC). Only the keys we have actually observed appear in
@@ -48,7 +48,7 @@ type CapacityState struct {
 	fullWeights    map[string]float64
 	currentWeights map[string]float64
 
-	// Optional model-specific views of the same weights. When a caller
+	// Optional model-specific views of the same raw weights. When a caller
 	// asks for a known model, these maps let the picker use only the
 	// capacity that the chain reports for that model.
 	fullWeightsByModel    map[string]map[string]float64
@@ -139,7 +139,7 @@ func (m *CapacityState) recomputeTotalSlotsLocked() {
 	m.hostTotalSlots = totals
 }
 
-// SetHostWeights replaces per-host chain weights. The pocActive flag
+// SetHostWeights replaces per-host raw poc_weight capacity. The pocActive flag
 // determines whether the call is treated as a steady-state observation
 // (updates BOTH fullWeights and currentWeights) or a PoC-time
 // observation (updates only currentWeights, leaving fullWeights at the
@@ -178,7 +178,7 @@ func (m *CapacityState) SetHostWeights(weights map[string]float64, pocActive boo
 	}
 }
 
-// SetHostWeightsByModel replaces per-model, per-host chain weights. It
+// SetHostWeightsByModel replaces per-model, per-host raw poc_weight capacity. It
 // follows the same baseline/current split as SetHostWeights.
 func (m *CapacityState) SetHostWeightsByModel(weights map[string]map[string]float64, pocActive bool) {
 	if m == nil {
@@ -285,7 +285,7 @@ func (m *CapacityState) hostAvailableLocked(host string) bool {
 	return true
 }
 
-// hostCurrentWeightLocked returns the current chain weight for the
+// hostCurrentWeightLocked returns the current raw poc_weight capacity for the
 // host or 1.0 if the state has no entry (best-effort fallback so
 // routing still works before the first chain fetch lands).
 func (m *CapacityState) hostCurrentWeightLocked(host string) float64 {
@@ -307,7 +307,7 @@ func (m *CapacityState) hostCurrentWeightForModelLocked(host, model string) floa
 	return m.hostCurrentWeightLocked(host)
 }
 
-// hostFullWeightLocked returns the steady-state chain weight for the
+// hostFullWeightLocked returns the steady-state raw poc_weight capacity for the
 // host or 1.0 if no Inference-phase observation has landed yet.
 func (m *CapacityState) hostFullWeightLocked(host string) float64 {
 	if w, ok := m.fullWeights[host]; ok {
@@ -344,7 +344,7 @@ func (m *CapacityState) EscrowWeight(escrowID string) float64 {
 	return m.escrowWeightLocked(escrowID, "")
 }
 
-// EscrowWeightForModel computes W(e) using model-specific chain weights
+// EscrowWeightForModel computes W(e) using model-specific raw poc_weight capacity
 // when they have been observed for the requested model.
 func (m *CapacityState) EscrowWeightForModel(escrowID, model string) float64 {
 	if m == nil {
@@ -561,6 +561,27 @@ type CapacitySnapshot struct {
 	BaselineWeightFallback   int
 	ObservedCurrentWeightKey int
 	ObservedFullWeightKey    int
+}
+
+func (m *CapacityState) Models() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seen := make(map[string]struct{}, len(m.fullWeightsByModel)+len(m.currentWeightsByModel))
+	for model := range m.fullWeightsByModel {
+		seen[model] = struct{}{}
+	}
+	for model := range m.currentWeightsByModel {
+		seen[model] = struct{}{}
+	}
+	models := make([]string, 0, len(seen))
+	for model := range seen {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models
 }
 
 // Snapshot copies the current state.

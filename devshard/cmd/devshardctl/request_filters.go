@@ -10,12 +10,15 @@ import (
 )
 
 const MaxChatRequestBodySize = 10 * 1024 * 1024
+const MaxChatRequestChoices = 5
+const kimiK26ModelID = "moonshotai/Kimi-K2.6"
 
 type chatRequest struct {
 	Model               string `json:"model"`
 	Stream              bool   `json:"stream"`
 	MaxTokens           uint64 `json:"max_tokens"`
 	MaxCompletionTokens uint64 `json:"max_completion_tokens"`
+	N                   uint64 `json:"n"`
 }
 
 type chatRequestFilterError struct {
@@ -74,6 +77,7 @@ func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
 	}
+	stripUnsupportedChatRequestParameters(raw)
 	if err := validateUnsupportedChatRequestFields(raw); err != nil {
 		return nil, chatRequest{}, err
 	}
@@ -86,11 +90,56 @@ func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
 		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
 	}
 
-	req.MaxTokens = capOutputTokens(req.MaxTokens)
-	req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens)
-	raw["max_tokens"] = req.MaxTokens
-	raw["max_completion_tokens"] = req.MaxCompletionTokens
+	_, hasMaxTokens := raw["max_tokens"]
+	_, hasMaxCompletionTokens := raw["max_completion_tokens"]
+	switch {
+	case hasMaxTokens && hasMaxCompletionTokens:
+		req.MaxTokens = capOutputTokens(req.MaxTokens)
+		req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens)
+		if req.MaxCompletionTokens < req.MaxTokens {
+			req.MaxTokens = req.MaxCompletionTokens
+		} else {
+			req.MaxCompletionTokens = req.MaxTokens
+		}
+		raw["max_tokens"] = req.MaxTokens
+		raw["max_completion_tokens"] = req.MaxCompletionTokens
+	case hasMaxTokens:
+		req.MaxTokens = capOutputTokens(req.MaxTokens)
+		raw["max_tokens"] = req.MaxTokens
+	case hasMaxCompletionTokens:
+		req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens)
+		req.MaxTokens = req.MaxCompletionTokens
+		raw["max_completion_tokens"] = req.MaxCompletionTokens
+	default:
+		req.MaxTokens = capOutputTokens(0)
+		raw["max_tokens"] = req.MaxTokens
+	}
+	if _, hasN := raw["n"]; hasN {
+		req.N = capChatRequestChoices(req.N)
+		raw["n"] = req.N
+	}
 	stripUnsupportedChatRequestParameters(raw)
+
+	updatedBody, err := json.Marshal(raw)
+	if err != nil {
+		return nil, chatRequest{}, badChatRequest("marshal request: %v", err)
+	}
+	return updatedBody, req, nil
+}
+
+func applyKimiRequestOverrides(body []byte, req chatRequest, model string) ([]byte, chatRequest, error) {
+	if model != kimiK26ModelID {
+		return body, req, nil
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
+	}
+	raw["stream"] = true
+	raw["tool_choice"] = "none"
+	stripUnsupportedChatRequestParameters(raw)
+	req.Stream = true
 
 	updatedBody, err := json.Marshal(raw)
 	if err != nil {
@@ -109,9 +158,17 @@ func capOutputTokens(value uint64) uint64 {
 	return value
 }
 
+func capChatRequestChoices(value uint64) uint64 {
+	if value > MaxChatRequestChoices {
+		return MaxChatRequestChoices
+	}
+	return value
+}
+
 func stripUnsupportedChatRequestParameters(request map[string]any) {
 	delete(request, "presence_penalty")
 	delete(request, "frequency_penalty")
+	delete(request, "structured_outputs")
 }
 
 func validateUnsupportedChatRequestFields(request map[string]any) error {

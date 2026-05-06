@@ -27,18 +27,15 @@ import (
 // offending host is recorded as non-responsive in the local PerfTracker.
 var errEmptyStream = errors.New("empty content stream")
 
+const emptyStreamBodySampleLimit = 256 * 1024
+
 // sseChunkHasContent reports whether the given bytes contain at least one SSE
-// data event carrying a content payload that a streaming OpenAI-compatible
-// client would actually render. Only `choices[].delta.content`,
-// `choices[].delta.reasoning_content`, and `choices[].delta.tool_calls`
-// qualify.
+// data event carrying a non-empty payload that an OpenAI-compatible client can
+// surface. `content`, `reasoning`, `reasoning_content`, and non-empty
+// `tool_calls` all qualify in both streaming `delta` and non-streaming
+// `message` shapes.
 //
 // Deliberately NOT treated as content (even though earlier versions did):
-//   - `choices[].message.*` — the non-streaming response shape. A backend
-//     that wraps this inside an SSE `data:` event for a `stream=true` request
-//     is misbehaving; streaming clients parse `delta` and see nothing. We
-//     observed a mainnet host using exactly this trick to win races with a
-//     single event while delivering no tokens to the user.
 //   - `choices[].text` — the legacy `/v1/completions` shape. The proxy's
 //     streaming path only serves `/v1/chat/completions`; a host emitting
 //     `text` here produces the same "1 chunk, 0 rendered tokens" failure.
@@ -52,11 +49,9 @@ func sseChunkHasContent(p []byte) bool {
 
 // sseChunkContentSource is the classifying variant of sseChunkHasContent: when
 // content is present it returns a short label identifying the field that
-// carried it ("delta.content", "delta.reasoning_content", "delta.tool_calls",
-// or the convertible completion shape "message.content"). The second return
-// value is false when no accepted content was found. Used for forensic logging
-// so we can tell, after the fact, exactly which field a short-content winner
-// was emitting.
+// carried it. The second return value is false when no accepted content was
+// found. Used for forensic logging so we can tell, after the fact, exactly
+// which field a short-content winner was emitting.
 func sseChunkContentSource(p []byte) (string, bool) {
 	if len(p) == 0 {
 		return "", false
@@ -74,11 +69,15 @@ func sseChunkContentSource(p []byte) (string, bool) {
 			Choices []struct {
 				Delta struct {
 					Content          string          `json:"content"`
+					Reasoning        string          `json:"reasoning"`
 					ReasoningContent string          `json:"reasoning_content"`
 					ToolCalls        json.RawMessage `json:"tool_calls"`
 				} `json:"delta"`
 				Message struct {
-					Content string `json:"content"`
+					Content          string          `json:"content"`
+					Reasoning        string          `json:"reasoning"`
+					ReasoningContent string          `json:"reasoning_content"`
+					ToolCalls        json.RawMessage `json:"tool_calls"`
 				} `json:"message"`
 			} `json:"choices"`
 		}
@@ -89,6 +88,9 @@ func sseChunkContentSource(p []byte) (string, bool) {
 			if c.Delta.Content != "" {
 				return "delta.content", true
 			}
+			if c.Delta.Reasoning != "" {
+				return "delta.reasoning", true
+			}
 			if c.Delta.ReasoningContent != "" {
 				return "delta.reasoning_content", true
 			}
@@ -98,9 +100,80 @@ func sseChunkContentSource(p []byte) (string, bool) {
 			if c.Message.Content != "" {
 				return "message.content", true
 			}
+			if c.Message.Reasoning != "" {
+				return "message.reasoning", true
+			}
+			if c.Message.ReasoningContent != "" {
+				return "message.reasoning_content", true
+			}
+			if hasJSONArrayElements(c.Message.ToolCalls) {
+				return "message.tool_calls", true
+			}
 		}
 	}
 	return "", false
+}
+
+// sseChunkErrorSource reports whether the bytes contain an OpenAI-style
+// top-level error response in an SSE data event. These responses are failures,
+// but not empty streams: the host did send a meaningful application response.
+func sseChunkErrorSource(p []byte) (string, bool) {
+	details, ok := sseChunkErrorDetails(p)
+	if !ok {
+		return "", false
+	}
+	if details.Type != "" {
+		return "error." + details.Type, true
+	}
+	return "error", true
+}
+
+type sseErrorDetails struct {
+	Code    string
+	Type    string
+	Message string
+}
+
+// sseChunkErrorDetails extracts the first OpenAI-compatible top-level error
+// from an SSE data event. The raw body is still logged separately, but these
+// fields make later grep/aggregation possible without decoding JSON by hand.
+func sseChunkErrorDetails(p []byte) (sseErrorDetails, bool) {
+	if len(p) == 0 {
+		return sseErrorDetails{}, false
+	}
+	for _, line := range bytes.Split(p, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(line[len("data:"):])
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var evt struct {
+			Error *struct {
+				Type    string `json:"type"`
+				Code    any    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(payload, &evt); err != nil {
+			continue
+		}
+		if evt.Error == nil {
+			continue
+		}
+		details := sseErrorDetails{
+			Type:    evt.Error.Type,
+			Code:    fmt.Sprint(evt.Error.Code),
+			Message: evt.Error.Message,
+		}
+		if evt.Error.Code == nil {
+			details.Code = ""
+		}
+		return details, true
+	}
+	return sseErrorDetails{}, false
 }
 
 // hasJSONArrayElements returns true if raw is a JSON array with at least one
@@ -115,6 +188,84 @@ func hasJSONArrayElements(raw json.RawMessage) bool {
 	}
 	inner := bytes.TrimSpace(trimmed[1 : len(trimmed)-1])
 	return len(inner) > 0
+}
+
+func bodySampleForLog(p []byte, limit int) (string, bool) {
+	if len(p) == 0 {
+		return "", false
+	}
+	if limit <= 0 {
+		limit = emptyStreamBodySampleLimit
+	}
+	truncated := len(p) > limit
+	if truncated {
+		p = p[:limit]
+	}
+	return string(bytes.ToValidUTF8(p, []byte("\uFFFD"))), truncated
+}
+
+func requestBodySampleForLog(params user.InferenceParams) (string, bool) {
+	return bodySampleForLog(params.Prompt, emptyStreamBodySampleLimit)
+}
+
+func requestFlagsForLog(params user.InferenceParams) string {
+	type requestFlags struct {
+		Model               string `json:"model,omitempty"`
+		Stream              *bool  `json:"stream,omitempty"`
+		MaxTokens           any    `json:"max_tokens,omitempty"`
+		MaxCompletionTokens any    `json:"max_completion_tokens,omitempty"`
+		ToolChoice          any    `json:"tool_choice,omitempty"`
+		ToolsCount          int    `json:"tools_count,omitempty"`
+		MessagesCount       int    `json:"messages_count,omitempty"`
+		ParallelToolCalls   any    `json:"parallel_tool_calls,omitempty"`
+		Temperature         any    `json:"temperature,omitempty"`
+		TopP                any    `json:"top_p,omitempty"`
+		InputTokens         uint64 `json:"input_tokens,omitempty"`
+		SignedMaxTokens     uint64 `json:"signed_max_tokens,omitempty"`
+		StartedAt           int64  `json:"started_at,omitempty"`
+		ParseError          string `json:"parse_error,omitempty"`
+	}
+
+	flags := requestFlags{
+		Model:           params.Model,
+		InputTokens:     params.InputLength,
+		SignedMaxTokens: params.MaxTokens,
+		StartedAt:       params.StartedAt,
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(params.Prompt, &raw); err != nil {
+		flags.ParseError = err.Error()
+		return marshalRequestFlags(flags)
+	}
+
+	if model, ok := raw["model"].(string); ok {
+		flags.Model = model
+	}
+	if stream, ok := raw["stream"].(bool); ok {
+		flags.Stream = &stream
+	}
+	flags.MaxTokens = raw["max_tokens"]
+	flags.MaxCompletionTokens = raw["max_completion_tokens"]
+	flags.ToolChoice = raw["tool_choice"]
+	flags.ParallelToolCalls = raw["parallel_tool_calls"]
+	flags.Temperature = raw["temperature"]
+	flags.TopP = raw["top_p"]
+	if tools, ok := raw["tools"].([]any); ok {
+		flags.ToolsCount = len(tools)
+	}
+	if messages, ok := raw["messages"].([]any); ok {
+		flags.MessagesCount = len(messages)
+	}
+	return marshalRequestFlags(flags)
+}
+
+func marshalRequestFlags(flags any) string {
+	data, err := json.Marshal(flags)
+	if err != nil {
+		return fmt.Sprintf(`{"parse_error":%q}`, err.Error())
+	}
+	return string(data)
 }
 
 // Tuning knobs — exported so they can be adjusted without code changes.
@@ -212,7 +363,7 @@ type Redundancy struct {
 	session              *user.Session
 	perf                 *PerfTracker
 	groupSize            int
-	devshardID             string
+	devshardID           string
 	model                string // escrow's registered model; used for ghost probes when no real request is around
 	metrics              *DevshardMetrics
 	onEscrowMissing      func() // called (at most once per request) when a host reports escrow not found
@@ -348,6 +499,16 @@ type inflight struct {
 	// accepted content was ever observed.
 	contentSource string
 
+	// errorSource labels the first OpenAI-style SSE error event observed. Such
+	// attempts are valid terminal responses, not empty streams for participant
+	// quarantine. Keep a small copy for later logging because winner bytes are
+	// forwarded immediately and pendingBuf is cleared.
+	errorSource     string
+	errorCode       string
+	errorType       string
+	errorMessage    string
+	errorBodySample []byte
+
 	resp *host.HostResponse
 	err  error
 	done chan struct{}
@@ -454,15 +615,29 @@ func (rw *raceWriter) Write(p []byte) (int, error) {
 	// chunks and [DONE] markers do not. Probes never produce winner content.
 	hadContentBefore := rw.inf.contentChunks.Load() > 0
 	var chunkHasContent bool
+	var chunkHasError bool
 	if !rw.inf.probe {
 		if src, ok := sseChunkContentSource(p); ok {
 			chunkHasContent = true
 			if rw.inf.contentSource == "" {
 				rw.inf.contentSource = src
 			}
+		} else if details, ok := sseChunkErrorDetails(p); ok {
+			src := "error"
+			if details.Type != "" {
+				src = "error." + details.Type
+			}
+			chunkHasError = true
+			if rw.inf.errorSource == "" {
+				rw.inf.errorSource = src
+				rw.inf.errorCode = details.Code
+				rw.inf.errorType = details.Type
+				rw.inf.errorMessage = details.Message
+				rw.inf.errorBodySample = append(rw.inf.errorBodySample, p...)
+			}
 		}
 	}
-	if chunkHasContent {
+	if chunkHasContent || chunkHasError {
 		rw.inf.contentChunks.Add(1)
 		rw.group.setWinner(rw.nonce)
 	}
@@ -630,7 +805,7 @@ func (e *Redundancy) RunInference(ctx context.Context, params user.InferencePara
 	attempts := []*inflight{primary}
 
 	// Always start the primary.
-	e.startInflight(settleCtx, primary, race)
+	e.startInflight(settleCtx, primary, race, params)
 
 	if decision.RunSecondary && decision.Delay == 0 && len(attempts) < maxAttempts {
 		logRequestStage(ctx, "secondary_immediate_start", "escrow", e.devshardID, "decision", decision.Reason)
@@ -713,7 +888,7 @@ func (e *Redundancy) prepareInflight(ctx context.Context, params user.InferenceP
 	}
 }
 
-func (e *Redundancy) startInflight(ctx context.Context, inf *inflight, race *raceGroup) {
+func (e *Redundancy) startInflight(ctx context.Context, inf *inflight, race *raceGroup, params user.InferenceParams) {
 	// Per-attempt context derived from the settle context so the background
 	// finalizer can cut off stragglers after the winner's grace window expires
 	// without disturbing the settle context itself (which is shared across all
@@ -776,24 +951,44 @@ func (e *Redundancy) startInflight(ctx context.Context, inf *inflight, race *rac
 			"output_bytes", inf.outputBytes.Load(),
 			"stream_bytes_read", streamBytes,
 		)
-		// A transport-level success that streamed bytes but produced zero
-		// content events indicates the host returned only protocol/SSE
-		// boilerplate (role chunk, [DONE]) without any delta content. Treat
-		// this as an attempt failure so redundancy can retry on a different
-		// host and the bad host gets recorded as non-responsive in the local
-		// PerfTracker. We require outputChunks > 0 to avoid penalising
-		// transports (e.g. in-process test clients) that never invoke the
-		// stream writer at all.
-		if !inf.probe && inf.outputChunks.Load() > 0 && inf.contentChunks.Load() == 0 {
-			inf.err = errEmptyStream
+		// A receipt-backed transport-level success that produced zero content
+		// events and did not produce a normal OpenAI error event is true empty
+		// SSE/protocol boilerplate. This includes protocol-only responses where
+		// stream_bytes_read > 0 but output_chunks == 0 because only devshard
+		// receipt/meta events were parsed and no inference data was forwarded to
+		// the race writer.
+		if isEmptyStreamAttempt(inf) {
+			responseBodySample, responseSampleTruncated := bodySampleForLog(inf.pendingBuf, emptyStreamBodySampleLimit)
 			// Discard any buffered bytes so they are never flushed if this
 			// attempt is later promoted incorrectly.
 			inf.pendingBuf = nil
+			inf.err = errEmptyStream
+			requestBodySample, requestSampleTruncated := requestBodySampleForLog(params)
 			logInferenceStage(ctx, inf.escrowID, inf.nonce, "empty_stream",
 				"host", inf.hostID,
 				"output_chunks", inf.outputChunks.Load(),
 				"output_bytes", inf.outputBytes.Load(),
 				"content_source", inf.contentSource,
+				"response_body_sample", responseBodySample,
+				"response_body_sample_truncated", responseSampleTruncated,
+				"request_body_sample", requestBodySample,
+				"request_body_sample_truncated", requestSampleTruncated,
+				"request_flags", requestFlagsForLog(params),
+			)
+		}
+		if !inf.probe && inf.errorSource != "" {
+			responseBodySample, responseSampleTruncated := bodySampleForLog(inf.errorBodySample, emptyStreamBodySampleLimit)
+			logInferenceStage(ctx, inf.escrowID, inf.nonce, "error_stream",
+				"host", inf.hostID,
+				"output_chunks", inf.outputChunks.Load(),
+				"output_bytes", inf.outputBytes.Load(),
+				"error_source", inf.errorSource,
+				"error_code", inf.errorCode,
+				"error_type", inf.errorType,
+				"error_message", inf.errorMessage,
+				"response_body_sample", responseBodySample,
+				"response_body_sample_truncated", responseSampleTruncated,
+				"request_flags", requestFlagsForLog(params),
 			)
 		}
 	}()
@@ -842,7 +1037,7 @@ func (e *Redundancy) startAdditionalInflight(streamCtx, settleCtx context.Contex
 	if e.metrics != nil {
 		e.metrics.RecordSpeculativeAttemptStart(reason)
 	}
-	e.startInflight(settleCtx, next, race)
+	e.startInflight(settleCtx, next, race, params)
 	return next
 }
 
@@ -1479,6 +1674,14 @@ func shouldRunHandleTimeout(inf *inflight, session *user.Session) bool {
 	return !session.IsNonceFinished(inf.nonce)
 }
 
+func isFailedStreamAttempt(inf *inflight) bool {
+	return isEmptyStreamAttempt(inf)
+}
+
+func isErrorStreamAttempt(inf *inflight) bool {
+	return inf != nil && inf.errorSource != ""
+}
+
 // inflightFinished checks the raw response for MsgFinishInference.
 // Used during the race loop before ProcessResponse has been called.
 // Non-probe attempts that completed the chain protocol but produced no
@@ -1488,7 +1691,7 @@ func inflightFinished(inf *inflight) bool {
 	if inf.err != nil || inf.resp == nil {
 		return false
 	}
-	if isEmptyStreamAttempt(inf) {
+	if isFailedStreamAttempt(inf) {
 		return false
 	}
 	return user.HasMsgFinish(inf.resp.Mempool, inf.nonce)
@@ -1510,6 +1713,9 @@ func isEmptyStreamAttempt(inf *inflight) bool {
 		return false
 	}
 	if inf.receiptTime.IsZero() {
+		return false
+	}
+	if isErrorStreamAttempt(inf) {
 		return false
 	}
 	return inf.contentChunks.Load() == 0
@@ -1609,7 +1815,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		// not be an empty stream (streamed bytes with no content). Attempts
 		// that never streamed at all (e.g. in-process clients) still count
 		// as successful purely on the protocol-level finish.
-		ok := nonceFinished && !isEmptyStreamAttempt(inf)
+		ok := nonceFinished && !isFailedStreamAttempt(inf)
 		if !inf.probe {
 			anySucceeded = anySucceeded || ok
 		}
@@ -1635,6 +1841,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 			"output_bytes", inf.outputBytes.Load(),
 			"stream_bytes_read", streamBytes,
 			"content_source", inf.contentSource,
+			"error_source", inf.errorSource,
 			"probe", inf.probe,
 		}
 		logInferenceStage(ctx, inf.escrowID, inf.nonce, "race_completed", fields...)
@@ -1791,13 +1998,13 @@ func (e *Redundancy) logRequestSettled(ctx context.Context, winnerNonce uint64, 
 }
 
 func (e *Redundancy) buildInvolvement(inf *inflight, winnerNonce uint64) HostInvolvement {
-	notEmpty := !isEmptyStreamAttempt(inf)
+	notFailedStream := !isFailedStreamAttempt(inf)
 	hi := HostInvolvement{
 		HostIdx:      inf.hostIdx,
 		Nonce:        inf.nonce,
 		OutputChunks: inf.outputChunks.Load(),
-		Responsive:   inf.resp != nil && inf.resp.ConfirmedAt > 0 && notEmpty,
-		Finished:     e.session.IsNonceFinished(inf.nonce) && notEmpty,
+		Responsive:   inf.resp != nil && inf.resp.ConfirmedAt > 0 && notFailedStream,
+		Finished:     e.session.IsNonceFinished(inf.nonce) && notFailedStream,
 		Winner:       inf.nonce == winnerNonce,
 	}
 	if !inf.sendTime.IsZero() {
@@ -1816,10 +2023,10 @@ func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams) {
 	if inf.probe {
 		return
 	}
-	// An attempt is responsive only if it confirmed receipt AND did not
-	// degenerate into an empty stream (bytes streamed with no content). A
-	// host that returns an empty stream is recorded as non-responsive so
-	// the local PerfTracker routes future requests away from it.
+	// Empty streams are participant faults and count as non-responsive. An
+	// OpenAI-style error response is different: the host responded with a
+	// meaningful application error, so it should not trigger empty-stream
+	// quarantine or be routed away as silent/non-responsive.
 	responsive := inf.resp != nil && inf.resp.ConfirmedAt > 0 && !isEmptyStreamAttempt(inf)
 	participantKey := e.participantKeyForHost(inf.hostIdx)
 	sample := RequestSample{
