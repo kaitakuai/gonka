@@ -29,6 +29,10 @@ const (
 	// emptyStreamQuarantineThreshold is the number of consecutive empty
 	// content responses before the host is temporarily quarantined.
 	emptyStreamQuarantineThreshold = 3
+	// participantProbationSuccessesAfterQuarantine keeps recently recovered hosts
+	// out of proactive pairwise/A-B routing until they prove they can finish
+	// normal inference requests again.
+	participantProbationSuccessesAfterQuarantine = 3
 	// participantStatusTransport is persisted in last_throttle_status when
 	// the last signal was a transport failure (not an HTTP 429/503).
 	participantStatusTransport = 0
@@ -108,10 +112,11 @@ type ParticipantRequestLimiter struct {
 }
 
 type participantRequestState struct {
-	tokens            float64
-	lastRefill        time.Time
-	quarantineUntil   time.Time // non-zero: wall-clock unavailability
-	emptyStreamStreak int
+	tokens                      float64
+	lastRefill                  time.Time
+	quarantineUntil             time.Time // non-zero: wall-clock unavailability
+	probationSuccessesRemaining int       // recently exited quarantine; not blocked
+	emptyStreamStreak           int
 }
 
 type ParticipantThrottleSnapshot struct {
@@ -303,6 +308,9 @@ func (l *ParticipantRequestLimiter) allow(participantKey string, now time.Time) 
 		if state.emptyStreamStreak > 0 {
 			return true
 		}
+		if l.probationActiveLocked(state) {
+			return true
+		}
 		delete(l.participants, participantKey)
 		l.persistDeleteLocked(participantKey)
 		log.Printf("participant_limit_expired participant_key=%s", participantKey)
@@ -331,13 +339,17 @@ func (l *ParticipantRequestLimiter) CanAcceptEscrow(participantKeys []string) er
 }
 
 func (l *ParticipantRequestLimiter) ObserveResult(participantKey, path string, statusCode int) {
+	l.ObserveResultWithBody(participantKey, path, statusCode, "")
+}
+
+func (l *ParticipantRequestLimiter) ObserveResultWithBody(participantKey, path string, statusCode int, body string) {
 	if participantKey == "" || statusCode <= 0 {
 		return
 	}
 	if l.metrics != nil && statusCode >= http.StatusBadRequest {
 		l.metrics.RecordParticipantTransportError(participantPathKind(path), statusCode)
 	}
-	quarantineFor := l.participantHTTPQuarantine(path, statusCode)
+	quarantineFor := l.participantHTTPQuarantine(path, statusCode, body)
 	if quarantineFor == 0 {
 		return
 	}
@@ -449,8 +461,8 @@ func (l *ParticipantRequestLimiter) ObserveStalledWinner(participantKey string) 
 	l.persistThrottledStateLocked(participantKey, state, participantStatusStalledWinner)
 }
 
-// ObserveSuccessfulInference clears any accumulated empty-stream streak for a
-// participant after a good finished response.
+// ObserveSuccessfulInference clears any accumulated empty-stream streak and
+// advances post-quarantine probation after a good finished response.
 func (l *ParticipantRequestLimiter) ObserveSuccessfulInference(participantKey string) {
 	if participantKey == "" {
 		return
@@ -468,11 +480,17 @@ func (l *ParticipantRequestLimiter) ObserveSuccessfulInference(participantKey st
 	if !ok {
 		return
 	}
-	if state.emptyStreamStreak == 0 {
+	if state.emptyStreamStreak == 0 && state.probationSuccessesRemaining == 0 {
 		return
 	}
 	state.emptyStreamStreak = 0
+	if state.probationSuccessesRemaining > 0 {
+		state.probationSuccessesRemaining--
+	}
 	if state.tokens >= l.burst && state.quarantineUntil.IsZero() {
+		if state.probationSuccessesRemaining > 0 {
+			return
+		}
 		delete(l.participants, participantKey)
 		l.persistDeleteLocked(participantKey)
 		return
@@ -607,6 +625,19 @@ func (l *ParticipantRequestLimiter) Snapshot(participantKeys []string) map[strin
 		if !quarantined {
 			l.refillLocked(state, now)
 			if state.tokens >= l.burst && state.emptyStreamStreak == 0 {
+				if l.probationActiveLocked(state) {
+					snapshot := ParticipantThrottleSnapshot{
+						Tracked:              true,
+						Quarantined:          false,
+						Blocked:              false,
+						RequestAllowed:       true,
+						AvailableForCapacity: true,
+						Tokens:               state.tokens,
+						Burst:                l.burst,
+					}
+					snapshots[key] = snapshot
+					continue
+				}
 				delete(l.participants, key)
 				l.persistDeleteLocked(key)
 				snapshots[key] = ParticipantThrottleSnapshot{
@@ -710,6 +741,32 @@ func (l *ParticipantRequestLimiter) TrackedCount() int {
 	return len(l.participants)
 }
 
+func (l *ParticipantRequestLimiter) IsRecentlyQuarantined(participantKey string) bool {
+	if participantKey == "" {
+		return false
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	state, tracked := l.participants[participantKey]
+	if !tracked {
+		return false
+	}
+	l.clearExpiredQuarantineIfAnyLocked(participantKey, state, now)
+	state, tracked = l.participants[participantKey]
+	if !tracked {
+		return false
+	}
+	if l.inQuarantineLocked(state, now) {
+		return true
+	}
+	if l.probationActiveLocked(state) {
+		return true
+	}
+	return false
+}
+
 // IsAvailable reports whether the participant is currently considered
 // available for capacity-aware routing. During quarantine the host is
 // unavailable; after legacy refills, full burst means available.
@@ -736,6 +793,9 @@ func (l *ParticipantRequestLimiter) IsAvailable(participantKey string) bool {
 	l.refillLocked(state, now)
 	if state.tokens >= l.burst {
 		if state.emptyStreamStreak > 0 {
+			return true
+		}
+		if l.probationActiveLocked(state) {
 			return true
 		}
 		delete(l.participants, participantKey)
@@ -776,10 +836,15 @@ func (l *ParticipantRequestLimiter) inQuarantineLocked(state *participantRequest
 	return !state.quarantineUntil.IsZero() && now.Before(state.quarantineUntil)
 }
 
+func (l *ParticipantRequestLimiter) probationActiveLocked(state *participantRequestState) bool {
+	return state != nil && state.probationSuccessesRemaining > 0
+}
+
 func (l *ParticipantRequestLimiter) applyQuarantineLocked(participantKey string, end time.Time, now time.Time) {
 	st := l.ensureStateLocked(participantKey, now)
 	st.tokens = 0
 	st.lastRefill = now
+	st.probationSuccessesRemaining = 0
 	if st.quarantineUntil.IsZero() || end.After(st.quarantineUntil) {
 		st.quarantineUntil = end
 	}
@@ -797,16 +862,18 @@ func (l *ParticipantRequestLimiter) clearExpiredQuarantineIfAnyLocked(key string
 		state.tokens = l.burst
 		state.lastRefill = now
 		state.emptyStreamStreak = 0
-		delete(l.participants, key)
+		state.probationSuccessesRemaining = participantProbationSuccessesAfterQuarantine
 		l.persistDeleteLocked(key)
 		log.Printf("participant_quarantine_ended participant_key=%s", key)
 	}
 }
 
-func (l *ParticipantRequestLimiter) participantHTTPQuarantine(path string, statusCode int) time.Duration {
+func (l *ParticipantRequestLimiter) participantHTTPQuarantine(path string, statusCode int, body string) time.Duration {
 	switch {
 	case isParticipantThrottleStatus(statusCode):
 		return l.httpThrottleQuarantine
+	case statusCode == http.StatusUnauthorized && participantPathKind(path) == "inference" && strings.Contains(strings.ToLower(body), "timestamp drift"):
+		return l.transportFailureQuarantine
 	case (statusCode == http.StatusNotFound || statusCode == http.StatusForbidden) && participantPathKind(path) == "inference":
 		return l.transportFailureQuarantine
 	default:

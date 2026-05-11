@@ -94,6 +94,10 @@ type RequestAdmissionController interface {
 	ObserveTransportFailure(participantKey, path string, err error)
 }
 
+type requestAdmissionBodyObserver interface {
+	ObserveResultWithBody(participantKey, path string, statusCode int, body string)
+}
+
 // ErrSSEStreamTruncated is returned when an SSE inference stream ends (clean EOF)
 // before the upstream emitted any terminator -- neither an OpenAI-style `data: [DONE]`
 // nor a protocol receipt event was observed. Treat it as truncation,
@@ -331,13 +335,14 @@ func (c *HTTPClient) handleSSELine(
 ) {
 	if !strings.HasPrefix(line, "data: ") {
 		if line != "" && !strings.HasPrefix(line, ":") && !*unexpectedLineLogged {
+			lineLen, lineHex := sseLineBytesForLog(line)
 			if strings.HasPrefix(line, "data:") {
-				logging.Warn("sse_data_line_missing_space", "subsystem", "transport", "escrow", c.escrowID, "line_prefix", truncate(line, 120))
+				logging.Warn("sse_data_line_missing_space", "subsystem", "transport", "escrow", c.escrowID, "line_prefix", truncate(line, 120), "line_len", lineLen, "line_hex", lineHex)
 			} else if strings.HasPrefix(line, "event:") || strings.HasPrefix(line, "id:") || strings.HasPrefix(line, "retry:") {
 				// Standard SSE fields we intentionally skip.
 			} else {
 				*unexpectedLineLogged = true
-				logging.Warn("sse_unexpected_line", "subsystem", "transport", "escrow", c.escrowID, "line_prefix", truncate(line, 120))
+				logging.Warn("sse_unexpected_line", "subsystem", "transport", "escrow", c.escrowID, "line_prefix", truncate(line, 120), "line_len", lineLen, "line_hex", lineHex)
 			}
 		}
 		return
@@ -463,6 +468,11 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func sseLineBytesForLog(line string) (int, string) {
+	b := []byte(line)
+	return len(b), hex.EncodeToString(b)
 }
 
 // GossipNonce sends a nonce notification to a peer.
@@ -621,17 +631,18 @@ func (c *HTTPClient) doPostRaw(ctx context.Context, path string, body []byte) (*
 		c.observeTransportFailure(path, err)
 		return nil, fmt.Errorf("POST %s: %w", url, err)
 	}
-	c.observeResult(path, resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		c.observeResultWithBody(path, resp.StatusCode, string(respBody))
 		return nil, &UpstreamStatusError{
 			Path:       path,
 			StatusCode: resp.StatusCode,
 			Body:       string(respBody),
 		}
 	}
+	c.observeResult(path, resp.StatusCode)
 
 	return resp, nil
 }
@@ -663,16 +674,17 @@ func (c *HTTPClient) doGet(ctx context.Context, url string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	c.observeResult(url, resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		c.observeResultWithBody(url, resp.StatusCode, string(respBody))
 		return nil, &UpstreamStatusError{
 			Path:       url,
 			StatusCode: resp.StatusCode,
 			Body:       string(respBody),
 		}
 	}
+	c.observeResult(url, resp.StatusCode)
 
 	return io.ReadAll(resp.Body)
 }
@@ -686,6 +698,17 @@ func (c *HTTPClient) allowRequest(path string) error {
 
 func (c *HTTPClient) observeResult(path string, statusCode int) {
 	if c == nil || c.config.Admission == nil || strings.TrimSpace(c.config.ParticipantKey) == "" {
+		return
+	}
+	c.config.Admission.ObserveResult(c.config.ParticipantKey, path, statusCode)
+}
+
+func (c *HTTPClient) observeResultWithBody(path string, statusCode int, body string) {
+	if c == nil || c.config.Admission == nil || strings.TrimSpace(c.config.ParticipantKey) == "" {
+		return
+	}
+	if observer, ok := c.config.Admission.(requestAdmissionBodyObserver); ok {
+		observer.ObserveResultWithBody(c.config.ParticipantKey, path, statusCode, body)
 		return
 	}
 	c.config.Admission.ObserveResult(c.config.ParticipantKey, path, statusCode)

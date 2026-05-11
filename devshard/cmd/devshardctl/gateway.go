@@ -183,6 +183,7 @@ func newRuntimeMux(proxy *Proxy) http.Handler {
 	mux.HandleFunc("GET /v1/debug/pending", proxy.handleDebugPending)
 	mux.HandleFunc("GET /v1/debug/state", proxy.handleDebugState)
 	mux.HandleFunc("GET /v1/debug/perf", proxy.handleDebugPerf)
+	mux.HandleFunc("GET /v1/debug/pairwise", proxy.handleDebugPairwise)
 	mux.HandleFunc("GET /v1/debug/signatures", proxy.handleDebugSignatures)
 	mux.HandleFunc("POST /v1/debug/signatures/collect", proxy.handleCollectSignatures)
 	return mux
@@ -304,6 +305,34 @@ func (rt *devshardRuntime) acceptsNewInferences() (bool, string) {
 		return true, ""
 	}
 	return false, fmt.Sprintf("phase=%s", sessionPhaseLabel(phase))
+}
+
+func runtimeSkipReasonKey(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if phase, ok := strings.CutPrefix(reason, "phase="); ok {
+		return phase
+	}
+	if reason == "" {
+		return "unknown"
+	}
+	return reason
+}
+
+func formatRuntimeSkipReasonCounts(counts map[string]int) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	reasons := make([]string, 0, len(counts))
+	for reason := range counts {
+		reasons = append(reasons, reason)
+	}
+	slices.Sort(reasons)
+
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, fmt.Sprintf("%s=%d", reason, counts[reason]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func sessionPhaseLabel(phase types.SessionPhase) string {
@@ -781,6 +810,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("/v1/debug/pending", g.handleSingleOnly)
 	mux.HandleFunc("/v1/debug/state", g.handleSingleOnly)
 	mux.HandleFunc("/v1/debug/perf", g.handleSingleOnly)
+	mux.HandleFunc("/v1/debug/pairwise", g.handleSingleOnly)
 	mux.HandleFunc("/v1/debug/signatures", g.handleSingleOnly)
 	mux.HandleFunc("/v1/debug/signatures/collect", g.handleSingleOnly)
 	mux.HandleFunc("/devshard/", g.handleDevshard)
@@ -1023,20 +1053,33 @@ func (g *Gateway) serveChatToRuntime(rt *devshardRuntime, path string, body []by
 
 func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64) (*devshardRuntime, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	var highNonceSettlementIDs []string
+	defer func() {
+		g.mu.Unlock()
+		for _, id := range highNonceSettlementIDs {
+			g.scheduleAutoSettlement(id, "high_nonce")
+		}
+	}()
 
 	var candidates []*devshardRuntime
+	skipReasonCounts := make(map[string]int)
 	for _, rt := range g.runtimeOrder {
+		if g.deactivateHighNonceRuntimeLocked(rt) {
+			highNonceSettlementIDs = append(highNonceSettlementIDs, rt.id)
+			skipReasonCounts["high_nonce"]++
+			continue
+		}
 		ok, reason := rt.acceptsNewInferences()
 		if !ok {
-			if rt != nil {
-				log.Printf("gateway: skipping escrow %s for new inference: %s", rt.id, reason)
-			}
+			skipReasonCounts[runtimeSkipReasonKey(reason)]++
 			continue
 		}
 		candidates = append(candidates, rt)
 	}
 	if len(candidates) == 0 {
+		if summary := formatRuntimeSkipReasonCounts(skipReasonCounts); summary != "" {
+			return nil, fmt.Errorf("no devshard runtimes available for new inferences (skipped: %s)", summary)
+		}
 		return nil, fmt.Errorf("no devshard runtimes available for new inferences")
 	}
 	if requestModel != "" {
@@ -1092,6 +1135,26 @@ func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64)
 		g.metrics.RecordPickerChoice(chosen.id, chosen.model)
 	}
 	return chosen, nil
+}
+
+func (g *Gateway) deactivateHighNonceRuntimeLocked(rt *devshardRuntime) bool {
+	if rt == nil || !rt.active.Load() || rt.proxy == nil || rt.proxy.sm == nil {
+		return false
+	}
+	nonce := rt.proxy.sm.LatestNonce()
+	if nonce < nonceDeactivationLimit {
+		return false
+	}
+	rt.active.Store(false)
+	if g.store != nil {
+		if err := g.store.SetDevshardActive(rt.id, false); err != nil {
+			log.Printf("escrow_nonce_high_deactivate_persist_failed escrow=%s nonce=%d limit=%d error=%v",
+				rt.id, nonce, nonceDeactivationLimit, err)
+		}
+	}
+	log.Printf("escrow_nonce_high escrow=%s nonce=%d limit=%d — deactivating before routing",
+		rt.id, nonce, nonceDeactivationLimit)
+	return true
 }
 
 // formatCandidateWeightsLocked returns a compact "id=W(e)" diagnostic
@@ -1477,6 +1540,13 @@ type adminRedundancyRequest struct {
 	SecondaryWaitAfterWinnerMS   *int64   `json:"secondary_wait_after_winner_ms,omitempty"`
 	ParallelAdvantageThreshold   *float64 `json:"parallel_advantage_threshold,omitempty"`
 	UnresponsiveThreshold        *float64 `json:"unresponsive_threshold,omitempty"`
+	SpeedPolicy                  *string  `json:"speed_policy,omitempty"`
+	PairwiseBudgetPercentile     *float64 `json:"pairwise_budget_percentile,omitempty"`
+	PairwiseMaxProactiveAttempts *int     `json:"pairwise_max_proactive_attempts,omitempty"`
+	PairwiseMinDirectComparisons *int     `json:"pairwise_min_direct_comparisons,omitempty"`
+	PairwiseWinnerHoldMS         *int64   `json:"pairwise_winner_hold_ms,omitempty"`
+	PairwiseWinnerHoldMinSpeedup *float64 `json:"pairwise_winner_hold_min_speedup,omitempty"`
+	PairwiseWinnerHoldMinSamples *int     `json:"pairwise_winner_hold_min_samples,omitempty"`
 }
 
 type adminPerfRequest struct {
@@ -1768,6 +1838,27 @@ func applyRedundancyRequest(settings *RedundancySettings, req *adminRedundancyRe
 	if req.UnresponsiveThreshold != nil {
 		settings.UnresponsiveThreshold = *req.UnresponsiveThreshold
 	}
+	if req.SpeedPolicy != nil {
+		settings.SpeedPolicy = normalizeRedundancySpeedPolicy(*req.SpeedPolicy)
+	}
+	if req.PairwiseBudgetPercentile != nil {
+		settings.PairwiseBudgetPercentile = *req.PairwiseBudgetPercentile
+	}
+	if req.PairwiseMaxProactiveAttempts != nil {
+		settings.PairwiseMaxProactiveAttempts = *req.PairwiseMaxProactiveAttempts
+	}
+	if req.PairwiseMinDirectComparisons != nil {
+		settings.PairwiseMinDirectComparisons = *req.PairwiseMinDirectComparisons
+	}
+	if req.PairwiseWinnerHoldMS != nil {
+		settings.PairwiseWinnerHoldMS = *req.PairwiseWinnerHoldMS
+	}
+	if req.PairwiseWinnerHoldMinSpeedup != nil {
+		settings.PairwiseWinnerHoldMinSpeedup = *req.PairwiseWinnerHoldMinSpeedup
+	}
+	if req.PairwiseWinnerHoldMinSamples != nil {
+		settings.PairwiseWinnerHoldMinSamples = *req.PairwiseWinnerHoldMinSamples
+	}
 }
 
 func applyPerfRequest(settings *PerfSettings, req *adminPerfRequest) {
@@ -1833,6 +1924,22 @@ func validateGatewaySettings(settings GatewaySettings) error {
 		return fmt.Errorf("redundancy.parallel_advantage_threshold must be > 0 and < 1")
 	case r.UnresponsiveThreshold <= 0 || r.UnresponsiveThreshold > 1:
 		return fmt.Errorf("redundancy.unresponsive_threshold must be > 0 and <= 1")
+	case normalizeRedundancySpeedPolicy(r.SpeedPolicy) != RedundancySpeedPolicyLegacy &&
+		normalizeRedundancySpeedPolicy(r.SpeedPolicy) != RedundancySpeedPolicyHybrid &&
+		normalizeRedundancySpeedPolicy(r.SpeedPolicy) != RedundancySpeedPolicyPairwise:
+		return fmt.Errorf("redundancy.speed_policy must be one of legacy, hybrid, pairwise")
+	case r.PairwiseBudgetPercentile <= 0 || r.PairwiseBudgetPercentile >= 1:
+		return fmt.Errorf("redundancy.pairwise_budget_percentile must be > 0 and < 1")
+	case r.PairwiseMaxProactiveAttempts <= 0:
+		return fmt.Errorf("redundancy.pairwise_max_proactive_attempts must be > 0")
+	case r.PairwiseMinDirectComparisons <= 0:
+		return fmt.Errorf("redundancy.pairwise_min_direct_comparisons must be > 0")
+	case r.PairwiseWinnerHoldMS < 0:
+		return fmt.Errorf("redundancy.pairwise_winner_hold_ms must be >= 0")
+	case r.PairwiseWinnerHoldMinSpeedup <= 0 || r.PairwiseWinnerHoldMinSpeedup >= 1:
+		return fmt.Errorf("redundancy.pairwise_winner_hold_min_speedup must be > 0 and < 1")
+	case r.PairwiseWinnerHoldMinSamples <= 0:
+		return fmt.Errorf("redundancy.pairwise_winner_hold_min_samples must be > 0")
 	}
 	perf := settings.Perf
 	switch {

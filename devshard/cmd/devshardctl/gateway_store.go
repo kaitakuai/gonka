@@ -59,6 +59,13 @@ type RedundancySettings struct {
 	SecondaryWaitAfterWinnerMS   int64   `json:"secondary_wait_after_winner_ms"`
 	ParallelAdvantageThreshold   float64 `json:"parallel_advantage_threshold"`
 	UnresponsiveThreshold        float64 `json:"unresponsive_threshold"`
+	SpeedPolicy                  string  `json:"speed_policy"`
+	PairwiseBudgetPercentile     float64 `json:"pairwise_budget_percentile"`
+	PairwiseMaxProactiveAttempts int     `json:"pairwise_max_proactive_attempts"`
+	PairwiseMinDirectComparisons int     `json:"pairwise_min_direct_comparisons"`
+	PairwiseWinnerHoldMS         int64   `json:"pairwise_winner_hold_ms"`
+	PairwiseWinnerHoldMinSpeedup float64 `json:"pairwise_winner_hold_min_speedup"`
+	PairwiseWinnerHoldMinSamples int     `json:"pairwise_winner_hold_min_samples"`
 }
 
 type PerfSettings struct {
@@ -95,6 +102,27 @@ func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 	}
 	if s.Redundancy == (RedundancySettings{}) {
 		s.Redundancy = redundancyDefaults
+	}
+	if s.Redundancy.SpeedPolicy == "" {
+		s.Redundancy.SpeedPolicy = redundancyDefaults.SpeedPolicy
+	}
+	if s.Redundancy.PairwiseBudgetPercentile == 0 {
+		s.Redundancy.PairwiseBudgetPercentile = redundancyDefaults.PairwiseBudgetPercentile
+	}
+	if s.Redundancy.PairwiseMaxProactiveAttempts == 0 {
+		s.Redundancy.PairwiseMaxProactiveAttempts = redundancyDefaults.PairwiseMaxProactiveAttempts
+	}
+	if s.Redundancy.PairwiseMinDirectComparisons == 0 {
+		s.Redundancy.PairwiseMinDirectComparisons = redundancyDefaults.PairwiseMinDirectComparisons
+	}
+	if s.Redundancy.PairwiseWinnerHoldMS == 0 {
+		s.Redundancy.PairwiseWinnerHoldMS = redundancyDefaults.PairwiseWinnerHoldMS
+	}
+	if s.Redundancy.PairwiseWinnerHoldMinSpeedup == 0 {
+		s.Redundancy.PairwiseWinnerHoldMinSpeedup = redundancyDefaults.PairwiseWinnerHoldMinSpeedup
+	}
+	if s.Redundancy.PairwiseWinnerHoldMinSamples == 0 {
+		s.Redundancy.PairwiseWinnerHoldMinSamples = redundancyDefaults.PairwiseWinnerHoldMinSamples
 	}
 	if s.Perf == (PerfSettings{}) {
 		s.Perf = perfDefaults
@@ -206,6 +234,13 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			redundancy_secondary_wait_after_winner_ms INTEGER NOT NULL DEFAULT 300000,
 			redundancy_parallel_advantage_threshold REAL NOT NULL DEFAULT 0.5,
 			redundancy_unresponsive_threshold REAL NOT NULL DEFAULT 1.0,
+			redundancy_speed_policy TEXT NOT NULL DEFAULT 'hybrid',
+			redundancy_pairwise_budget_percentile REAL NOT NULL DEFAULT 0.9,
+			redundancy_pairwise_max_proactive_attempts INTEGER NOT NULL DEFAULT 3,
+			redundancy_pairwise_min_direct_comparisons INTEGER NOT NULL DEFAULT 4,
+			redundancy_pairwise_winner_hold_ms INTEGER NOT NULL DEFAULT 500,
+			redundancy_pairwise_winner_hold_min_speedup REAL NOT NULL DEFAULT 0.1,
+			redundancy_pairwise_winner_hold_min_samples INTEGER NOT NULL DEFAULT 6,
 			perf_sample_size INTEGER NOT NULL DEFAULT 256,
 			perf_window_ms INTEGER NOT NULL DEFAULT 3600000,
 			escrow_rotation_enabled INTEGER NOT NULL DEFAULT 0,
@@ -336,7 +371,11 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		       redundancy_per_input_token_first_token_lag_ms, redundancy_inter_chunk_stall_timeout_ms,
 		       redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
 		       redundancy_secondary_wait_after_winner_ms, redundancy_parallel_advantage_threshold,
-		       redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms,
+		       redundancy_unresponsive_threshold, redundancy_speed_policy, redundancy_pairwise_budget_percentile,
+		       redundancy_pairwise_max_proactive_attempts, redundancy_pairwise_min_direct_comparisons,
+		       redundancy_pairwise_winner_hold_ms, redundancy_pairwise_winner_hold_min_speedup,
+		       redundancy_pairwise_winner_hold_min_samples,
+		       perf_sample_size, perf_window_ms,
 		       escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_models_json,
 	       gateway_disabled_enabled, gateway_disabled_message, gateway_disabled_new_url
 		FROM gateway_settings
@@ -372,6 +411,13 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.Redundancy.SecondaryWaitAfterWinnerMS,
 		&state.Settings.Redundancy.ParallelAdvantageThreshold,
 		&state.Settings.Redundancy.UnresponsiveThreshold,
+		&state.Settings.Redundancy.SpeedPolicy,
+		&state.Settings.Redundancy.PairwiseBudgetPercentile,
+		&state.Settings.Redundancy.PairwiseMaxProactiveAttempts,
+		&state.Settings.Redundancy.PairwiseMinDirectComparisons,
+		&state.Settings.Redundancy.PairwiseWinnerHoldMS,
+		&state.Settings.Redundancy.PairwiseWinnerHoldMinSpeedup,
+		&state.Settings.Redundancy.PairwiseWinnerHoldMinSamples,
 		&state.Settings.Perf.SampleSize,
 		&state.Settings.Perf.WindowMS,
 		&rotationEnabled,
@@ -471,11 +517,15 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 			redundancy_per_input_token_first_token_lag_ms, redundancy_inter_chunk_stall_timeout_ms,
 			redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
 			redundancy_secondary_wait_after_winner_ms, redundancy_parallel_advantage_threshold,
-			redundancy_unresponsive_threshold, perf_sample_size, perf_window_ms,
+			redundancy_unresponsive_threshold, redundancy_speed_policy, redundancy_pairwise_budget_percentile,
+			redundancy_pairwise_max_proactive_attempts, redundancy_pairwise_min_direct_comparisons,
+			redundancy_pairwise_winner_hold_ms, redundancy_pairwise_winner_hold_min_speedup,
+			redundancy_pairwise_winner_hold_min_samples,
+			perf_sample_size, perf_window_ms,
 			escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_models_json,
 			gateway_disabled_enabled, gateway_disabled_message, gateway_disabled_new_url,
 			updated_at
-		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(settings.ChainREST),
 		strings.TrimSpace(settings.PublicAPI),
 		strings.TrimSpace(settings.DefaultModel),
@@ -501,6 +551,13 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 		settings.Redundancy.SecondaryWaitAfterWinnerMS,
 		settings.Redundancy.ParallelAdvantageThreshold,
 		settings.Redundancy.UnresponsiveThreshold,
+		settings.Redundancy.SpeedPolicy,
+		settings.Redundancy.PairwiseBudgetPercentile,
+		settings.Redundancy.PairwiseMaxProactiveAttempts,
+		settings.Redundancy.PairwiseMinDirectComparisons,
+		settings.Redundancy.PairwiseWinnerHoldMS,
+		settings.Redundancy.PairwiseWinnerHoldMinSpeedup,
+		settings.Redundancy.PairwiseWinnerHoldMinSamples,
 		settings.Perf.SampleSize,
 		settings.Perf.WindowMS,
 		gatewayBoolToInt(settings.EscrowRotation.Enabled),
@@ -551,6 +608,13 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    redundancy_secondary_wait_after_winner_ms = ?,
 		    redundancy_parallel_advantage_threshold = ?,
 		    redundancy_unresponsive_threshold = ?,
+		    redundancy_speed_policy = ?,
+		    redundancy_pairwise_budget_percentile = ?,
+		    redundancy_pairwise_max_proactive_attempts = ?,
+		    redundancy_pairwise_min_direct_comparisons = ?,
+		    redundancy_pairwise_winner_hold_ms = ?,
+		    redundancy_pairwise_winner_hold_min_speedup = ?,
+		    redundancy_pairwise_winner_hold_min_samples = ?,
 		    perf_sample_size = ?,
 		    perf_window_ms = ?,
 		    escrow_rotation_enabled = ?,
@@ -586,6 +650,13 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		settings.Redundancy.SecondaryWaitAfterWinnerMS,
 		settings.Redundancy.ParallelAdvantageThreshold,
 		settings.Redundancy.UnresponsiveThreshold,
+		settings.Redundancy.SpeedPolicy,
+		settings.Redundancy.PairwiseBudgetPercentile,
+		settings.Redundancy.PairwiseMaxProactiveAttempts,
+		settings.Redundancy.PairwiseMinDirectComparisons,
+		settings.Redundancy.PairwiseWinnerHoldMS,
+		settings.Redundancy.PairwiseWinnerHoldMinSpeedup,
+		settings.Redundancy.PairwiseWinnerHoldMinSamples,
 		settings.Perf.SampleSize,
 		settings.Perf.WindowMS,
 		gatewayBoolToInt(settings.EscrowRotation.Enabled),
@@ -928,6 +999,13 @@ func ensureGatewaySettingsTuningColumns(db *sql.DB) error {
 		{"redundancy_secondary_wait_after_winner_ms", "INTEGER NOT NULL DEFAULT 300000"},
 		{"redundancy_parallel_advantage_threshold", "REAL NOT NULL DEFAULT 0.5"},
 		{"redundancy_unresponsive_threshold", "REAL NOT NULL DEFAULT 1.0"},
+		{"redundancy_speed_policy", "TEXT NOT NULL DEFAULT 'hybrid'"},
+		{"redundancy_pairwise_budget_percentile", "REAL NOT NULL DEFAULT 0.9"},
+		{"redundancy_pairwise_max_proactive_attempts", "INTEGER NOT NULL DEFAULT 3"},
+		{"redundancy_pairwise_min_direct_comparisons", "INTEGER NOT NULL DEFAULT 4"},
+		{"redundancy_pairwise_winner_hold_ms", "INTEGER NOT NULL DEFAULT 500"},
+		{"redundancy_pairwise_winner_hold_min_speedup", "REAL NOT NULL DEFAULT 0.1"},
+		{"redundancy_pairwise_winner_hold_min_samples", "INTEGER NOT NULL DEFAULT 6"},
 		{"perf_sample_size", "INTEGER NOT NULL DEFAULT 256"},
 		{"perf_window_ms", "INTEGER NOT NULL DEFAULT 3600000"},
 	}

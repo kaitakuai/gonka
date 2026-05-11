@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"log"
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -196,20 +197,22 @@ func (r *hostRing) stats(participantKey string, hostIdx int, windowStart time.Ti
 
 // HostInvolvement describes one host's participation in a user request.
 type HostInvolvement struct {
-	HostIdx       int     `json:"host_idx"`
-	Nonce         uint64  `json:"nonce"`
-	OutputChunks  int64   `json:"output_chunks"`
-	ReceiptTimeMs float64 `json:"receipt_time_ms"`
-	FirstTokenMs  float64 `json:"first_token_ms"`
-	TotalTimeMs   float64 `json:"total_time_ms"`
-	Responsive    bool    `json:"responsive"`
-	Finished      bool    `json:"finished"`
-	Winner        bool    `json:"winner"`
+	HostIdx        int     `json:"host_idx"`
+	ParticipantKey string  `json:"participant_key,omitempty"`
+	Nonce          uint64  `json:"nonce"`
+	OutputChunks   int64   `json:"output_chunks"`
+	ReceiptTimeMs  float64 `json:"receipt_time_ms"`
+	FirstTokenMs   float64 `json:"first_token_ms"`
+	TotalTimeMs    float64 `json:"total_time_ms"`
+	Responsive     bool    `json:"responsive"`
+	Finished       bool    `json:"finished"`
+	Winner         bool    `json:"winner"`
 }
 
 // RequestRecord logs a single user-facing inference request.
 type RequestRecord struct {
 	Timestamp     time.Time         `json:"timestamp"`
+	Model         string            `json:"model,omitempty"`
 	InputTokens   uint64            `json:"input_tokens"`
 	WinnerHostIdx int               `json:"winner_host_idx"`
 	WinnerNonce   uint64            `json:"winner_nonce"`
@@ -217,7 +220,10 @@ type RequestRecord struct {
 	Hosts         []HostInvolvement `json:"hosts"`
 }
 
-const requestLogSize = 256
+const (
+	requestLogSize             = 4096
+	firstTokenBucketSampleSize = 100
+)
 
 type requestRing struct {
 	records [requestLogSize]RequestRecord
@@ -246,14 +252,21 @@ func (r *requestRing) all() []RequestRecord {
 }
 
 type PerfTracker struct {
-	mu       sync.RWMutex
-	hosts    map[string]*hostRing
-	requests requestRing
-	store    *PerfStore
+	mu                sync.RWMutex
+	hosts             map[string]*hostRing
+	requests          requestRing
+	firstTokenBuckets map[string]*firstTokenBucketRing
+	pairwise          *PairwiseTracker
+	store             *PerfStore
 }
 
 func NewPerfTracker(store *PerfStore) *PerfTracker {
-	pt := &PerfTracker{hosts: make(map[string]*hostRing), store: store}
+	pt := &PerfTracker{
+		hosts:             make(map[string]*hostRing),
+		firstTokenBuckets: make(map[string]*firstTokenBucketRing),
+		pairwise:          NewPairwiseTracker(),
+		store:             store,
+	}
 	if store != nil {
 		pt.loadFromStore()
 	}
@@ -286,6 +299,10 @@ func (t *PerfTracker) loadFromStore() {
 	}
 	for _, r := range records {
 		t.requests.add(r)
+		t.recordFirstTokenSampleLocked(r)
+		if t.pairwise != nil {
+			t.pairwise.RecordRequest(r)
+		}
 	}
 
 	if len(samples) > 0 || len(records) > 0 {
@@ -426,7 +443,11 @@ func estimatedTimeFromStats(st HostPerfStats, inputTokens uint64) float64 {
 func (t *PerfTracker) RecordRequest(rec RequestRecord) {
 	t.mu.Lock()
 	t.requests.add(rec)
+	t.recordFirstTokenSampleLocked(rec)
 	t.mu.Unlock()
+	if t.pairwise != nil {
+		t.pairwise.RecordRequest(rec)
+	}
 
 	if t.store != nil {
 		if err := t.store.InsertRequest(rec); err != nil {
@@ -439,6 +460,33 @@ func (t *PerfTracker) RecentRequests() []RequestRecord {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.requests.all()
+}
+
+func (t *PerfTracker) FirstTokenFallbackDelay(model string, inputTokens uint64) (time.Duration, bool) {
+	if t == nil {
+		return 0, false
+	}
+	key := firstTokenBucketKey(model, inputTokens)
+	t.mu.RLock()
+	ring := t.firstTokenBuckets[key]
+	if ring == nil || ring.count < firstTokenBucketSampleSize {
+		t.mu.RUnlock()
+		return 0, false
+	}
+	samples := ring.all()
+	t.mu.RUnlock()
+	delay := percentileDuration(samples, 0.95)
+	if delay <= 0 {
+		return 0, false
+	}
+	return delay, true
+}
+
+func (t *PerfTracker) PairwiseSummaries() []PairwiseSummary {
+	if t == nil || t.pairwise == nil {
+		return nil
+	}
+	return t.pairwise.Summaries()
 }
 
 func (t *PerfTracker) IsUnresponsive(hostIdx int) bool {
@@ -478,6 +526,97 @@ func perfSampleKey(s RequestSample) string {
 
 func legacyHostPerfKey(hostIdx int) string {
 	return fmt.Sprintf("host:%d", hostIdx)
+}
+
+type firstTokenBucketRing struct {
+	samples [firstTokenBucketSampleSize]time.Duration
+	pos     int
+	count   int
+}
+
+func (r *firstTokenBucketRing) add(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	r.samples[r.pos] = d
+	r.pos = (r.pos + 1) % len(r.samples)
+	if r.count < len(r.samples) {
+		r.count++
+	}
+}
+
+func (r *firstTokenBucketRing) all() []time.Duration {
+	if r == nil || r.count == 0 {
+		return nil
+	}
+	out := make([]time.Duration, r.count)
+	for i := 0; i < r.count; i++ {
+		idx := (r.pos - r.count + i + len(r.samples)) % len(r.samples)
+		out[i] = r.samples[idx]
+	}
+	return out
+}
+
+func (t *PerfTracker) recordFirstTokenSampleLocked(rec RequestRecord) {
+	if t == nil || rec.Model == "" || rec.InputTokens == 0 {
+		return
+	}
+	for _, host := range rec.Hosts {
+		if !host.Winner || !host.Finished || !host.Responsive || host.FirstTokenMs <= 0 {
+			continue
+		}
+		key := firstTokenBucketKey(rec.Model, rec.InputTokens)
+		ring := t.firstTokenBuckets[key]
+		if ring == nil {
+			ring = &firstTokenBucketRing{}
+			t.firstTokenBuckets[key] = ring
+		}
+		ring.add(time.Duration(host.FirstTokenMs) * time.Millisecond)
+		return
+	}
+}
+
+func firstTokenBucketKey(model string, inputTokens uint64) string {
+	return model + "\x00" + firstTokenInputBucket(inputTokens)
+}
+
+func firstTokenInputBucket(inputTokens uint64) string {
+	switch {
+	case inputTokens < 2_000:
+		return "lt_2k"
+	case inputTokens < 4_000:
+		return "2k_4k"
+	case inputTokens < 8_000:
+		return "4k_8k"
+	case inputTokens < 16_000:
+		return "8k_16k"
+	case inputTokens < 32_000:
+		return "16k_32k"
+	case inputTokens < 64_000:
+		return "32k_64k"
+	case inputTokens < 128_000:
+		return "64k_128k"
+	case inputTokens < 256_000:
+		return "128k_256k"
+	default:
+		return "gte_256k"
+	}
+}
+
+func percentileDuration(values []time.Duration, q float64) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := int(math.Ceil(q*float64(len(sorted)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
 }
 
 func participantPerfWindowStart(participantKey string, now time.Time) time.Time {

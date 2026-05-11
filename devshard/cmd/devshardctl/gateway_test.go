@@ -960,6 +960,28 @@ func TestGatewayChooseRuntimeSkipsInactiveDevshard(t *testing.T) {
 	require.Equal(t, "6", chosen.id)
 }
 
+func TestGatewayChooseRuntimeDeactivatesHighNonceBeforeRouting(t *testing.T) {
+	highNonce := gatewayTestRuntimeForLimits(t, "6", balanceMinimumThreshold, nonceDeactivationLimit)
+	available := gatewayTestRuntimeForLimits(t, "12", balanceMinimumThreshold, nonceDeactivationLimit-1)
+	g := NewGateway([]*devshardRuntime{highNonce, available}, NewGatewayLimiter(0, 0), "m")
+
+	chosen, err := g.reserveRuntimeForModel("m", 5)
+	require.NoError(t, err)
+	require.Equal(t, "12", chosen.id)
+	require.False(t, highNonce.active.Load())
+}
+
+func TestGatewayChooseRuntimeFailsWhenAllDevshardsHighNonce(t *testing.T) {
+	rt := gatewayTestRuntimeForLimits(t, "6", balanceMinimumThreshold, nonceDeactivationLimit)
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "m")
+
+	_, err := g.reserveRuntimeForModel("m", 5)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no devshard runtimes available for new inferences")
+	require.Contains(t, err.Error(), "skipped: high_nonce=1")
+	require.False(t, rt.active.Load())
+}
+
 func TestGatewayChooseRuntimeSkipsNonActivePhaseDevshard(t *testing.T) {
 	finalizing := &devshardRuntime{id: "6", model: "m", proxy: &Proxy{sm: gatewayTestStateMachineInPhase(t, types.PhaseFinalizing)}}
 	settlement := &devshardRuntime{id: "9", model: "m", proxy: &Proxy{sm: gatewayTestStateMachineInPhase(t, types.PhaseSettlement)}}
@@ -979,6 +1001,7 @@ func TestGatewayChooseRuntimeFailsWhenOnlyNonActivePhaseDevshardsRemain(t *testi
 	_, err := g.reserveRuntimeForModel("m", 5)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no devshard runtimes available for new inferences")
+	require.Contains(t, err.Error(), "skipped: finalizing=1, settlement=1")
 }
 
 func TestGatewayExplicitChatRouteRejectsNonActivePhaseDevshard(t *testing.T) {
@@ -1233,6 +1256,16 @@ func TestParticipantRequestLimiterInferenceRouteFailureUsesShortQuarantine(t *te
 	require.True(t, limiter.allow("forbidden-host", t0.Add(transportFailureQuarantine+time.Second)))
 }
 
+func TestParticipantRequestLimiterTimestampDriftUsesShortQuarantine(t *testing.T) {
+	limiter := NewParticipantRequestLimiter(10, 10)
+	t0 := time.Now()
+
+	limiter.ObserveResultWithBody("drift-host", "/sessions/38/chat/completions", http.StatusUnauthorized, `{"error":"timestamp drift 64s exceeds maximum 30s"}`)
+
+	require.True(t, limiter.IsBlocked("drift-host"))
+	require.True(t, limiter.allow("drift-host", t0.Add(transportFailureQuarantine+time.Second)))
+}
+
 func TestParticipantRequestLimiterEmptyStreamQuarantineAfterThreeConsecutive(t *testing.T) {
 	limiter := NewParticipantRequestLimiter(10, 10)
 	now := time.Now()
@@ -1331,6 +1364,15 @@ func TestParticipantRequestLimiterExpiresOnFullRecovery(t *testing.T) {
 
 	now := time.Now().Add(httpThrottleQuarantine + 2*time.Second)
 	require.True(t, limiter.allow("shared-host", now))
+	require.Equal(t, 1, limiter.TrackedCount())
+	require.True(t, limiter.IsRecentlyQuarantined("shared-host"))
+
+	for i := 0; i < participantProbationSuccessesAfterQuarantine-1; i++ {
+		limiter.ObserveSuccessfulInference("shared-host")
+		require.True(t, limiter.IsRecentlyQuarantined("shared-host"))
+	}
+	limiter.ObserveSuccessfulInference("shared-host")
+	require.False(t, limiter.IsRecentlyQuarantined("shared-host"))
 	require.Equal(t, 0, limiter.TrackedCount())
 }
 

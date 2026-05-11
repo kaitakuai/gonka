@@ -56,6 +56,63 @@ func TestParticipantFailureThreshold(t *testing.T) {
 	require.True(t, perf.ParticipantFailureThresholdExceeded(key), "2 failures crosses both short and 100-sample thresholds")
 }
 
+func TestPerfTrackerFirstTokenFallbackUsesP95AfterFullBucket(t *testing.T) {
+	perf := NewPerfTracker(nil)
+	for i := 1; i <= 99; i++ {
+		perf.RecordRequest(RequestRecord{
+			Model:       "Qwen/Test",
+			InputTokens: 20_000,
+			Hosts: []HostInvolvement{{
+				FirstTokenMs: float64(i),
+				Responsive:   true,
+				Finished:     true,
+				Winner:       true,
+			}},
+		})
+	}
+	_, ok := perf.FirstTokenFallbackDelay("Qwen/Test", 20_000)
+	require.False(t, ok)
+
+	perf.RecordRequest(RequestRecord{
+		Model:       "Qwen/Test",
+		InputTokens: 20_000,
+		Hosts: []HostInvolvement{{
+			FirstTokenMs: 100,
+			Responsive:   true,
+			Finished:     true,
+			Winner:       true,
+		}},
+	})
+	delay, ok := perf.FirstTokenFallbackDelay("Qwen/Test", 20_000)
+	require.True(t, ok)
+	require.Equal(t, 95*time.Millisecond, delay)
+}
+
+func TestPerfTrackerFirstTokenFallbackBucketsByModelAndInputSize(t *testing.T) {
+	perf := NewPerfTracker(nil)
+	for i := 0; i < 100; i++ {
+		perf.RecordRequest(RequestRecord{
+			Model:       "Qwen/Test",
+			InputTokens: 20_000,
+			Hosts: []HostInvolvement{{
+				FirstTokenMs: 100,
+				Responsive:   true,
+				Finished:     true,
+				Winner:       true,
+			}},
+		})
+	}
+
+	delay, ok := perf.FirstTokenFallbackDelay("Qwen/Test", 20_000)
+	require.True(t, ok)
+	require.Equal(t, 100*time.Millisecond, delay)
+
+	_, ok = perf.FirstTokenFallbackDelay("Qwen/Test", 100_000)
+	require.False(t, ok, "different input bucket should not reuse the 16K-32K history")
+	_, ok = perf.FirstTokenFallbackDelay("Kimi/Test", 20_000)
+	require.False(t, ok, "different model should not reuse Qwen history")
+}
+
 func TestPerfStoreBackfillsLegacyEscrowSamples(t *testing.T) {
 	dir := t.TempDir()
 	legacy, err := NewPerfStore(filepath.Join(dir, "escrow-12-state.db"))

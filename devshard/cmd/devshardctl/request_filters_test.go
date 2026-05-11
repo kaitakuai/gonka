@@ -71,6 +71,62 @@ func TestNormalizeChatRequestCapsChoices(t *testing.T) {
 	require.NotContains(t, string(body), `"n"`)
 }
 
+func TestNormalizeChatRequestStripsMinTokensAboveEffectiveMax(t *testing.T) {
+	oldDefault := DefaultRequestMaxTokens
+	DefaultRequestMaxTokens = 2_000
+	t.Cleanup(func() {
+		DefaultRequestMaxTokens = oldDefault
+	})
+
+	body, req, err := normalizeChatRequest([]byte(`{
+		"max_tokens": 9999,
+		"min_tokens": 9994,
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+	require.EqualValues(t, 2_000, req.MaxTokens)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 2_000, raw["max_tokens"])
+	require.NotContains(t, raw, "min_tokens")
+}
+
+func TestNormalizeChatRequestKeepsMinTokensWithinEffectiveMax(t *testing.T) {
+	oldDefault := DefaultRequestMaxTokens
+	DefaultRequestMaxTokens = 2_000
+	t.Cleanup(func() {
+		DefaultRequestMaxTokens = oldDefault
+	})
+
+	body, req, err := normalizeChatRequest([]byte(`{
+		"max_tokens": 9999,
+		"min_tokens": 128,
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+	require.EqualValues(t, 2_000, req.MaxTokens)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 2_000, raw["max_tokens"])
+	require.EqualValues(t, 128, raw["min_tokens"])
+}
+
+func TestNormalizeChatRequestStripsEmptyTools(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"tool_choice": "auto",
+		"tools": [],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.NotContains(t, raw, "tools")
+	require.NotContains(t, raw, "tool_choice")
+}
+
 func TestApplyKimiRequestOverrides(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -86,24 +142,24 @@ func TestApplyKimiRequestOverrides(t *testing.T) {
 			body:           `{"model":"moonshotai/Kimi-K2.6","stream":false,"messages":[{"role":"user","content":"hello"}]}`,
 			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
 			model:          kimiK26ModelID,
-			wantStream:     true,
-			wantToolChoice: "none",
+			wantStream:     false,
+			wantToolChoice: nil,
 		},
 		{
 			name:           "missing stream",
 			body:           `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hello"}]}`,
 			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
 			model:          kimiK26ModelID,
-			wantStream:     true,
-			wantToolChoice: "none",
+			wantStream:     false,
+			wantToolChoice: nil,
 		},
 		{
 			name:           "default kimi model",
 			body:           `{"messages":[{"role":"user","content":"hello"}]}`,
 			req:            chatRequest{Stream: false},
 			model:          kimiK26ModelID,
-			wantStream:     true,
-			wantToolChoice: "none",
+			wantStream:     false,
+			wantToolChoice: nil,
 		},
 		{
 			name:           "already streaming",
@@ -111,23 +167,23 @@ func TestApplyKimiRequestOverrides(t *testing.T) {
 			req:            chatRequest{Model: kimiK26ModelID, Stream: true},
 			model:          kimiK26ModelID,
 			wantStream:     true,
-			wantToolChoice: "none",
+			wantToolChoice: nil,
 		},
 		{
-			name:           "tool auto becomes none",
+			name:           "tool auto preserved",
 			body:           `{"model":"moonshotai/Kimi-K2.6","stream":true,"tool_choice":"auto","tools":[{"type":"function","function":{"name":"x","description":"x","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hello"}]}`,
 			req:            chatRequest{Model: kimiK26ModelID, Stream: true},
 			model:          kimiK26ModelID,
 			wantStream:     true,
-			wantToolChoice: "none",
+			wantToolChoice: "auto",
 		},
 		{
 			name:           "structured outputs removed",
 			body:           `{"model":"moonshotai/Kimi-K2.6","stream":false,"structured_outputs":{"schema":{"type":"object"}},"messages":[{"role":"user","content":"hello"}]}`,
 			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
 			model:          kimiK26ModelID,
-			wantStream:     true,
-			wantToolChoice: "none",
+			wantStream:     false,
+			wantToolChoice: nil,
 		},
 		{
 			name:           "non kimi unchanged",
@@ -148,10 +204,8 @@ func TestApplyKimiRequestOverrides(t *testing.T) {
 
 			var raw map[string]any
 			require.NoError(t, json.Unmarshal(body, &raw))
-			if tt.wantStream {
-				require.Equal(t, true, raw["stream"])
-			} else {
-				require.Equal(t, false, raw["stream"])
+			if _, hasStream := raw["stream"]; hasStream {
+				require.Equal(t, tt.wantStream, raw["stream"])
 			}
 			if tt.wantToolChoice == nil {
 				require.NotContains(t, raw, "tool_choice")
@@ -162,6 +216,76 @@ func TestApplyKimiRequestOverrides(t *testing.T) {
 				require.Contains(t, raw, "structured_outputs")
 			} else {
 				require.NotContains(t, raw, "structured_outputs")
+			}
+		})
+	}
+}
+
+func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T) {
+	boolPtr := func(v bool) *bool {
+		return &v
+	}
+
+	tests := []struct {
+		name         string
+		body         string
+		model        string
+		wantThinking *bool
+		wantExtra    any
+	}{
+		{
+			name:         "disabled",
+			body:         `{"model":"moonshotai/Kimi-K2.6","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hello"}]}`,
+			model:        kimiK26ModelID,
+			wantThinking: boolPtr(false),
+		},
+		{
+			name:         "enabled",
+			body:         `{"model":"moonshotai/Kimi-K2.6","thinking":{"type":"enabled"},"messages":[{"role":"user","content":"hello"}]}`,
+			model:        kimiK26ModelID,
+			wantThinking: boolPtr(true),
+		},
+		{
+			name:         "preserves other chat template kwargs",
+			body:         `{"model":"moonshotai/Kimi-K2.6","thinking":{"type":"disabled"},"chat_template_kwargs":{"foo":"bar"},"messages":[{"role":"user","content":"hello"}]}`,
+			model:        kimiK26ModelID,
+			wantThinking: boolPtr(false),
+			wantExtra:    "bar",
+		},
+		{
+			name:         "explicit vllm thinking wins",
+			body:         `{"model":"moonshotai/Kimi-K2.6","thinking":{"type":"enabled"},"chat_template_kwargs":{"thinking":false},"messages":[{"role":"user","content":"hello"}]}`,
+			model:        kimiK26ModelID,
+			wantThinking: boolPtr(false),
+		},
+		{
+			name:  "invalid moonshot type is ignored",
+			body:  `{"model":"moonshotai/Kimi-K2.6","thinking":{"type":"brief"},"messages":[{"role":"user","content":"hello"}]}`,
+			model: kimiK26ModelID,
+		},
+		{
+			name:  "non kimi unchanged",
+			body:  `{"model":"Qwen/Test","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hello"}]}`,
+			model: "Qwen/Test",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, err := applyKimiRequestOverrides([]byte(tt.body), chatRequest{Model: tt.model}, tt.model)
+			require.NoError(t, err)
+
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			kwargs, hasKwargs := raw["chat_template_kwargs"].(map[string]any)
+			if tt.wantThinking == nil {
+				require.False(t, hasKwargs)
+				return
+			}
+			require.True(t, hasKwargs)
+			require.Equal(t, *tt.wantThinking, kwargs["thinking"])
+			if tt.wantExtra != nil {
+				require.Equal(t, tt.wantExtra, kwargs["foo"])
 			}
 		})
 	}
@@ -239,6 +363,8 @@ func TestNormalizeChatRequestRejectsMalformedMessages(t *testing.T) {
 		`{"messages":[{"content":"hello"}]}`,
 		`{"messages":[{"role":"user","content":123}]}`,
 		`{"messages":[{"role":"user","content":[{"type":"text"}]}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]}`,
+		`{"messages":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`,
 		`{"messages":[{"role":"tool","tool_call_id":"missing","content":"hello"}]}`,
 	}
 
@@ -246,6 +372,66 @@ func TestNormalizeChatRequestRejectsMalformedMessages(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			_, _, err := normalizeChatRequest([]byte(body))
 			require.Error(t, err)
+			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+		})
+	}
+}
+
+func TestPrepareChatRequestBodyNormalizesTextContentParts(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"messages": [{
+			"role": "user",
+			"content": [
+				{"type": "text", "text": "hello"},
+				{"type": "text", "text": "world"}
+			]
+		}]
+	}`))
+
+	body, _, err := prepareChatRequestBody(req)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	messages := raw["messages"].([]any)
+	message := messages[0].(map[string]any)
+	require.Equal(t, "hello\nworld", message["content"])
+}
+
+func TestPrepareChatRequestBodyRejectsNonTextContentParts(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "image_url",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]}`,
+			want: `unsupported value "image_url"`,
+		},
+		{
+			name: "input_text",
+			body: `{"messages":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`,
+			want: `unsupported value "input_text"`,
+		},
+		{
+			name: "unknown",
+			body: `{"messages":[{"role":"user","content":[{"type":"custom","text":"hello"}]}]}`,
+			want: `unsupported value "custom"`,
+		},
+		{
+			name: "text with extra field",
+			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello","image_url":{"url":"https://example.com/image.png"}}]}]}`,
+			want: `must only include type and text`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.body))
+			_, _, err := prepareChatRequestBody(req)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
 			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
 		})
 	}

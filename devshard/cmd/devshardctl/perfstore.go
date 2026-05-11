@@ -51,6 +51,7 @@ func NewPerfStore(dbPath string) (*PerfStore, error) {
 	CREATE TABLE IF NOT EXISTS perf_request_log (
 		id              INTEGER PRIMARY KEY AUTOINCREMENT,
 		timestamp       TEXT NOT NULL,
+		model           TEXT NOT NULL DEFAULT '',
 		input_tokens    INTEGER NOT NULL,
 		winner_host_idx INTEGER NOT NULL,
 		winner_nonce    INTEGER NOT NULL,
@@ -74,6 +75,10 @@ func NewPerfStore(dbPath string) (*PerfStore, error) {
 			db.Close()
 			return nil, fmt.Errorf("migrate perf samples: %w", err)
 		}
+	}
+	if err := ensureColumn(db, "perf_request_log", "model", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate perf request log: %w", err)
 	}
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS perf_host_samples_source_idx ON perf_host_samples(source_escrow, source_sample_id) WHERE source_sample_id IS NOT NULL`); err != nil {
 		db.Close()
@@ -109,9 +114,10 @@ func (s *PerfStore) InsertRequest(rec RequestRecord) error {
 		return fmt.Errorf("marshal hosts: %w", err)
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO perf_request_log (timestamp, input_tokens, winner_host_idx, winner_nonce, decision, hosts_json)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO perf_request_log (timestamp, model, input_tokens, winner_host_idx, winner_nonce, decision, hosts_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		rec.Timestamp.Format(time.RFC3339Nano),
+		rec.Model,
 		rec.InputTokens,
 		rec.WinnerHostIdx,
 		rec.WinnerNonce,
@@ -180,7 +186,7 @@ func (s *PerfStore) LoadSamples() ([]RequestSample, error) {
 // LoadRequests returns the most recent requestLogSize request records.
 func (s *PerfStore) LoadRequests() ([]RequestRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT timestamp, input_tokens, winner_host_idx, winner_nonce, decision, hosts_json
+		`SELECT timestamp, model, input_tokens, winner_host_idx, winner_nonce, decision, hosts_json
 		 FROM perf_request_log ORDER BY id DESC LIMIT ?`, requestLogSize)
 	if err != nil {
 		return nil, err
@@ -191,17 +197,19 @@ func (s *PerfStore) LoadRequests() ([]RequestRecord, error) {
 	for rows.Next() {
 		var (
 			tsStr       string
+			model       string
 			inputTokens uint64
 			winnerIdx   int
 			winnerNonce uint64
 			decision    string
 			hostsJSON   string
 		)
-		if err := rows.Scan(&tsStr, &inputTokens, &winnerIdx, &winnerNonce, &decision, &hostsJSON); err != nil {
+		if err := rows.Scan(&tsStr, &model, &inputTokens, &winnerIdx, &winnerNonce, &decision, &hostsJSON); err != nil {
 			return nil, err
 		}
 		rec := RequestRecord{
 			Timestamp:     strToTime(tsStr),
+			Model:         model,
 			InputTokens:   inputTokens,
 			WinnerHostIdx: winnerIdx,
 			WinnerNonce:   winnerNonce,

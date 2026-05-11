@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,16 @@ func TestSseChunkHasContent(t *testing.T) {
 		{
 			name: "finish_only",
 			body: `data: {"id":"a","choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}` + "\n\n",
+			want: false,
+		},
+		{
+			name: "empty_stop_with_completion_tokens",
+			body: `data: {"id":"a","choices":[{"message":{"content":""},"index":0,"finish_reason":"stop"}],"usage":{"completion_tokens":1}}` + "\n\n",
+			want: true,
+		},
+		{
+			name: "empty_stop_without_completion_tokens",
+			body: `data: {"id":"a","choices":[{"message":{"content":""},"index":0,"finish_reason":"stop"}],"usage":{"completion_tokens":0}}` + "\n\n",
 			want: false,
 		},
 		{
@@ -199,6 +210,18 @@ func TestSseChunkContentSource(t *testing.T) {
 			wantOK:     true,
 		},
 		{
+			name:       "message_empty_stop_with_completion_tokens",
+			body:       `data: {"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}` + "\n\n",
+			wantSource: "message.empty_stop_completion_tokens",
+			wantOK:     true,
+		},
+		{
+			name:       "message_empty_stop_without_completion_tokens",
+			body:       `data: {"choices":[{"message":{"content":""},"finish_reason":"stop"}],"usage":{"completion_tokens":0}}` + "\n\n",
+			wantSource: "",
+			wantOK:     false,
+		},
+		{
 			name:       "text_rejected",
 			body:       `data: {"choices":[{"text":"abc"}]}` + "\n\n",
 			wantSource: "",
@@ -240,6 +263,12 @@ func TestSseChunkErrorSource(t *testing.T) {
 			wantOK:     true,
 		},
 		{
+			name:       "top_level_openai_error_with_type",
+			body:       `data: {"code":400,"object":"error","message":"context too long","type":"BadRequestError"}` + "\n\n",
+			wantSource: "error.BadRequestError",
+			wantOK:     true,
+		},
+		{
 			name:       "openai_error_without_type",
 			body:       `data: {"error":{"code":500,"message":"backend failed"}}` + "\n\n",
 			wantSource: "error",
@@ -276,6 +305,18 @@ func TestSseChunkErrorDetails(t *testing.T) {
 	require.Equal(t, "400", details.Code)
 	require.Equal(t, "BadRequestError", details.Type)
 	require.Equal(t, "bad request", details.Message)
+}
+
+func TestHostApplicationErrorPayloadAndStatus(t *testing.T) {
+	body := []byte(`data: {"error":{"code":400,"message":"bad request","type":"BadRequestError"}}` + "\n\n")
+	details, payload, ok := sseChunkErrorPayload(body)
+	require.True(t, ok)
+
+	err := &hostApplicationError{details: details, payload: payload}
+
+	require.Equal(t, http.StatusBadRequest, err.statusCode())
+	require.Equal(t, "bad request", err.Error())
+	require.JSONEq(t, `{"error":{"code":400,"message":"bad request","type":"BadRequestError"}}`, string(err.jsonPayload()))
 }
 
 // TestRaceWriter_RecordsContentSourceAndSample verifies that the forensic
@@ -427,7 +468,7 @@ func TestIsEmptyStreamAttempt(t *testing.T) {
 		inf.outputChunks.Store(2)
 		require.False(t, isEmptyStreamAttempt(inf))
 		require.True(t, isErrorStreamAttempt(inf))
-		require.False(t, isFailedStreamAttempt(inf))
+		require.True(t, isFailedStreamAttempt(inf))
 	})
 	t.Run("receipt_no_bytes_at_all_stall", func(t *testing.T) {
 		// Stall pattern (369pqtgx-class): host got the receipt, then
@@ -646,8 +687,8 @@ func TestInflightFinished_StallHostNotFinished(t *testing.T) {
 	}
 	errorStream.outputChunks.Store(2)
 	require.False(t, isEmptyStreamAttempt(errorStream))
-	require.True(t, inflightFinished(errorStream),
-		"error response with finish marker is a valid terminal response")
+	require.False(t, inflightFinished(errorStream),
+		"error response with finish marker must not count as a successful terminal response")
 
 	noReceipt := &inflight{
 		hostID: "in-process",

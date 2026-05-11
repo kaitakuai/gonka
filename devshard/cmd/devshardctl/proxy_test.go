@@ -69,6 +69,25 @@ func TestStreamReset_WrittenOnReconnect(t *testing.T) {
 	require.Contains(t, body, `data: {"devshard_stream_reset":true}`)
 }
 
+func TestJSONErrorPayloadDetails(t *testing.T) {
+	details, ok := jsonErrorPayloadDetails([]byte(`{"error":{"code":400,"message":"bad request","type":"BadRequestError"}}`))
+
+	require.True(t, ok)
+	require.Equal(t, "400", details.Code)
+	require.Equal(t, "BadRequestError", details.Type)
+	require.Equal(t, "bad request", details.Message)
+}
+
+func TestWriteGatewayJSONErrorContentType(t *testing.T) {
+	rec := httptest.NewRecorder()
+
+	writeGatewayJSONError(rec, http.StatusBadGateway, "upstream failed")
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	require.JSONEq(t, `{"error":{"message":"upstream failed"}}`, rec.Body.String())
+}
+
 func TestDeferredWriterSkipsWriteAfterContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &panicAfterCancelWriter{ctx: ctx}
@@ -539,6 +558,21 @@ func (streamContentThenErrClient) Send(ctx context.Context, req host.HostRequest
 	return nil, errSimulatedWinnerTransport
 }
 
+type streamContentWithoutFinishClient struct{}
+
+func (streamContentWithoutFinishClient) Send(ctx context.Context, req host.HostRequest, stream io.Writer, receiptHandler func()) (*host.HostResponse, error) {
+	if receiptHandler != nil {
+		receiptHandler()
+	}
+	if stream != nil {
+		_, _ = io.WriteString(stream, `data: {"choices":[{"delta":{"content":"x"}}]}`+"\n\n")
+	}
+	return &host.HostResponse{
+		Nonce:       req.Nonce,
+		ConfirmedAt: time.Now().Unix(),
+	}, nil
+}
+
 type streamContentThenStallClient struct{}
 
 func (streamContentThenStallClient) Send(ctx context.Context, req host.HostRequest, stream io.Writer, receiptHandler func()) (*host.HostResponse, error) {
@@ -734,6 +768,82 @@ func TestStalledWinnerQuarantineRequiresParticipantFailureThreshold(t *testing.T
 	}
 	env.proxy.redundancy.recordStalledWinnerFailureOnce(second, defaultParams())
 	require.True(t, limiter.IsBlocked(participantKey))
+}
+
+func TestLongResponseAfterContentSkipsParticipantFailureAccounting(t *testing.T) {
+	env := setupTestProxyWithClients(t, []user.HostClient{streamContentThenStallClient{}})
+	limiter := NewParticipantRequestLimiter(10, 10)
+	env.proxy.redundancy.participantLimiter = limiter
+	participantKey := env.session.HostParticipantKey(0)
+
+	for i := 0; i < 2; i++ {
+		inf := &inflight{
+			hostIdx:     0,
+			nonce:       uint64(i + 1),
+			sendTime:    time.Now().Add(-(longResponseFailureExemption + time.Second)),
+			receiptTime: time.Now().Add(-(longResponseFailureExemption + 900*time.Millisecond)),
+			firstToken:  time.Now().Add(-(longResponseFailureExemption + 800*time.Millisecond)),
+		}
+		inf.contentChunks.Store(1)
+		inf.outputChunks.Store(1)
+		env.proxy.redundancy.recordStalledWinnerFailureOnce(inf, defaultParams())
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams())
+	}
+
+	require.False(t, limiter.IsBlocked(participantKey))
+	require.Equal(t, 0, env.proxy.redundancy.perf.Stats(0).TotalSamples)
+}
+
+func TestErrorStreamSkipsParticipantFailureAccounting(t *testing.T) {
+	env := setupTestProxyWithClients(t, []user.HostClient{streamContentThenStallClient{}})
+	limiter := NewParticipantRequestLimiter(10, 10)
+	env.proxy.redundancy.participantLimiter = limiter
+	participantKey := env.session.HostParticipantKey(0)
+
+	for i := 0; i < 2; i++ {
+		inf := &inflight{
+			hostIdx:     0,
+			nonce:       uint64(i + 1),
+			sendTime:    time.Now().Add(-time.Second),
+			receiptTime: time.Now().Add(-900 * time.Millisecond),
+			firstToken:  time.Now().Add(-800 * time.Millisecond),
+			errorSource: "error.BadRequestError",
+		}
+		inf.outputChunks.Store(1)
+		env.proxy.redundancy.recordStalledWinnerFailureOnce(inf, defaultParams())
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams())
+	}
+
+	require.False(t, limiter.IsBlocked(participantKey))
+	require.Equal(t, 0, env.proxy.redundancy.perf.Stats(0).TotalSamples)
+}
+
+func TestRunInference_IncompleteWinnerAfterContentQuarantinesParticipant(t *testing.T) {
+	env := setupTestProxyWithClients(t, []user.HostClient{streamContentWithoutFinishClient{}})
+	limiter := NewParticipantRequestLimiter(10, 10)
+	env.proxy.redundancy.participantLimiter = limiter
+	participantKey := env.session.HostParticipantKey(0)
+
+	var first bytes.Buffer
+	err := env.proxy.redundancy.RunInference(context.Background(), defaultParams(), &first)
+	requireIncompleteWinnerError(t, err)
+	require.Contains(t, first.String(), `"content":"x"`)
+	require.False(t, limiter.IsBlocked(participantKey))
+
+	var second bytes.Buffer
+	err = env.proxy.redundancy.RunInference(context.Background(), defaultParams(), &second)
+	requireIncompleteWinnerError(t, err)
+	require.Contains(t, second.String(), `"content":"x"`)
+	require.True(t, limiter.IsBlocked(participantKey))
+}
+
+func requireIncompleteWinnerError(t *testing.T, err error) {
+	t.Helper()
+	require.Error(t, err)
+	require.True(t,
+		strings.Contains(err.Error(), "winner inference incomplete") ||
+			strings.Contains(err.Error(), "no non-probe attempt finished"),
+		"unexpected incomplete winner error: %v", err)
 }
 
 func TestRecordStartedAttemptSamplesRecordsFailedHostAttempts(t *testing.T) {
@@ -1023,6 +1133,7 @@ func TestRunInference_SpeculativeFallsThroughMultipleDeadHosts(t *testing.T) {
 }
 
 func TestRunInference_PerfTracking(t *testing.T) {
+	withRedundancySpeedPolicyForProxyTest(t, RedundancySpeedPolicyLegacy)
 	zeroReceiptTimeout(t)
 	env := setupTestProxy(t, 3, nil, true)
 	ctx := context.Background()
@@ -1042,6 +1153,7 @@ func TestRunInference_PerfTracking(t *testing.T) {
 }
 
 func TestRunInference_ExportsPrometheusMetrics(t *testing.T) {
+	withRedundancySpeedPolicyForProxyTest(t, RedundancySpeedPolicyLegacy)
 	zeroReceiptTimeout(t)
 	env := setupTestProxy(t, 3, nil, true)
 	env.proxy.redundancy.metrics = NewDevshardMetrics()
@@ -1083,11 +1195,11 @@ func TestPerfTrackerIsUnresponsiveUsesThreshold(t *testing.T) {
 	require.True(t, perf.IsUnresponsive(0))
 }
 
-func TestFirstTokenFallbackDelayCapsAtOneSecond(t *testing.T) {
+func TestFirstTokenFallbackDelayUsesDefaultFormula(t *testing.T) {
 	setSpeculativeTiming(t, 50*time.Millisecond, time.Second, 10*time.Millisecond, time.Minute)
-	require.Equal(t, time.Second, firstTokenFallbackDelay(50))
-	require.Equal(t, 5*time.Second, firstTokenFallbackDelay(500))
-	require.Equal(t, time.Second, firstTokenFallbackDelay(0))
+	require.InDelta(t, (1.7+0.00003*50+0.0000000005*50*50)*float64(time.Second), float64(defaultFirstTokenFallbackDelay(50)), float64(time.Millisecond))
+	require.InDelta(t, (1.7+0.00003*500+0.0000000005*500*500)*float64(time.Second), float64(defaultFirstTokenFallbackDelay(500)), float64(time.Millisecond))
+	require.InDelta(t, 1.7*float64(time.Second), float64(defaultFirstTokenFallbackDelay(0)), float64(time.Millisecond))
 }
 
 func TestWaitForFirstTokenUntilReturnsWhenTokenArrives(t *testing.T) {
@@ -1161,7 +1273,16 @@ func TestDecision_UnresponsiveHost(t *testing.T) {
 	require.Equal(t, "primary_unresponsive", d.Reason)
 }
 
+func withRedundancySpeedPolicyForProxyTest(t *testing.T, policy string) {
+	t.Helper()
+	saved := RedundancySpeedPolicy
+	RedundancySpeedPolicy = policy
+	t.Cleanup(func() { RedundancySpeedPolicy = saved })
+}
+
 func TestDecision_FasterSecondary(t *testing.T) {
+	withRedundancySpeedPolicyForProxyTest(t, RedundancySpeedPolicyLegacy)
+
 	perf := NewPerfTracker(nil)
 	for i := 0; i < 5; i++ {
 		perf.Record(RequestSample{
@@ -1192,6 +1313,7 @@ func TestDecision_FasterSecondary(t *testing.T) {
 }
 
 func TestDecision_DefaultDelay(t *testing.T) {
+	withRedundancySpeedPolicyForProxyTest(t, RedundancySpeedPolicyLegacy)
 	perf := NewPerfTracker(nil)
 	redundancy := &Redundancy{perf: perf, groupSize: 3}
 	d := redundancy.Decide(0, 100)
@@ -1201,6 +1323,7 @@ func TestDecision_DefaultDelay(t *testing.T) {
 }
 
 func TestDecision_ReceiptTimeoutScalesForLargeRunnerInput(t *testing.T) {
+	withRedundancySpeedPolicyForProxyTest(t, RedundancySpeedPolicyLegacy)
 	saved := ReceiptTimeout
 	ReceiptTimeout = 5 * time.Second
 	t.Cleanup(func() { ReceiptTimeout = saved })
@@ -1224,8 +1347,8 @@ func TestFirstTokenFallbackDelayScalesForLargeRunnerInput(t *testing.T) {
 		PerInputTokenFirstTokenLag = savedLag
 	})
 
-	require.Equal(t, time.Second, firstTokenFallbackDelay(100))
-	require.Equal(t, 200*time.Second, firstTokenFallbackDelay(100_000))
+	require.InDelta(t, float64(1703*time.Millisecond), float64(defaultFirstTokenFallbackDelay(100)), float64(time.Millisecond))
+	require.InDelta(t, float64(9700*time.Millisecond), float64(defaultFirstTokenFallbackDelay(100_000)), float64(time.Millisecond))
 }
 
 // slowReceiptClient wraps an inner user.HostClient and defers the receipt
@@ -1345,6 +1468,7 @@ func TestRunInference_ReceiptTimeoutEscalatesEvenWhenSendTimeRaces(t *testing.T)
 // need. Without the re-check in awaitRace, every healthy primary with
 // sendTime stamped synchronously would trigger a useless secondary.
 func TestRunInference_FastReceiptDoesNotSpuriouslyEscalate(t *testing.T) {
+	withRedundancySpeedPolicyForProxyTest(t, RedundancySpeedPolicyLegacy)
 	// Receipt timeout of 50ms is plenty of headroom for the in-process
 	// client's synchronous receiptHandler to fire first.
 	setSpeculativeTiming(t, 50*time.Millisecond, time.Second, 10*time.Millisecond, time.Minute)

@@ -73,21 +73,21 @@ type Proxy struct {
 	phaseGate  *ChainPhaseGate
 }
 
-// normalizeContent converts multi-part content arrays to simple strings.
-// [{"type":"text","text":"A"},{"type":"text","text":"B"}] → "A\nB"
-func normalizeContent(body []byte) []byte {
+// normalizeContent converts text-only multi-part content arrays to simple strings.
+// [{"type":"text","text":"A"},{"type":"text","text":"B"}] -> "A\nB"
+func normalizeContent(body []byte) ([]byte, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return body
+		return body, nil
 	}
 	msgsRaw, ok := raw["messages"]
 	if !ok {
-		return body
+		return body, nil
 	}
 
 	var msgs []map[string]json.RawMessage
 	if err := json.Unmarshal(msgsRaw, &msgs); err != nil {
-		return body
+		return body, nil
 	}
 
 	changed := false
@@ -96,15 +96,17 @@ func normalizeContent(body []byte) []byte {
 		if !ok {
 			continue
 		}
-		var parts []map[string]string
+		var parts []map[string]any
 		if err := json.Unmarshal(contentRaw, &parts); err != nil {
 			continue
 		}
 		var texts []string
-		for _, p := range parts {
-			if p["type"] == "text" && p["text"] != "" {
-				texts = append(texts, p["text"])
+		for partIndex, p := range parts {
+			text, err := requiredTextContentPart(p, partIndex)
+			if err != nil {
+				return nil, badChatRequest("messages[%d].content%v", i, err)
 			}
+			texts = append(texts, text)
 		}
 		if len(texts) > 0 {
 			combined, _ := json.Marshal(strings.Join(texts, "\n"))
@@ -114,19 +116,19 @@ func normalizeContent(body []byte) []byte {
 	}
 
 	if !changed {
-		return body
+		return body, nil
 	}
 
 	newMsgs, err := json.Marshal(msgs)
 	if err != nil {
-		return body
+		return nil, badChatRequest("marshal messages: %v", err)
 	}
 	raw["messages"] = newMsgs
 	out, err := json.Marshal(raw)
 	if err != nil {
-		return body
+		return nil, badChatRequest("marshal request: %v", err)
 	}
-	return out
+	return out, nil
 }
 
 func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -139,14 +141,14 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := p.admissionError(); err != nil {
 		logRequestStage(ctx, "proxy_request_blocked", "escrow", p.escrowID, "error", err)
-		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), gatewayStatusCodeForError(err))
+		writeGatewayJSONError(w, gatewayStatusCodeForError(err), err.Error())
 		return
 	}
 
 	body, req, err := prepareChatRequestBody(r)
 	if err != nil {
 		logRequestStage(ctx, "proxy_read_body_failed", "error", err)
-		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
+		writeGatewayJSONError(w, chatRequestErrorStatus(err, http.StatusBadRequest), err.Error())
 		return
 	}
 
@@ -157,7 +159,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, req, err = applyKimiRequestOverrides(body, req, model)
 	if err != nil {
 		logRequestStage(ctx, "proxy_request_filter_failed", "error", err)
-		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
+		writeGatewayJSONError(w, chatRequestErrorStatus(err, http.StatusBadRequest), err.Error())
 		return
 	}
 	params := user.InferenceParams{
@@ -301,10 +303,39 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, params u
 		}
 		logRequestStage(r.Context(), "proxy_stream_failed", "escrow", p.escrowID, "error", err)
 		statusCode := gatewayStatusCodeForError(err)
+		var hostErr *hostApplicationError
+		if errors.As(err, &hostErr) {
+			if !dw.started {
+				if _, werr := fmt.Fprintf(dw, "data: %s\n\n", hostErr.jsonPayload()); werr != nil {
+					doneWriteErr = werr
+					logRequestStage(r.Context(), "proxy_error_write_failed", "escrow", p.escrowID, "error", werr)
+				}
+				if _, werr := fmt.Fprint(dw, "data: [DONE]\n\n"); werr != nil {
+					doneWriteErr = werr
+					logRequestStage(r.Context(), "proxy_done_write_failed", "escrow", p.escrowID, "error", werr)
+				}
+				finalErr := dw.flush("host_error_final")
+				logProxyResponseFinished(r.Context(), p.escrowID, "host_error", dw, finalErr, doneWriteErr, started)
+				return
+			}
+			if !dw.sawDone {
+				if _, werr := fmt.Fprint(dw, "data: [DONE]\n\n"); werr != nil {
+					doneWriteErr = werr
+					logRequestStage(r.Context(), "proxy_done_write_failed", "escrow", p.escrowID, "error", werr)
+				}
+			}
+			finalErr := dw.flush("host_error_final")
+			logProxyResponseFinished(r.Context(), p.escrowID, "host_error", dw, finalErr, doneWriteErr, started)
+			return
+		}
 		if !dw.started {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(statusCode)
-			fmt.Fprintf(w, `{"error":{"message":%q}}`, err.Error())
+			writeGatewayJSONError(w, statusCode, err.Error())
+			return
+		}
+		if dw.sawDone {
+			logRequestStage(r.Context(), "proxy_gateway_error_after_done_suppressed", "escrow", p.escrowID, "error", err)
+			finalErr := dw.flush("gateway_error_after_done")
+			logProxyResponseFinished(r.Context(), p.escrowID, "error_after_done", dw, finalErr, nil, started)
 			return
 		}
 		log.Printf("inference error (mid-stream): %v", err)
@@ -330,6 +361,56 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, r *http.Request, params u
 
 // werrOrNil normalizes an error so the varargs passthrough below stays tidy.
 func werrOrNil(err error) error { return err }
+
+func writeGatewayJSONError(w http.ResponseWriter, statusCode int, message string) {
+	writeJSONPayload(w, statusCode, []byte(fmt.Sprintf(`{"error":{"message":%q}}`, message)))
+}
+
+func writeJSONPayload(w http.ResponseWriter, statusCode int, payload []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	w.Write(payload)
+}
+
+func jsonErrorPayloadDetails(payload []byte) (sseErrorDetails, bool) {
+	var evt struct {
+		Error *struct {
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+		Object  string `json:"object"`
+		Type    string `json:"type"`
+		Code    any    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		return sseErrorDetails{}, false
+	}
+	if evt.Error != nil {
+		details := sseErrorDetails{
+			Type:    evt.Error.Type,
+			Code:    fmt.Sprint(evt.Error.Code),
+			Message: evt.Error.Message,
+		}
+		if evt.Error.Code == nil {
+			details.Code = ""
+		}
+		return details, true
+	}
+	if evt.Object == "error" && evt.Message != "" {
+		details := sseErrorDetails{
+			Type:    evt.Type,
+			Code:    fmt.Sprint(evt.Code),
+			Message: evt.Message,
+		}
+		if evt.Code == nil {
+			details.Code = ""
+		}
+		return details, true
+	}
+	return sseErrorDetails{}, false
+}
 
 // logProxyResponseFinished is the authoritative "request left the building"
 // log entry. It fires after the final Flush on every success/error streaming
@@ -367,7 +448,12 @@ func (p *Proxy) handleNonStreaming(w http.ResponseWriter, r *http.Request, param
 	err := p.redundancy.RunInference(r.Context(), params, &buf)
 	if err != nil {
 		logRequestStage(r.Context(), "proxy_request_failed", "escrow", p.escrowID, "error", err)
-		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), gatewayStatusCodeForError(err))
+		var hostErr *hostApplicationError
+		if errors.As(err, &hostErr) {
+			writeJSONPayload(w, hostErr.statusCode(), hostErr.jsonPayload())
+			return
+		}
+		writeGatewayJSONError(w, gatewayStatusCodeForError(err), err.Error())
 		return
 	}
 
@@ -376,8 +462,12 @@ func (p *Proxy) handleNonStreaming(w http.ResponseWriter, r *http.Request, param
 	if rid, ok := requestLogFromContext(r.Context()); ok {
 		w.Header().Set("X-Request-Id", rid)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(assembled)
+	if details, ok := jsonErrorPayloadDetails(assembled); ok {
+		writeJSONPayload(w, (&hostApplicationError{details: details, payload: assembled}).statusCode(), assembled)
+		logRequestStage(r.Context(), "proxy_request_completed_with_host_error", "escrow", p.escrowID, "error", details.Message)
+		return
+	}
+	writeJSONPayload(w, http.StatusOK, assembled)
 	logRequestStage(r.Context(), "proxy_request_completed", "escrow", p.escrowID)
 }
 
@@ -522,12 +612,32 @@ func (p *Proxy) handleDebugPerf(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"hosts":                  stats,
 		"requests":               requests,
+		"pairwise":               p.perf.PairwiseSummaries(),
 		"receipt_timeout_ms":     ReceiptTimeout.Milliseconds(),
 		"advantage_threshold":    ParallelAdvantageThreshold,
 		"unresponsive_threshold": UnresponsiveThreshold,
 		"host_window_size":       PerfWindowSize,
 		"participant_window_ms":  ParticipantPerfWindow.Milliseconds(),
 		"request_log_size":       requestLogSize,
+	})
+}
+
+func (p *Proxy) handleDebugPairwise(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{
+		"speed_policy":                    RedundancySpeedPolicy,
+		"budget_percentile":               PairwiseBudgetPercentile,
+		"max_proactive_attempts":          PairwiseMaxProactiveAttempts,
+		"min_direct_comparisons":          PairwiseMinDirectComparisons,
+		"chained_confidence_decay":        PairwiseChainedConfidenceDecay,
+		"ab_sample_rate":                  PairwiseABSampleRate,
+		"ab_sparse_sample_rate":           PairwiseABSparseSampleRate,
+		"ab_sparse_sample_threshold":      PairwiseABSparseSampleThreshold,
+		"winner_hold_ms":                  PairwiseWinnerHold.Milliseconds(),
+		"winner_hold_min_speedup":         PairwiseWinnerHoldMinSpeedup,
+		"winner_hold_min_samples":         PairwiseWinnerHoldMinSamples,
+		"request_shape_buckets":           []string{"lt_1k", "1k_5k", "5k_15k", "15k_30k", "30k_100k", "gte_100k"},
+		"comparisons":                     p.perf.PairwiseSummaries(),
+		"legacy_secondary_faster_enabled": RedundancySpeedPolicy != RedundancySpeedPolicyPairwise,
 	})
 }
 

@@ -69,7 +69,11 @@ func prepareChatRequestBody(r *http.Request) ([]byte, chatRequest, error) {
 	if err != nil {
 		return nil, chatRequest{}, err
 	}
-	return normalizeChatRequest(normalizeContent(body))
+	body, err = normalizeContent(body)
+	if err != nil {
+		return nil, chatRequest{}, err
+	}
+	return normalizeChatRequest(body)
 }
 
 func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
@@ -114,6 +118,7 @@ func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
 		req.MaxTokens = capOutputTokens(0)
 		raw["max_tokens"] = req.MaxTokens
 	}
+	stripMinTokensAboveMax(raw, req.MaxTokens)
 	if _, hasN := raw["n"]; hasN {
 		req.N = capChatRequestChoices(req.N)
 		raw["n"] = req.N
@@ -136,16 +141,53 @@ func applyKimiRequestOverrides(body []byte, req chatRequest, model string) ([]by
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
 	}
-	raw["stream"] = true
-	raw["tool_choice"] = "none"
+	// raw["stream"] = true
+	// raw["tool_choice"] = "none"
+	translateKimiThinkingForVLLM(raw)
 	stripUnsupportedChatRequestParameters(raw)
-	req.Stream = true
+	// req.Stream = true
 
 	updatedBody, err := json.Marshal(raw)
 	if err != nil {
 		return nil, chatRequest{}, badChatRequest("marshal request: %v", err)
 	}
 	return updatedBody, req, nil
+}
+
+func translateKimiThinkingForVLLM(request map[string]any) {
+	enabled, ok := moonshotThinkingEnabled(request["thinking"])
+	if !ok {
+		return
+	}
+
+	chatTemplateKwargs, _ := request["chat_template_kwargs"].(map[string]any)
+	if chatTemplateKwargs == nil {
+		chatTemplateKwargs = map[string]any{}
+		request["chat_template_kwargs"] = chatTemplateKwargs
+	}
+	if _, exists := chatTemplateKwargs["thinking"]; exists {
+		return
+	}
+	chatTemplateKwargs["thinking"] = enabled
+}
+
+func moonshotThinkingEnabled(value any) (bool, bool) {
+	thinking, ok := value.(map[string]any)
+	if !ok {
+		return false, false
+	}
+	typ, ok := thinking["type"].(string)
+	if !ok {
+		return false, false
+	}
+	switch strings.ToLower(typ) {
+	case "enabled":
+		return true, true
+	case "disabled":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func capOutputTokens(value uint64) uint64 {
@@ -165,10 +207,57 @@ func capChatRequestChoices(value uint64) uint64 {
 	return value
 }
 
+func stripMinTokensAboveMax(request map[string]any, maxTokens uint64) {
+	if maxTokens == 0 {
+		return
+	}
+	value, ok := numericJSONValueAsUint64(request["min_tokens"])
+	if !ok {
+		return
+	}
+	if value > maxTokens {
+		delete(request, "min_tokens")
+	}
+}
+
+func numericJSONValueAsUint64(value any) (uint64, bool) {
+	switch v := value.(type) {
+	case float64:
+		if v < 0 || v != float64(uint64(v)) {
+			return 0, false
+		}
+		return uint64(v), true
+	case uint64:
+		return v, true
+	case int:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case int64:
+		if v < 0 {
+			return 0, false
+		}
+		return uint64(v), true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil || n < 0 {
+			return 0, false
+		}
+		return uint64(n), true
+	default:
+		return 0, false
+	}
+}
+
 func stripUnsupportedChatRequestParameters(request map[string]any) {
 	delete(request, "presence_penalty")
 	delete(request, "frequency_penalty")
 	delete(request, "structured_outputs")
+	if tools, ok := request["tools"].([]any); ok && len(tools) == 0 {
+		delete(request, "tools")
+		delete(request, "tool_choice")
+	}
 }
 
 func validateUnsupportedChatRequestFields(request map[string]any) error {
@@ -380,16 +469,9 @@ func validateNonEmptyContent(content any) error {
 			if !ok {
 				return fmt.Errorf("[%d] must be an object", i)
 			}
-			partType, err := requiredNonEmptyString(part, "type")
+			text, err := requiredTextContentPart(part, i)
 			if err != nil {
-				return fmt.Errorf("[%d].type: %w", i, err)
-			}
-			if partType != "text" {
-				continue
-			}
-			text, err := requiredNonEmptyString(part, "text")
-			if err != nil {
-				return fmt.Errorf("[%d].text: %w", i, err)
+				return err
 			}
 			if strings.TrimSpace(text) == "" {
 				return fmt.Errorf("[%d].text must not be empty", i)
@@ -399,6 +481,24 @@ func validateNonEmptyContent(content any) error {
 	default:
 		return fmt.Errorf("must be a string or an array of typed content parts")
 	}
+}
+
+func requiredTextContentPart(part map[string]any, partIndex int) (string, error) {
+	if len(part) != 2 {
+		return "", fmt.Errorf("[%d] must only include type and text", partIndex)
+	}
+	partType, err := requiredNonEmptyString(part, "type")
+	if err != nil {
+		return "", fmt.Errorf("[%d].type: %w", partIndex, err)
+	}
+	if partType != "text" {
+		return "", fmt.Errorf("[%d].type has unsupported value %q", partIndex, partType)
+	}
+	text, err := requiredNonEmptyString(part, "text")
+	if err != nil {
+		return "", fmt.Errorf("[%d].text: %w", partIndex, err)
+	}
+	return text, nil
 }
 
 func ensureFieldsAbsent(values map[string]any, fields ...string) error {

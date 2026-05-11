@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,11 +32,13 @@ var errEmptyStream = errors.New("empty content stream")
 
 const emptyStreamBodySampleLimit = 256 * 1024
 
+const longResponseFailureExemption = 280 * time.Second
+
 // sseChunkHasContent reports whether the given bytes contain at least one SSE
 // data event carrying a non-empty payload that an OpenAI-compatible client can
-// surface. `content`, `reasoning`, `reasoning_content`, and non-empty
-// `tool_calls` all qualify in both streaming `delta` and non-streaming
-// `message` shapes.
+// surface. `content`, `reasoning`, `reasoning_content`, non-empty
+// `tool_calls`, and a stopped completion with generated tokens all qualify in
+// both streaming `delta` and non-streaming `message` shapes.
 //
 // Deliberately NOT treated as content (even though earlier versions did):
 //   - `choices[].text` — the legacy `/v1/completions` shape. The proxy's
@@ -67,7 +72,8 @@ func sseChunkContentSource(p []byte) (string, bool) {
 		}
 		var evt struct {
 			Choices []struct {
-				Delta struct {
+				FinishReason string `json:"finish_reason"`
+				Delta        struct {
 					Content          string          `json:"content"`
 					Reasoning        string          `json:"reasoning"`
 					ReasoningContent string          `json:"reasoning_content"`
@@ -80,6 +86,9 @@ func sseChunkContentSource(p []byte) (string, bool) {
 					ToolCalls        json.RawMessage `json:"tool_calls"`
 				} `json:"message"`
 			} `json:"choices"`
+			Usage struct {
+				CompletionTokens int `json:"completion_tokens"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal(payload, &evt); err != nil {
 			continue
@@ -109,6 +118,9 @@ func sseChunkContentSource(p []byte) (string, bool) {
 			if hasJSONArrayElements(c.Message.ToolCalls) {
 				return "message.tool_calls", true
 			}
+			if c.FinishReason == "stop" && evt.Usage.CompletionTokens > 0 {
+				return "message.empty_stop_completion_tokens", true
+			}
 		}
 	}
 	return "", false
@@ -134,12 +146,73 @@ type sseErrorDetails struct {
 	Message string
 }
 
+type hostApplicationError struct {
+	details sseErrorDetails
+	payload []byte
+}
+
+func (e *hostApplicationError) Error() string {
+	if e == nil {
+		return "host application error"
+	}
+	if e.details.Message != "" {
+		return e.details.Message
+	}
+	if len(e.payload) > 0 {
+		return string(e.payload)
+	}
+	return "host application error"
+}
+
+func (e *hostApplicationError) statusCode() int {
+	if e == nil {
+		return http.StatusBadGateway
+	}
+	status, err := strconv.Atoi(e.details.Code)
+	if err == nil && status >= 400 && status <= 599 {
+		return status
+	}
+	if strings.Contains(strings.ToLower(e.details.Type), "badrequest") {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}
+
+func (e *hostApplicationError) jsonPayload() []byte {
+	if e == nil {
+		return nil
+	}
+	if len(e.payload) > 0 {
+		return append([]byte(nil), e.payload...)
+	}
+	errorBody := map[string]any{
+		"message": e.Error(),
+	}
+	if e.details.Type != "" {
+		errorBody["type"] = e.details.Type
+	}
+	if e.details.Code != "" {
+		errorBody["code"] = e.details.Code
+	}
+	body := map[string]any{"error": errorBody}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return []byte(fmt.Sprintf(`{"error":{"message":%q}}`, e.Error()))
+	}
+	return data
+}
+
 // sseChunkErrorDetails extracts the first OpenAI-compatible top-level error
 // from an SSE data event. The raw body is still logged separately, but these
 // fields make later grep/aggregation possible without decoding JSON by hand.
 func sseChunkErrorDetails(p []byte) (sseErrorDetails, bool) {
+	details, _, ok := sseChunkErrorPayload(p)
+	return details, ok
+}
+
+func sseChunkErrorPayload(p []byte) (sseErrorDetails, []byte, bool) {
 	if len(p) == 0 {
-		return sseErrorDetails{}, false
+		return sseErrorDetails{}, nil, false
 	}
 	for _, line := range bytes.Split(p, []byte("\n")) {
 		line = bytes.TrimRight(line, "\r")
@@ -156,24 +229,38 @@ func sseChunkErrorDetails(p []byte) (sseErrorDetails, bool) {
 				Code    any    `json:"code"`
 				Message string `json:"message"`
 			} `json:"error"`
+			Object  string `json:"object"`
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+			Message string `json:"message"`
 		}
 		if err := json.Unmarshal(payload, &evt); err != nil {
 			continue
 		}
-		if evt.Error == nil {
-			continue
+		if evt.Error != nil {
+			details := sseErrorDetails{
+				Type:    evt.Error.Type,
+				Code:    fmt.Sprint(evt.Error.Code),
+				Message: evt.Error.Message,
+			}
+			if evt.Error.Code == nil {
+				details.Code = ""
+			}
+			return details, append([]byte(nil), payload...), true
 		}
-		details := sseErrorDetails{
-			Type:    evt.Error.Type,
-			Code:    fmt.Sprint(evt.Error.Code),
-			Message: evt.Error.Message,
+		if evt.Object == "error" && evt.Message != "" {
+			details := sseErrorDetails{
+				Type:    evt.Type,
+				Code:    fmt.Sprint(evt.Code),
+				Message: evt.Message,
+			}
+			if evt.Code == nil {
+				details.Code = ""
+			}
+			return details, append([]byte(nil), payload...), true
 		}
-		if evt.Error.Code == nil {
-			details.Code = ""
-		}
-		return details, true
 	}
-	return sseErrorDetails{}, false
+	return sseErrorDetails{}, nil, false
 }
 
 // hasJSONArrayElements returns true if raw is a JSON array with at least one
@@ -296,6 +383,13 @@ func DefaultRedundancySettings() RedundancySettings {
 		SecondaryWaitAfterWinnerMS:   300000,
 		ParallelAdvantageThreshold:   0.5,
 		UnresponsiveThreshold:        1.0,
+		SpeedPolicy:                  RedundancySpeedPolicyHybrid,
+		PairwiseBudgetPercentile:     0.90,
+		PairwiseMaxProactiveAttempts: 3,
+		PairwiseMinDirectComparisons: 4,
+		PairwiseWinnerHoldMS:         500,
+		PairwiseWinnerHoldMinSpeedup: 0.10,
+		PairwiseWinnerHoldMinSamples: 6,
 	}
 }
 
@@ -328,6 +422,28 @@ func ApplyRedundancySettings(settings RedundancySettings) {
 	if settings.UnresponsiveThreshold <= 0 || settings.UnresponsiveThreshold > 1 {
 		settings.UnresponsiveThreshold = defaults.UnresponsiveThreshold
 	}
+	settings.SpeedPolicy = normalizeRedundancySpeedPolicy(settings.SpeedPolicy)
+	if settings.SpeedPolicy == "" {
+		settings.SpeedPolicy = defaults.SpeedPolicy
+	}
+	if settings.PairwiseBudgetPercentile <= 0 || settings.PairwiseBudgetPercentile >= 1 {
+		settings.PairwiseBudgetPercentile = defaults.PairwiseBudgetPercentile
+	}
+	if settings.PairwiseMaxProactiveAttempts <= 0 {
+		settings.PairwiseMaxProactiveAttempts = defaults.PairwiseMaxProactiveAttempts
+	}
+	if settings.PairwiseMinDirectComparisons <= 0 {
+		settings.PairwiseMinDirectComparisons = defaults.PairwiseMinDirectComparisons
+	}
+	if settings.PairwiseWinnerHoldMS < 0 {
+		settings.PairwiseWinnerHoldMS = defaults.PairwiseWinnerHoldMS
+	}
+	if settings.PairwiseWinnerHoldMinSpeedup <= 0 || settings.PairwiseWinnerHoldMinSpeedup >= 1 {
+		settings.PairwiseWinnerHoldMinSpeedup = defaults.PairwiseWinnerHoldMinSpeedup
+	}
+	if settings.PairwiseWinnerHoldMinSamples <= 0 {
+		settings.PairwiseWinnerHoldMinSamples = defaults.PairwiseWinnerHoldMinSamples
+	}
 	ReceiptTimeout = time.Duration(settings.ReceiptTimeoutMS) * time.Millisecond
 	FirstTokenTimeoutCap = time.Duration(settings.FirstTokenTimeoutFloorMS) * time.Millisecond
 	PerInputTokenFirstTokenLag = time.Duration(settings.PerInputTokenFirstTokenLagMS) * time.Millisecond
@@ -337,6 +453,26 @@ func ApplyRedundancySettings(settings RedundancySettings) {
 	SecondaryWaitAfterWinner = time.Duration(settings.SecondaryWaitAfterWinnerMS) * time.Millisecond
 	ParallelAdvantageThreshold = settings.ParallelAdvantageThreshold
 	UnresponsiveThreshold = settings.UnresponsiveThreshold
+	RedundancySpeedPolicy = settings.SpeedPolicy
+	PairwiseBudgetPercentile = settings.PairwiseBudgetPercentile
+	PairwiseMaxProactiveAttempts = settings.PairwiseMaxProactiveAttempts
+	PairwiseMinDirectComparisons = settings.PairwiseMinDirectComparisons
+	PairwiseWinnerHold = time.Duration(settings.PairwiseWinnerHoldMS) * time.Millisecond
+	PairwiseWinnerHoldMinSpeedup = settings.PairwiseWinnerHoldMinSpeedup
+	PairwiseWinnerHoldMinSamples = settings.PairwiseWinnerHoldMinSamples
+}
+
+func normalizeRedundancySpeedPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", RedundancySpeedPolicyHybrid:
+		return RedundancySpeedPolicyHybrid
+	case RedundancySpeedPolicyLegacy:
+		return RedundancySpeedPolicyLegacy
+	case RedundancySpeedPolicyPairwise:
+		return RedundancySpeedPolicyPairwise
+	default:
+		return policy
+	}
 }
 
 var maxSpeculativeAttempts atomic.Int64
@@ -351,9 +487,10 @@ func CurrentMaxSpeculativeAttempts() int {
 
 // Decision describes whether and when to start a parallel secondary inference.
 type Decision struct {
-	RunSecondary bool
-	Delay        time.Duration // 0 = immediate
-	Reason       string
+	RunSecondary      bool
+	Delay             time.Duration // 0 = immediate
+	Reason            string
+	ImmediateAttempts int
 }
 
 // Redundancy runs one request reliably, using extra attempts when needed.
@@ -392,6 +529,8 @@ var ErrAllHostsExcluded = errors.New("redundancy: request has tried every host i
 // attempts, lets existing in-flights finish, and surfaces this error
 // to the user only when there is no other attempt to wait on.
 var ErrNoAvailableHost = errors.New("redundancy: no currently-available host outside the request's exclude set")
+
+var pairwiseABRandom = rand.Float64
 
 func NewRedundancy(session *user.Session, perf *PerfTracker, groupSize int, model string) *Redundancy {
 	return NewRedundancyWithThrottle(session, perf, groupSize, model, nil)
@@ -433,14 +572,183 @@ func (e *Redundancy) Decide(primaryHostIdx int, inputTokens uint64) Decision {
 
 	// Rule 1: primary is known unresponsive → immediate parallel
 	if e.perf.IsUnresponsiveParticipant(primaryParticipant) {
-		return Decision{RunSecondary: true, Delay: 0, Reason: "primary_unresponsive"}
+		return Decision{RunSecondary: true, Delay: 0, Reason: "primary_unresponsive", ImmediateAttempts: 1}
 	}
 
-	// Rule 2: secondary is >50% faster → immediate parallel
+	if RedundancySpeedPolicy != RedundancySpeedPolicyLegacy {
+		if decision, ok := e.decidePairwiseSpeedup(primaryHostIdx, inputTokens); ok {
+			return decision
+		}
+		if RedundancySpeedPolicy == RedundancySpeedPolicyPairwise {
+			return Decision{RunSecondary: true, Delay: receiptTimeoutForInput(inputTokens), Reason: "pairwise_insufficient_data"}
+		}
+	}
+
+	return e.decideLegacySecondaryFaster(primaryParticipant, secondaryParticipant, inputTokens)
+}
+
+func (e *Redundancy) decidePairwiseSpeedup(primaryHostIdx int, inputTokens uint64) (Decision, bool) {
+	if e == nil || e.perf == nil || e.perf.pairwise == nil || e.groupSize <= 1 {
+		return Decision{}, false
+	}
+	primary := e.participantKeyForHost(primaryHostIdx)
+	if !e.pairwiseParticipantAvailable(primary) {
+		return Decision{}, false
+	}
+	candidates := e.pairwiseCandidateParticipants(primaryHostIdx, primary)
+	if len(candidates) == 0 {
+		return Decision{}, false
+	}
+	cutoff, cutoffOK := e.perf.pairwise.SpeedupCutoffForParticipants(e.model, inputTokens, e.pairwiseParticipantAvailable)
+	bestCost := 1.0
+	accepted := 0
+	acceptedPath := []string{}
+	deterministicAccepted := false
+	if cutoffOK && cutoff > 0 {
+		for idx, candidate := range candidates {
+			if accepted >= PairwiseMaxProactiveAttempts {
+				break
+			}
+			step := idx + 1
+			ratio, confidence, ok := e.perf.pairwise.EstimateRatio(e.model, inputTokens, primary, candidate, acceptedPath)
+			if !ok || ratio <= 1 {
+				continue
+			}
+			candidateCost := 1 / ratio
+			var score float64
+			if accepted == 0 && step > 1 {
+				score = ((bestCost - candidateCost) / bestCost) * confidence / float64(step)
+			} else {
+				score = ((bestCost - candidateCost) / bestCost) * confidence
+			}
+			if score < cutoff {
+				if accepted == 0 {
+					acceptedPath = append(acceptedPath, candidate)
+				}
+				continue
+			}
+			if accepted == 0 && step > 1 {
+				accepted = step
+			} else {
+				accepted++
+			}
+			deterministicAccepted = true
+			if candidateCost < bestCost {
+				bestCost = candidateCost
+			}
+			acceptedPath = append(acceptedPath, candidate)
+		}
+	}
+	sampledAttempts := e.pairwiseABAdditionalAttempts(primary, candidates, accepted, inputTokens)
+	if sampledAttempts > 0 {
+		accepted += sampledAttempts
+	}
+	if accepted <= 0 {
+		return Decision{}, false
+	}
+	if accepted > PairwiseMaxProactiveAttempts {
+		accepted = PairwiseMaxProactiveAttempts
+	}
+	reason := "pairwise_budgeted_speedup"
+	if sampledAttempts > 0 && !deterministicAccepted {
+		reason = "pairwise_ab_sample"
+	}
+	return Decision{
+		RunSecondary:      true,
+		Delay:             0,
+		Reason:            reason,
+		ImmediateAttempts: accepted,
+	}, true
+}
+
+func (e *Redundancy) pairwiseCandidateParticipants(primaryHostIdx int, primary string) []string {
+	seen := map[string]bool{primary: true}
+	candidates := make([]string, 0, e.groupSize-1)
+	for step := 1; step <= e.groupSize-1; step++ {
+		candidateIdx := (primaryHostIdx + step) % e.groupSize
+		candidate := e.participantKeyForHost(candidateIdx)
+		if candidate == "" || seen[candidate] || !e.pairwiseParticipantAvailable(candidate) {
+			continue
+		}
+		seen[candidate] = true
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func (e *Redundancy) pairwiseABAdditionalAttempts(primary string, candidates []string, accepted int, inputTokens uint64) int {
+	if accepted < 0 || accepted >= PairwiseMaxProactiveAttempts || accepted >= len(candidates) {
+		return 0
+	}
+	additional := 0
+	currentAccepted := accepted
+
+	if currentAccepted == 0 && e.perf.pairwise.DirectSampleCount(e.model, inputTokens, primary, candidates[0]) < PairwiseMinDirectComparisons {
+		additional++
+		currentAccepted++
+	}
+
+	if currentAccepted == 1 && currentAccepted < len(candidates) && currentAccepted < PairwiseMaxProactiveAttempts {
+		failedB := candidates[0]
+		c := candidates[1]
+		if e.perf.pairwise.NeedsFailedComparisonFollowUp(e.model, inputTokens, primary, failedB, c) {
+			additional++
+			currentAccepted++
+		}
+	}
+
+	if currentAccepted >= PairwiseMaxProactiveAttempts || currentAccepted >= len(candidates) {
+		return additional
+	}
+
+	latest := primary
+	if currentAccepted > 0 {
+		latest = candidates[currentAccepted-1]
+	}
+	next := candidates[currentAccepted]
+	samples := e.perf.pairwise.DirectSampleCount(e.model, inputTokens, latest, next)
+	rate := PairwiseABSampleRate
+	if samples < PairwiseABSparseSampleThreshold {
+		rate = PairwiseABSparseSampleRate
+	}
+	if rate <= 0 {
+		return additional
+	}
+	if rate >= 1 {
+		return additional + 1
+	}
+	if pairwiseABRandom() < rate {
+		return additional + 1
+	}
+	return additional
+}
+
+func (e *Redundancy) pairwiseParticipantAvailable(participantKey string) bool {
+	if participantKey == "" {
+		return false
+	}
+	if shouldUseProbeForParticipant(participantKey) {
+		return false
+	}
+	if e != nil {
+		if e.perf != nil && e.perf.IsUnresponsiveParticipant(participantKey) {
+			return false
+		}
+		if e.participantLimiter != nil && (e.participantLimiter.IsBlocked(participantKey) || e.participantLimiter.IsRecentlyQuarantined(participantKey)) {
+			return false
+		}
+	}
+	return true
+}
+
+// Deprecated fallback: retained while pairwise routing warms up. Remove after
+// pairwise speed policy has enough production coverage and legacy fallback has
+// been disabled for one release.
+func (e *Redundancy) decideLegacySecondaryFaster(primaryParticipant, secondaryParticipant string, inputTokens uint64) Decision {
 	primaryEst := e.perf.EstimatedTimeMsForParticipant(primaryParticipant, inputTokens)
 	secondaryEst := e.perf.EstimatedTimeMsForParticipant(secondaryParticipant, inputTokens)
 	if primaryEst > 0 && secondaryEst > 0 && secondaryEst < primaryEst*(1-ParallelAdvantageThreshold) {
-		return Decision{RunSecondary: true, Delay: 0, Reason: "secondary_faster"}
+		return Decision{RunSecondary: true, Delay: 0, Reason: "secondary_faster", ImmediateAttempts: 1}
 	}
 
 	// Rule 3: default — start secondary after the request-sized receipt timeout.
@@ -527,6 +835,7 @@ type raceGroup struct {
 	winner         uint64 // 0 = undecided
 	winnerCh       chan struct{}
 	w              io.Writer
+	holdCandidates map[uint64]*inflight
 	decided        atomic.Bool
 	clientDetached atomic.Bool
 	logCtx         context.Context
@@ -552,6 +861,81 @@ func (rg *raceGroup) setWinner(nonce uint64) {
 		rg.decided.Store(true)
 		close(rg.winnerCh)
 		logInferenceStage(rg.logCtx, rg.escrow, nonce, "winner_selected")
+	}
+}
+
+func (rg *raceGroup) addWinnerHoldCandidate(inf *inflight) {
+	if rg == nil || inf == nil || PairwiseWinnerHold <= 0 {
+		return
+	}
+	rg.mu.Lock()
+	defer rg.mu.Unlock()
+	if rg.holdCandidates == nil {
+		rg.holdCandidates = make(map[uint64]*inflight)
+	}
+	rg.holdCandidates[inf.nonce] = inf
+}
+
+func (rg *raceGroup) maybeHoldWinnerCandidate(candidate *inflight) {
+	if rg == nil || candidate == nil || PairwiseWinnerHold <= 0 {
+		return
+	}
+	rg.mu.Lock()
+	if rg.winner != 0 {
+		rg.mu.Unlock()
+		return
+	}
+	holdUntil := time.Now().Add(PairwiseWinnerHold)
+	preferred := make([]*inflight, 0, len(rg.holdCandidates))
+	for nonce, inf := range rg.holdCandidates {
+		if nonce == candidate.nonce || inf == nil || inflightDone(inf) {
+			continue
+		}
+		preferred = append(preferred, inf)
+	}
+	rg.mu.Unlock()
+	if len(preferred) == 0 {
+		return
+	}
+	logInferenceStage(rg.logCtx, candidate.escrowID, candidate.nonce, "pairwise_winner_hold_started",
+		"host", candidate.hostID,
+		"preferred_attempts", len(preferred),
+		"hold_ms", PairwiseWinnerHold.Milliseconds(),
+	)
+	timer := time.NewTimer(time.Until(holdUntil))
+	defer timer.Stop()
+	for {
+		rg.mu.Lock()
+		winner := rg.winner
+		rg.mu.Unlock()
+		if winner != 0 {
+			logInferenceStage(rg.logCtx, candidate.escrowID, candidate.nonce, "pairwise_winner_hold_resolved",
+				"host", candidate.hostID,
+				"winner_nonce", winner,
+			)
+			return
+		}
+		if allInflightsDone(preferred) {
+			logInferenceStage(rg.logCtx, candidate.escrowID, candidate.nonce, "pairwise_winner_hold_no_preferred",
+				"host", candidate.hostID,
+			)
+			return
+		}
+		select {
+		case <-rg.winnerCh:
+			logInferenceStage(rg.logCtx, candidate.escrowID, candidate.nonce, "pairwise_winner_hold_resolved",
+				"host", candidate.hostID,
+				"winner_nonce", rg.winnerNonce(),
+			)
+			return
+		case <-timer.C:
+			logInferenceStage(rg.logCtx, candidate.escrowID, candidate.nonce, "pairwise_winner_hold_expired",
+				"host", candidate.hostID,
+			)
+			return
+		case <-candidate.done:
+			return
+		}
 	}
 }
 
@@ -639,6 +1023,7 @@ func (rw *raceWriter) Write(p []byte) (int, error) {
 	}
 	if chunkHasContent || chunkHasError {
 		rw.inf.contentChunks.Add(1)
+		rw.group.maybeHoldWinnerCandidate(rw.inf)
 		rw.group.setWinner(rw.nonce)
 	}
 
@@ -808,10 +1193,24 @@ func (e *Redundancy) RunInference(ctx context.Context, params user.InferencePara
 	e.startInflight(settleCtx, primary, race, params)
 
 	if decision.RunSecondary && decision.Delay == 0 && len(attempts) < maxAttempts {
-		logRequestStage(ctx, "secondary_immediate_start", "escrow", e.devshardID, "decision", decision.Reason)
-		primary.escalated = true
-		if secondary := e.startAdditionalInflight(ctx, settleCtx, race, params, "secondary_immediate_start", primary, decision.Reason, triedParticipants); secondary != nil {
-			attempts = append(attempts, secondary)
+		immediateAttempts := decision.ImmediateAttempts
+		if immediateAttempts <= 0 {
+			immediateAttempts = 1
+		}
+		for i := 0; i < immediateAttempts && len(attempts) < maxAttempts; i++ {
+			logRequestStage(ctx, "secondary_immediate_start",
+				"escrow", e.devshardID,
+				"decision", decision.Reason,
+				"attempt_index", i+1,
+				"immediate_attempts", immediateAttempts,
+			)
+			trigger := attempts[len(attempts)-1]
+			trigger.escalated = true
+			if secondary := e.startAdditionalInflight(ctx, settleCtx, race, params, "secondary_immediate_start", trigger, decision.Reason, triedParticipants); secondary != nil {
+				attempts = append(attempts, secondary)
+			} else {
+				break
+			}
 		}
 	} else if decision.RunSecondary && decision.Delay == 0 {
 		logInferenceStage(ctx, primary.escrowID, primary.nonce, "secondary_immediate_skipped",
@@ -1004,7 +1403,7 @@ func (e *Redundancy) startAdditionalInflight(streamCtx, settleCtx context.Contex
 		return nil
 	}
 	fields := []any{"host", trigger.hostID}
-	if delay := escalationDelay(stage, params.InputLength); delay > 0 {
+	if delay := e.escalationDelay(stage, params); delay > 0 {
 		fields = append(fields, "delay_ms", delay.Milliseconds())
 	}
 	logInferenceStage(settleCtx, trigger.escrowID, trigger.nonce, stage, fields...)
@@ -1037,19 +1436,60 @@ func (e *Redundancy) startAdditionalInflight(streamCtx, settleCtx context.Contex
 	if e.metrics != nil {
 		e.metrics.RecordSpeculativeAttemptStart(reason)
 	}
+	if reason == "pairwise_budgeted_speedup" {
+		e.maybeAddPairwiseWinnerHoldCandidate(race, params, trigger, next)
+	}
 	e.startInflight(settleCtx, next, race, params)
 	return next
 }
 
-func firstTokenFallbackDelay(inputTokens uint64) time.Duration {
-	delay := time.Duration(inputTokens) * PerInputTokenFirstTokenLag
+func (e *Redundancy) maybeAddPairwiseWinnerHoldCandidate(race *raceGroup, params user.InferenceParams, trigger, next *inflight) {
+	if e == nil || e.perf == nil || e.perf.pairwise == nil || race == nil || trigger == nil || next == nil {
+		return
+	}
+	triggerParticipant := e.session.HostParticipantKey(trigger.hostIdx)
+	nextParticipant := e.session.HostParticipantKey(next.hostIdx)
+	speedup, samples, ok := e.perf.pairwise.HoldEligible(params.Model, params.InputLength, triggerParticipant, nextParticipant)
+	if !ok {
+		return
+	}
+	race.addWinnerHoldCandidate(next)
+	logRequestStage(race.logCtx, "pairwise_winner_hold_candidate",
+		"escrow", e.devshardID,
+		"from_nonce", trigger.nonce,
+		"from_host", trigger.hostID,
+		"to_nonce", next.nonce,
+		"to_host", next.hostID,
+		"speedup", speedup,
+		"samples", samples,
+		"hold_ms", PairwiseWinnerHold.Milliseconds(),
+	)
+}
+
+func defaultFirstTokenFallbackDelay(inputTokens uint64) time.Duration {
+	tokens := float64(inputTokens)
+	seconds := 1.7 + 0.00003*tokens + 0.0000000005*tokens*tokens
+	if seconds < 0 {
+		seconds = 0
+	}
+	delay := time.Duration(seconds * float64(time.Second))
 	if delay < FirstTokenTimeoutCap {
 		delay = FirstTokenTimeoutCap
 	}
-	if inputTokens > 50_000 {
-		delay = time.Duration(float64(delay) * (float64(inputTokens) / 50_000.0))
-	}
 	return delay
+}
+
+func (e *Redundancy) firstTokenFallbackDelay(params user.InferenceParams) time.Duration {
+	model := params.Model
+	if model == "" && e != nil {
+		model = e.model
+	}
+	if e != nil && e.perf != nil {
+		if delay, ok := e.perf.FirstTokenFallbackDelay(model, params.InputLength); ok {
+			return delay
+		}
+	}
+	return defaultFirstTokenFallbackDelay(params.InputLength)
 }
 
 func receiptTimeoutForInput(inputTokens uint64) time.Duration {
@@ -1161,6 +1601,9 @@ func (e *Redundancy) winningInflightTerminalFailure(inf *inflight) (failed bool,
 	if ok {
 		return false, nil
 	}
+	if hostErr := hostApplicationErrorFromInflight(inf); hostErr != nil {
+		return true, hostErr
+	}
 	return true, fmt.Errorf("inference: winner inference incomplete (nonce_finished=%v)", nonceFinished)
 }
 
@@ -1200,7 +1643,7 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 			}
 		}
 
-		trigger, hasTrigger := nextEscalationTrigger(attempts, params)
+		trigger, hasTrigger := e.nextEscalationTrigger(attempts, params)
 		maxAttempts := e.maxAttempts()
 		var escalationTimer *time.Timer
 		var escalationC <-chan time.Time
@@ -1249,6 +1692,7 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 					if escalationTimer != nil {
 						stopTimer(escalationTimer)
 					}
+					e.recordWinnerTerminalFailureOnce(inf, params, w)
 					go e.finishRaceWhenPendingDone(settleCtx, attempts, params, decision, w, raceFinishOptions{
 						forceTreatAsFailure:  true,
 						recordFailureSamples: true,
@@ -1269,7 +1713,7 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 			// every primary that receipts-in under ReceiptTimeout, i.e. the
 			// majority of a healthy run. Skip and let the loop re-schedule
 			// the correct next trigger.
-			current, stillValid := escalationForInflight(trigger.inf, params)
+			current, stillValid := e.escalationForInflight(trigger.inf, params)
 			if !stillValid || current.stage != trigger.stage {
 				break
 			}
@@ -1336,13 +1780,13 @@ func (e *Redundancy) watchInflightDone(inf *inflight, doneCh chan<- *inflight) {
 	}()
 }
 
-func nextEscalationTrigger(attempts []*inflight, params user.InferenceParams) (escalationTrigger, bool) {
+func (e *Redundancy) nextEscalationTrigger(attempts []*inflight, params user.InferenceParams) (escalationTrigger, bool) {
 	var (
 		chosen escalationTrigger
 		ok     bool
 	)
 	for _, inf := range attempts {
-		trigger, candidate := escalationForInflight(inf, params)
+		trigger, candidate := e.escalationForInflight(inf, params)
 		if !candidate {
 			continue
 		}
@@ -1354,7 +1798,7 @@ func nextEscalationTrigger(attempts []*inflight, params user.InferenceParams) (e
 	return chosen, ok
 }
 
-func escalationForInflight(inf *inflight, params user.InferenceParams) (escalationTrigger, bool) {
+func (e *Redundancy) escalationForInflight(inf *inflight, params user.InferenceParams) (escalationTrigger, bool) {
 	if inf == nil || inf.escalated {
 		return escalationTrigger{}, false
 	}
@@ -1401,20 +1845,20 @@ func escalationForInflight(inf *inflight, params user.InferenceParams) (escalati
 	}
 	return escalationTrigger{
 		inf:      inf,
-		deadline: inf.sendTime.Add(firstTokenFallbackDelay(params.InputLength)),
+		deadline: inf.sendTime.Add(e.firstTokenFallbackDelay(params)),
 		stage:    "first_token_timeout_wait_elapsed",
 		reason:   "first_token_timeout",
 	}, true
 }
 
-func escalationDelay(stage string, inputTokens uint64) time.Duration {
+func (e *Redundancy) escalationDelay(stage string, params user.InferenceParams) time.Duration {
 	switch stage {
 	case "receipt_timeout_wait_elapsed":
-		return receiptTimeoutForInput(inputTokens)
+		return receiptTimeoutForInput(params.InputLength)
 	case "first_token_timeout_wait_elapsed":
-		return firstTokenFallbackDelay(inputTokens)
+		return e.firstTokenFallbackDelay(params)
 	case "response_timeout_wait_elapsed":
-		return nonStreamingFallbackDelay(inputTokens)
+		return nonStreamingFallbackDelay(params.InputLength)
 	case "attempt_failed":
 		return 0
 	default:
@@ -1674,12 +2118,61 @@ func shouldRunHandleTimeout(inf *inflight, session *user.Session) bool {
 	return !session.IsNonceFinished(inf.nonce)
 }
 
+func longResponseFailureExempt(inf *inflight, session *user.Session) bool {
+	if inf == nil || session == nil || inf.probe || inf.sendTime.IsZero() {
+		return false
+	}
+	if session.IsNonceFinished(inf.nonce) {
+		return false
+	}
+	if inf.contentChunks.Load() == 0 {
+		return false
+	}
+	return time.Since(inf.sendTime) >= longResponseFailureExemption
+}
+
+func (e *Redundancy) longResponseFailureExempt(inf *inflight) bool {
+	if e == nil {
+		return false
+	}
+	return longResponseFailureExempt(inf, e.session)
+}
+
 func isFailedStreamAttempt(inf *inflight) bool {
-	return isEmptyStreamAttempt(inf)
+	return isEmptyStreamAttempt(inf) || isErrorStreamAttempt(inf)
 }
 
 func isErrorStreamAttempt(inf *inflight) bool {
 	return inf != nil && inf.errorSource != ""
+}
+
+func hostApplicationErrorFromInflight(inf *inflight) *hostApplicationError {
+	if !isErrorStreamAttempt(inf) {
+		return nil
+	}
+	details, payload, ok := sseChunkErrorPayload(inf.errorBodySample)
+	if !ok {
+		details = sseErrorDetails{
+			Code:    inf.errorCode,
+			Type:    inf.errorType,
+			Message: inf.errorMessage,
+		}
+	}
+	return &hostApplicationError{details: details, payload: payload}
+}
+
+func hostApplicationErrorFromAttempts(attempts []*inflight, winnerNonce uint64) *hostApplicationError {
+	if winner := inflightByNonce(attempts, winnerNonce); winner != nil {
+		if err := hostApplicationErrorFromInflight(winner); err != nil {
+			return err
+		}
+	}
+	for _, inf := range attempts {
+		if err := hostApplicationErrorFromInflight(inf); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // inflightFinished checks the raw response for MsgFinishInference.
@@ -1731,6 +2224,12 @@ func inflightByNonce(attempts []*inflight, nonce uint64) *inflight {
 }
 
 func (e *Redundancy) recordSampleOnce(inf *inflight, params user.InferenceParams) {
+	if isErrorStreamAttempt(inf) {
+		return
+	}
+	if e.longResponseFailureExempt(inf) {
+		return
+	}
 	inf.sampleOnce.Do(func() {
 		e.recordSample(inf, params)
 	})
@@ -1747,6 +2246,17 @@ func (e *Redundancy) recordStartedAttemptSamples(attempts []*inflight, params us
 
 func (e *Redundancy) recordStalledWinnerFailureOnce(inf *inflight, params user.InferenceParams) {
 	if inf == nil {
+		return
+	}
+	if isErrorStreamAttempt(inf) {
+		// TODO: Hosts should submit MsgFinishInference for model/client error
+		// responses too. Until that is fixed across hosts, do not punish a
+		// participant that returned a valid OpenAI-style error just because the
+		// nonce did not finish. Restore normal stalled-winner accounting here
+		// once error responses reliably finish on-chain.
+		return
+	}
+	if e.longResponseFailureExempt(inf) {
 		return
 	}
 	inf.sampleOnce.Do(func() {
@@ -1771,6 +2281,19 @@ func (e *Redundancy) recordStalledWinnerFailureOnce(inf *inflight, params user.I
 			e.metrics.ObserveRequestSample(e.devshardID, sample)
 		}
 	})
+}
+
+func (e *Redundancy) recordWinnerTerminalFailureOnce(inf *inflight, params user.InferenceParams, winnerNonce uint64) {
+	if inf == nil || inf.probe || inf.nonce != winnerNonce {
+		return
+	}
+	if inf.contentChunks.Load() == 0 {
+		return
+	}
+	if e.longResponseFailureExempt(inf) {
+		return
+	}
+	e.recordStalledWinnerFailureOnce(inf, params)
 }
 
 func (e *Redundancy) processInflightOnce(inf *inflight) error {
@@ -1846,6 +2369,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		}
 		logInferenceStage(ctx, inf.escrowID, inf.nonce, "race_completed", fields...)
 		if !ok {
+			e.recordWinnerTerminalFailureOnce(inf, params, winnerNonce)
 			failed = append(failed, inf)
 		}
 	}
@@ -1859,9 +2383,24 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 				logInferenceStage(ctx, inf.escrowID, inf.nonce, "poc_probe_failed_no_timeout", "host", inf.hostID, "poc_reason", currentPoCPhaseReason())
 				continue
 			}
+			if isErrorStreamAttempt(inf) {
+				logInferenceStage(ctx, inf.escrowID, inf.nonce, "timeout_skipped",
+					"host", inf.hostID, "reason", "error_stream_without_finish")
+				continue
+			}
 			if !shouldRunHandleTimeout(inf, e.session) {
 				logInferenceStage(ctx, inf.escrowID, inf.nonce, "timeout_skipped",
 					"host", inf.hostID, "reason", "nonce_already_finished")
+				continue
+			}
+			if e.longResponseFailureExempt(inf) {
+				logInferenceStage(ctx, inf.escrowID, inf.nonce, "timeout_skipped",
+					"host", inf.hostID,
+					"reason", "long_response_after_content",
+					"elapsed_ms", time.Since(inf.sendTime).Milliseconds(),
+					"content_chunks", inf.contentChunks.Load(),
+					"output_bytes", inf.outputBytes.Load(),
+				)
 				continue
 			}
 			payload := &host.InferencePayload{
@@ -1878,6 +2417,12 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 			if err != nil {
 				logInferenceStage(ctx, inf.escrowID, inf.nonce, "timeout_failed", "host", inf.hostID, "error", err)
 			}
+		}
+		if hostErr := hostApplicationErrorFromAttempts(attempts, winnerNonce); hostErr != nil {
+			logRequestStage(ctx, "request_failed", "escrow", e.devshardID, "error", hostErr)
+			e.logRequestSettled(ctx, 0, decision, "failed")
+			e.checkEscrowMissing(ctx, attempts)
+			return hostErr
 		}
 		errMsg := "inference: no non-probe attempt finished"
 		if opts.forceTreatAsFailure && anySucceeded {
@@ -1899,6 +2444,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 	}
 	e.perf.RecordRequest(RequestRecord{
 		Timestamp:     time.Now(),
+		Model:         params.Model,
 		InputTokens:   params.InputLength,
 		WinnerHostIdx: winnerIdx,
 		WinnerNonce:   winnerNonce,
@@ -1922,9 +2468,24 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 						logInferenceStage(bgCtx, inf.escrowID, inf.nonce, "poc_probe_failed_no_timeout", "host", inf.hostID, "poc_reason", currentPoCPhaseReason())
 						continue
 					}
+					if isErrorStreamAttempt(inf) {
+						logInferenceStage(bgCtx, inf.escrowID, inf.nonce, "timeout_skipped",
+							"host", inf.hostID, "reason", "error_stream_without_finish")
+						continue
+					}
 					if !shouldRunHandleTimeout(inf, e.session) {
 						logInferenceStage(bgCtx, inf.escrowID, inf.nonce, "timeout_skipped",
 							"host", inf.hostID, "reason", "nonce_already_finished")
+						continue
+					}
+					if e.longResponseFailureExempt(inf) {
+						logInferenceStage(bgCtx, inf.escrowID, inf.nonce, "timeout_skipped",
+							"host", inf.hostID,
+							"reason", "long_response_after_content",
+							"elapsed_ms", time.Since(inf.sendTime).Milliseconds(),
+							"content_chunks", inf.contentChunks.Load(),
+							"output_bytes", inf.outputBytes.Load(),
+						)
 						continue
 					}
 					result, err := e.session.HandleTimeout(bgCtx, inf.nonce, inf.sendTime, payload)
@@ -2000,12 +2561,13 @@ func (e *Redundancy) logRequestSettled(ctx context.Context, winnerNonce uint64, 
 func (e *Redundancy) buildInvolvement(inf *inflight, winnerNonce uint64) HostInvolvement {
 	notFailedStream := !isFailedStreamAttempt(inf)
 	hi := HostInvolvement{
-		HostIdx:      inf.hostIdx,
-		Nonce:        inf.nonce,
-		OutputChunks: inf.outputChunks.Load(),
-		Responsive:   inf.resp != nil && inf.resp.ConfirmedAt > 0 && notFailedStream,
-		Finished:     e.session.IsNonceFinished(inf.nonce) && notFailedStream,
-		Winner:       inf.nonce == winnerNonce,
+		HostIdx:        inf.hostIdx,
+		ParticipantKey: e.participantKeyForHost(inf.hostIdx),
+		Nonce:          inf.nonce,
+		OutputChunks:   inf.outputChunks.Load(),
+		Responsive:     inf.resp != nil && inf.resp.ConfirmedAt > 0 && notFailedStream,
+		Finished:       e.session.IsNonceFinished(inf.nonce) && notFailedStream,
+		Winner:         inf.nonce == winnerNonce,
 	}
 	if !inf.sendTime.IsZero() {
 		if !inf.receiptTime.IsZero() {
