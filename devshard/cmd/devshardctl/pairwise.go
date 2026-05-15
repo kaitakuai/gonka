@@ -151,11 +151,11 @@ func (t *PairwiseTracker) RecordRequest(rec RequestRecord) {
 }
 
 func scoreablePairwiseHost(h HostInvolvement) bool {
-	return h.ParticipantKey != "" && h.Finished && h.Responsive && h.TotalTimeMs > 0
+	return !h.ExcludePairwise && h.ParticipantKey != "" && h.Finished && h.Responsive && h.TotalTimeMs > 0
 }
 
 func failedPairwiseHost(h HostInvolvement) bool {
-	return h.ParticipantKey != "" && !scoreablePairwiseHost(h)
+	return !h.ExcludePairwise && h.ParticipantKey != "" && !scoreablePairwiseHost(h)
 }
 
 func (t *PairwiseTracker) recordFailedFollowUps(rec RequestRecord, bucket string, now time.Time) {

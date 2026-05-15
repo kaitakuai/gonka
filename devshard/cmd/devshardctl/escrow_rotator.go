@@ -23,6 +23,7 @@ var (
 	errDevshardBusy                   = errors.New("devshard has active requests")
 	errEscrowRotationCreateSuppressed = errors.New("escrow rotation create already failed for this epoch")
 	gatewayCreateRotationEscrow       = (*Gateway).createRotationEscrow
+	gatewayCreateDepletionEscrow      func(*Gateway, context.Context, GatewaySettings, EscrowRotationModelSettings, string, uint64) (*CreateDevshardEscrowResult, error)
 	gatewaySettleDevshardOnChain      = (*Gateway).settleDevshardOnChain
 )
 

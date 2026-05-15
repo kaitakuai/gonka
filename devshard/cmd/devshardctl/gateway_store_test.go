@@ -118,7 +118,7 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 		MaxConcurrentRequests:   5,
 		MaxInputTokensInFlight:  500,
 		ModelLimits: []GatewayModelLimitSettings{
-			{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700},
+			{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700, DefaultRequestMaxTokens: 3072, RequestMaxTokensCap: 4096},
 			{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300},
 		},
 		ModelAccess: []GatewayModelAccessSettings{
@@ -170,7 +170,7 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 	require.EqualValues(t, 5, state.Settings.MaxConcurrentRequests)
 	require.EqualValues(t, 500, state.Settings.MaxInputTokensInFlight)
 	require.Equal(t, []GatewayModelLimitSettings{
-		{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700},
+		{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700, DefaultRequestMaxTokens: 3072, RequestMaxTokensCap: 4096},
 		{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300},
 	}, state.Settings.ModelLimits)
 	require.Equal(t, []GatewayModelAccessSettings{

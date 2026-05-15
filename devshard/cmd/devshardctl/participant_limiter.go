@@ -498,8 +498,9 @@ func (l *ParticipantRequestLimiter) ObserveSuccessfulInference(participantKey st
 	l.persistThrottledStateLocked(participantKey, state, participantStatusTransport)
 }
 
-// ClearQuarantine removes quarantine and resets the token bucket for
-// the given participant, making it immediately available for requests.
+// ClearQuarantine removes quarantine and resets the token bucket for the
+// given participant, making it immediately available for requests while
+// keeping it on the same post-quarantine probation path as natural expiry.
 // Returns true if the participant had state to clear.
 func (l *ParticipantRequestLimiter) ClearQuarantine(participantKey string) bool {
 	if participantKey == "" {
@@ -507,11 +508,16 @@ func (l *ParticipantRequestLimiter) ClearQuarantine(participantKey string) bool 
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, ok := l.participants[participantKey]
+	state, ok := l.participants[participantKey]
 	if !ok {
 		return false
 	}
-	delete(l.participants, participantKey)
+	now := time.Now()
+	state.tokens = l.burst
+	state.lastRefill = now
+	state.quarantineUntil = time.Time{}
+	state.emptyStreamStreak = 0
+	state.probationSuccessesRemaining = participantProbationSuccessesAfterQuarantine
 	l.persistDeleteLocked(participantKey)
 	log.Printf("participant_quarantine_cleared participant_key=%s", participantKey)
 	return true

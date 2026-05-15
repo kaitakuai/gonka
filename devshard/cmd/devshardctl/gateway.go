@@ -37,27 +37,29 @@ type RuntimeConfig struct {
 }
 
 type Gateway struct {
-	runtimes           map[string]*devshardRuntime
-	runtimeOrder       []*devshardRuntime
-	limiter            *GatewayLimiter
-	participantLimiter *ParticipantRequestLimiter
-	phaseGate          *ChainPhaseGate
-	escrowChecker      *EscrowChecker
-	metrics            *DevshardMetrics
-	capacity           *CapacityState
-	settings           GatewaySettings
-	store              *GatewayStore
-	perf               *PerfTracker
-	perfStore          *PerfStore
-	baseStorageDir     string
-	rotatorStop        chan struct{}
-	rotatorDone        chan struct{}
-	rotationFailures   map[string]struct{}
-	finalizeMu         sync.Mutex
-	settlementMu       sync.Mutex
-	settlementInFlight map[string]struct{}
-	mu                 sync.Mutex
-	roundRobinSeed     atomic.Uint64
+	runtimes              map[string]*devshardRuntime
+	runtimeOrder          []*devshardRuntime
+	limiter               *GatewayLimiter
+	participantLimiter    *ParticipantRequestLimiter
+	phaseGate             *ChainPhaseGate
+	escrowChecker         *EscrowChecker
+	metrics               *DevshardMetrics
+	capacity              *CapacityState
+	settings              GatewaySettings
+	store                 *GatewayStore
+	perf                  *PerfTracker
+	perfStore             *PerfStore
+	baseStorageDir        string
+	rotatorStop           chan struct{}
+	rotatorDone           chan struct{}
+	rotationFailures      map[string]struct{}
+	finalizeMu            sync.Mutex
+	settlementMu          sync.Mutex
+	settlementInFlight    map[string]struct{}
+	replenishmentMu       sync.Mutex
+	replenishmentInFlight map[string]struct{}
+	mu                    sync.Mutex
+	roundRobinSeed        atomic.Uint64
 }
 
 type devshardRuntime struct {
@@ -135,7 +137,8 @@ type gatewayModelCapacityStatus struct {
 }
 
 var (
-	DefaultRequestMaxTokens uint64 = 10_000
+	DefaultRequestMaxTokens uint64 = 3_072
+	RequestMaxTokensCap     uint64 = 4_096
 
 	errRuntimePrivateKeyMissing = errors.New("private key missing")
 )
@@ -179,6 +182,7 @@ func newRuntimeMux(proxy *Proxy) http.Handler {
 	mux.HandleFunc("POST /v1/finalize", proxy.handleFinalize)
 	mux.HandleFunc("GET /v1/finalize", proxy.handleGetFinalize)
 	mux.HandleFunc("GET /v1/status", proxy.handleStatus)
+	mux.HandleFunc("GET /v1/requests/{request_id}", proxy.handleRequestAccounting)
 	mux.HandleFunc("GET /v1/state", proxy.handleState)
 	mux.HandleFunc("GET /v1/debug/pending", proxy.handleDebugPending)
 	mux.HandleFunc("GET /v1/debug/state", proxy.handleDebugState)
@@ -481,12 +485,40 @@ func (g *Gateway) attachRuntimeSharedState(rt *devshardRuntime) {
 	}
 	if rt.proxy != nil {
 		rt.proxy.phaseGate = g.phaseGate
+		limits := g.outputTokenLimitsForModel(firstNonEmpty(rt.model, g.settings.DefaultModel))
+		rt.proxy.defaultRequestMaxTokens = limits.DefaultMaxTokens
+		rt.proxy.requestMaxTokensCap = limits.MaxTokensCap
 	}
 	g.attachMetrics(rt)
 	g.attachEscrowChecker(rt)
 	if g.capacity != nil {
 		g.capacity.SetEscrowMembership(rt.id, rt.participantSlotCounts)
 	}
+}
+
+func (g *Gateway) outputTokenLimitsForModel(model string) outputTokenLimits {
+	if g == nil {
+		return defaultOutputTokenLimits()
+	}
+	settings := g.settings.WithTuningDefaults()
+	limits := outputTokenLimits{
+		DefaultMaxTokens: settings.DefaultRequestMaxTokens,
+		MaxTokensCap:     settings.RequestMaxTokensCap,
+	}
+	model = strings.TrimSpace(model)
+	for _, modelLimit := range settings.ModelLimits {
+		if modelLimit.ModelID != model {
+			continue
+		}
+		if modelLimit.DefaultRequestMaxTokens > 0 {
+			limits.DefaultMaxTokens = modelLimit.DefaultRequestMaxTokens
+		}
+		if modelLimit.RequestMaxTokensCap > 0 {
+			limits.MaxTokensCap = modelLimit.RequestMaxTokensCap
+		}
+		break
+	}
+	return normalizedOutputTokenLimits(limits)
 }
 
 const (
@@ -512,16 +544,16 @@ func (g *Gateway) checkBalances() {
 		}
 		balance := rt.proxy.sm.Balance()
 		if balance < balanceMinimumThreshold {
-			log.Printf("escrow_balance_low escrow=%s balance=%d threshold=%d — deactivating",
+			log.Printf("escrow_balance_low escrow=%s balance=%d threshold=%d — scheduling replacement before deactivation",
 				rt.id, balance, balanceMinimumThreshold)
-			g.deactivateAndSettleDevshardByID(rt.id, "low_balance")
+			g.scheduleDepletedEscrowReplacement(rt.id, rt.model, "low_balance")
 			continue
 		}
 		nonce := rt.proxy.sm.LatestNonce()
 		if nonce >= nonceDeactivationLimit {
-			log.Printf("escrow_nonce_high escrow=%s nonce=%d limit=%d — deactivating",
+			log.Printf("escrow_nonce_high escrow=%s nonce=%d limit=%d — scheduling replacement before deactivation",
 				rt.id, nonce, nonceDeactivationLimit)
-			g.deactivateAndSettleDevshardByID(rt.id, "high_nonce")
+			g.scheduleDepletedEscrowReplacement(rt.id, rt.model, "high_nonce")
 		}
 	}
 }
@@ -824,9 +856,10 @@ func (g *Gateway) handlePooledModels(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	runtimes := append([]*devshardRuntime(nil), g.runtimeOrder...)
 	defaultModel := g.settings.DefaultModel
-	maxTokens := g.settings.DefaultRequestMaxTokens
 	g.mu.Unlock()
-	writeModelList(w, gatewayModelIDs(runtimes, defaultModel), maxTokens)
+	writeModelListWithCapForModel(w, gatewayModelIDs(runtimes, defaultModel), func(model string) uint64 {
+		return g.outputTokenLimitsForModel(model).MaxTokensCap
+	})
 }
 
 func (g *Gateway) handlePooledStatus(w http.ResponseWriter, r *http.Request) {
@@ -873,7 +906,7 @@ func (g *Gateway) handleSingleOnly(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) handlePooledChat(w http.ResponseWriter, r *http.Request) {
 	ctx, _ := ensureRequestLogContext(r.Context())
 	r = r.WithContext(ctx)
-	body, model, inputTokens, err := parseChatReservation(r)
+	body, model, inputTokens, err := g.parseChatReservation(r, g.settings.DefaultModel)
 	if err != nil {
 		logRequestStage(ctx, "gateway_parse_failed", "error", err)
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
@@ -943,7 +976,7 @@ func (g *Gateway) handleDevshard(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":{"message":"devshard %s is unavailable for new inferences: %s"}}`, devshardID, reason), http.StatusConflict)
 			return
 		}
-		body, model, inputTokens, err := parseChatReservation(r)
+		body, model, inputTokens, err := g.parseChatReservation(r, firstNonEmpty(rt.model, g.settings.DefaultModel))
 		if err != nil {
 			logRequestStage(ctx, "gateway_devshard_parse_failed", "escrow", devshardID, "error", err)
 			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
@@ -1053,19 +1086,27 @@ func (g *Gateway) serveChatToRuntime(rt *devshardRuntime, path string, body []by
 
 func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64) (*devshardRuntime, error) {
 	g.mu.Lock()
-	var highNonceSettlementIDs []string
+	var depletedEscrows []struct {
+		id     string
+		model  string
+		reason string
+	}
 	defer func() {
 		g.mu.Unlock()
-		for _, id := range highNonceSettlementIDs {
-			g.scheduleAutoSettlement(id, "high_nonce")
+		for _, depleted := range depletedEscrows {
+			g.scheduleDepletedEscrowReplacement(depleted.id, depleted.model, depleted.reason)
 		}
 	}()
 
 	var candidates []*devshardRuntime
 	skipReasonCounts := make(map[string]int)
 	for _, rt := range g.runtimeOrder {
-		if g.deactivateHighNonceRuntimeLocked(rt) {
-			highNonceSettlementIDs = append(highNonceSettlementIDs, rt.id)
+		if g.runtimeAtNonceLimit(rt) {
+			depletedEscrows = append(depletedEscrows, struct {
+				id     string
+				model  string
+				reason string
+			}{id: rt.id, model: rt.model, reason: "high_nonce"})
 			skipReasonCounts["high_nonce"]++
 			continue
 		}
@@ -1137,24 +1178,12 @@ func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64)
 	return chosen, nil
 }
 
-func (g *Gateway) deactivateHighNonceRuntimeLocked(rt *devshardRuntime) bool {
+func (g *Gateway) runtimeAtNonceLimit(rt *devshardRuntime) bool {
 	if rt == nil || !rt.active.Load() || rt.proxy == nil || rt.proxy.sm == nil {
 		return false
 	}
 	nonce := rt.proxy.sm.LatestNonce()
-	if nonce < nonceDeactivationLimit {
-		return false
-	}
-	rt.active.Store(false)
-	if g.store != nil {
-		if err := g.store.SetDevshardActive(rt.id, false); err != nil {
-			log.Printf("escrow_nonce_high_deactivate_persist_failed escrow=%s nonce=%d limit=%d error=%v",
-				rt.id, nonce, nonceDeactivationLimit, err)
-		}
-	}
-	log.Printf("escrow_nonce_high escrow=%s nonce=%d limit=%d — deactivating before routing",
-		rt.id, nonce, nonceDeactivationLimit)
-	return true
+	return nonce >= nonceDeactivationLimit
 }
 
 // formatCandidateWeightsLocked returns a compact "id=W(e)" diagnostic
@@ -1297,7 +1326,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !allowGetOrHead(w, r) {
 		return
 	}
-	writeModelList(w, []string{p.model}, DefaultRequestMaxTokens)
+	writeModelList(w, []string{p.model}, RequestMaxTokensCap)
 }
 
 func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
@@ -1311,14 +1340,26 @@ func allowGetOrHead(w http.ResponseWriter, r *http.Request) bool {
 
 func writeModelList(w http.ResponseWriter, modelIDs []string, maxTokens uint64) {
 	if maxTokens == 0 {
-		maxTokens = DefaultRequestMaxTokens
+		maxTokens = RequestMaxTokensCap
 	}
+	writeModelListWithCapForModel(w, modelIDs, func(string) uint64 {
+		return maxTokens
+	})
+}
+
+func writeModelListWithCapForModel(w http.ResponseWriter, modelIDs []string, capForModel func(string) uint64) {
 	created := time.Now().Unix()
 	data := make([]modelDescriptor, 0, len(modelIDs))
 	for _, id := range modelIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
+		}
+		maxTokens := RequestMaxTokensCap
+		if capForModel != nil {
+			if configured := capForModel(id); configured > 0 {
+				maxTokens = configured
+			}
 		}
 		data = append(data, modelDescriptor{
 			ID:                  id,
@@ -1364,6 +1405,10 @@ func gatewayStatusCodeForError(err error) int {
 	}
 	if isParticipantRateLimitError(err) {
 		return http.StatusTooManyRequests
+	}
+	var reducedTokenTimeoutErr *nonStreamingReducedMaxTokensTimeoutError
+	if errors.As(err, &reducedTokenTimeoutErr) {
+		return http.StatusGatewayTimeout
 	}
 	var admissionErr *RequestAdmissionError
 	if errors.As(err, &admissionErr) {
@@ -1418,14 +1463,32 @@ func cloneURL(u *url.URL) *url.URL {
 	return &clone
 }
 
-func parseChatReservation(r *http.Request) ([]byte, string, int64, error) {
-	updatedBody, req, err := prepareChatRequestBody(r)
+func (g *Gateway) parseChatReservation(r *http.Request, defaultModel string) ([]byte, string, int64, error) {
+	body, err := readLimitedChatRequestBody(r)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	body, err = normalizeContent(body)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	model := chatRequestModel(body)
+	limits := g.outputTokenLimitsForModel(firstNonEmpty(model, defaultModel))
+	updatedBody, req, err := normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits)
 	if err != nil {
 		return nil, "", 0, err
 	}
 
 	inputTokens := estimatePromptTokens(updatedBody)
 	return updatedBody, req.Model, inputTokens, nil
+}
+
+func chatRequestModel(body []byte) string {
+	var req chatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(req.Model)
 }
 
 func estimatePromptTokens(body []byte) int64 {
@@ -1474,6 +1537,12 @@ type adminDevshardRequest struct {
 	ProtocolVersion string `json:"protocol_version,omitempty"`
 }
 
+type adminImportDevshardRequest struct {
+	adminDevshardRequest
+	Active   *bool  `json:"active,omitempty"`
+	PerfPath string `json:"perf_path,omitempty"`
+}
+
 type adminCreateEscrowRequest struct {
 	PrivateKey      string `json:"private_key,omitempty"`
 	PrivateKeyEnv   string `json:"private_key_env,omitempty"`
@@ -1506,6 +1575,7 @@ type adminSettingsRequest struct {
 	ModelLimits             *[]GatewayModelLimitSettings     `json:"model_limits,omitempty"`
 	ModelAccess             *[]GatewayModelAccessSettings    `json:"model_access,omitempty"`
 	DefaultRequestMaxTokens *uint64                          `json:"default_request_max_tokens,omitempty"`
+	RequestMaxTokensCap     *uint64                          `json:"request_max_tokens_cap,omitempty"`
 	TxGasLimit              *uint64                          `json:"tx_gas_limit,omitempty"`
 	Disabled                *adminGatewayDisabledRequest     `json:"disabled,omitempty"`
 	ParticipantThrottle     *adminParticipantThrottleRequest `json:"participant_throttle,omitempty"`
@@ -1660,6 +1730,9 @@ func (g *Gateway) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		if req.DefaultRequestMaxTokens != nil {
 			settings.DefaultRequestMaxTokens = *req.DefaultRequestMaxTokens
 		}
+		if req.RequestMaxTokensCap != nil {
+			settings.RequestMaxTokensCap = *req.RequestMaxTokensCap
+		}
 		if req.TxGasLimit != nil {
 			settings.TxGasLimit = *req.TxGasLimit
 		}
@@ -1705,6 +1778,7 @@ func (g *Gateway) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		g.limiter.UpdateLimits(settings.MaxConcurrentRequests, settings.MaxInputTokensInFlight, settings.ModelLimits)
 		DefaultRequestMaxTokens = settings.DefaultRequestMaxTokens
+		RequestMaxTokensCap = settings.RequestMaxTokensCap
 		applyGatewayTuningSettings(settings)
 		if g.perf != nil {
 			g.perf.ResizeRings()
@@ -1887,6 +1961,14 @@ func applyEscrowRotationRequest(settings *EscrowRotationSettings, req *adminEscr
 }
 
 func validateGatewaySettings(settings GatewaySettings) error {
+	switch {
+	case settings.DefaultRequestMaxTokens == 0:
+		return fmt.Errorf("default_request_max_tokens must be > 0")
+	case settings.RequestMaxTokensCap == 0:
+		return fmt.Errorf("request_max_tokens_cap must be > 0")
+	case settings.DefaultRequestMaxTokens > settings.RequestMaxTokensCap:
+		return fmt.Errorf("default_request_max_tokens must be <= request_max_tokens_cap")
+	}
 	p := settings.ParticipantThrottle
 	switch {
 	case p.RequestBurst <= 0:
@@ -1958,6 +2040,19 @@ func validateGatewaySettings(settings GatewaySettings) error {
 			return fmt.Errorf("model_limits.max_concurrent_requests must be >= 0")
 		case limit.MaxInputTokensInFlight < 0:
 			return fmt.Errorf("model_limits.max_input_tokens_in_flight must be >= 0")
+		}
+		effectiveTokenLimits := outputTokenLimits{
+			DefaultMaxTokens: settings.DefaultRequestMaxTokens,
+			MaxTokensCap:     settings.RequestMaxTokensCap,
+		}
+		if limit.DefaultRequestMaxTokens > 0 {
+			effectiveTokenLimits.DefaultMaxTokens = limit.DefaultRequestMaxTokens
+		}
+		if limit.RequestMaxTokensCap > 0 {
+			effectiveTokenLimits.MaxTokensCap = limit.RequestMaxTokensCap
+		}
+		if effectiveTokenLimits.DefaultMaxTokens > effectiveTokenLimits.MaxTokensCap {
+			return fmt.Errorf("model_limits.default_request_max_tokens must be <= request_max_tokens_cap for model_id %q", modelID)
 		}
 		if _, ok := seenLimitModels[modelID]; ok {
 			return fmt.Errorf("model_limits contains duplicate model_id %q", modelID)
@@ -2170,6 +2265,10 @@ func (g *Gateway) handleAdminDevshardAction(w http.ResponseWriter, r *http.Reque
 		http.NotFound(w, r)
 		return
 	}
+	if len(parts) == 1 && parts[0] == "import" && r.Method == http.MethodPost {
+		g.handleAdminImportDevshard(w, r)
+		return
+	}
 	id := parts[0]
 	if len(parts) == 1 && r.Method == http.MethodDelete {
 		g.handleAdminCleanDevshard(w, r, id)
@@ -2331,6 +2430,109 @@ func (g *Gateway) handleAdminSettleDevshard(w http.ResponseWriter, r *http.Reque
 		"active":    false,
 		"tx_hash":   result.TxHash,
 		"settler":   result.Settler,
+	})
+}
+
+func (g *Gateway) handleAdminImportDevshard(w http.ResponseWriter, r *http.Request) {
+	if g.store == nil {
+		http.Error(w, `{"error":{"message":"gateway state store unavailable"}}`, http.StatusServiceUnavailable)
+		return
+	}
+	var req adminImportDevshardRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.StoragePath = strings.TrimSpace(req.StoragePath)
+	if req.ID == "" {
+		http.Error(w, `{"error":{"message":"id is required"}}`, http.StatusBadRequest)
+		return
+	}
+	if req.StoragePath == "" {
+		http.Error(w, `{"error":{"message":"storage_path is required for import"}}`, http.StatusBadRequest)
+		return
+	}
+	hasKey := strings.TrimSpace(req.PrivateKey) != "" || strings.TrimSpace(req.PrivateKeyEnv) != ""
+	if !hasKey {
+		http.Error(w, `{"error":{"message":"private_key or private_key_env is required for import"}}`, http.StatusBadRequest)
+		return
+	}
+	active := false
+	if req.Active != nil {
+		active = *req.Active
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	state, ok, err := g.store.LoadState()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, `{"error":{"message":"gateway state is not initialized"}}`, http.StatusServiceUnavailable)
+		return
+	}
+	if _, exists := g.runtimes[req.ID]; exists {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"devshard %s already loaded"}}`, req.ID), http.StatusConflict)
+		return
+	}
+	if _, found := findGatewayDevshard(state.Devshards, req.ID); found {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"devshard %s already exists in gateway state"}}`, req.ID), http.StatusConflict)
+		return
+	}
+
+	record := GatewayDevshardState{
+		RuntimeConfig: RuntimeConfig{
+			ID:              req.ID,
+			PrivateKeyHex:   strings.TrimSpace(req.PrivateKey),
+			PrivateKeyEnv:   strings.TrimSpace(req.PrivateKeyEnv),
+			Model:           strings.TrimSpace(req.Model),
+			StoragePath:     req.StoragePath,
+			ProtocolVersion: strings.TrimSpace(req.ProtocolVersion),
+		},
+		Active: active,
+	}
+	if record.Model == "" {
+		record.Model = state.Settings.DefaultModel
+	}
+	rt, err := gatewayRuntimeBuilder(record.RuntimeConfig, state.Settings.ChainREST, state.Settings.DefaultModel, g.perf)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+	if err := g.store.UpsertDevshard(record); err != nil {
+		rt.close()
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	rt.active.Store(active)
+	rt.activeConfigured = true
+	g.runtimes[record.ID] = rt
+	g.runtimeOrder = append(g.runtimeOrder, rt)
+	g.attachRuntimeSharedState(rt)
+	g.sortRuntimeOrderLocked()
+
+	accountingImported := int64(0)
+	accountingAttemptsImported := int64(0)
+	perfPath := strings.TrimSpace(req.PerfPath)
+	if perfPath != "" && g.perfStore != nil {
+		accountingImported, accountingAttemptsImported, err = g.perfStore.ImportRequestAccounting(perfPath, record.ID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":%q,"id":%q,"active":%t}}`, err.Error(), record.ID, active), http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, map[string]any{
+		"id":                           record.ID,
+		"active":                       active,
+		"model":                        record.Model,
+		"storage_path":                 record.StoragePath,
+		"perf_path":                    perfPath,
+		"accounting_records_imported":  accountingImported,
+		"accounting_attempts_imported": accountingAttemptsImported,
 	})
 }
 
@@ -2612,6 +2814,7 @@ func (g *Gateway) attachEscrowChecker(rt *devshardRuntime) {
 		return
 	}
 	escrowID := rt.id
+	modelID := rt.model
 	protocol := rt.proxy.sm.ProtocolVersion()
 	if g.escrowChecker != nil {
 		rt.proxy.redundancy.onEscrowMissing = func() {
@@ -2621,8 +2824,8 @@ func (g *Gateway) attachEscrowChecker(rt *devshardRuntime) {
 		}
 	}
 	rt.proxy.redundancy.onBalanceExhausted = func() {
-		log.Printf("gateway_deactivating_exhausted_escrow escrow=%s", escrowID)
-		g.deactivateAndSettleDevshardByID(escrowID, "balance_exhausted")
+		log.Printf("gateway_replacing_exhausted_escrow escrow=%s", escrowID)
+		g.scheduleDepletedEscrowReplacement(escrowID, modelID, "balance_exhausted")
 	}
 }
 
@@ -2657,6 +2860,74 @@ func (g *Gateway) deactivateAndSettleDevshardByID(id, reason string) {
 	g.scheduleAutoSettlement(id, reason)
 }
 
+func (g *Gateway) scheduleDepletedEscrowReplacement(id, modelID, reason string) {
+	if g == nil {
+		return
+	}
+	g.replenishmentMu.Lock()
+	if g.replenishmentInFlight == nil {
+		g.replenishmentInFlight = make(map[string]struct{})
+	}
+	if _, exists := g.replenishmentInFlight[id]; exists {
+		g.replenishmentMu.Unlock()
+		return
+	}
+	g.replenishmentInFlight[id] = struct{}{}
+	g.replenishmentMu.Unlock()
+
+	go func() {
+		defer func() {
+			g.replenishmentMu.Lock()
+			delete(g.replenishmentInFlight, id)
+			g.replenishmentMu.Unlock()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), autoSettlementAttemptTimeout)
+		defer cancel()
+		if err := g.replaceDepletedEscrow(ctx, id, modelID, reason); err != nil {
+			log.Printf("escrow_depletion_replacement_failed escrow=%s model=%q reason=%s error=%v", id, modelID, reason, err)
+		}
+	}()
+}
+
+func (g *Gateway) replaceDepletedEscrow(ctx context.Context, id, modelID, reason string) error {
+	settings := g.settings
+	model, ok := replacementModelForDepletedEscrow(settings, modelID)
+	if !ok {
+		return fmt.Errorf("no escrow rotation model configured for %q", modelID)
+	}
+
+	var epoch uint64
+	if g.phaseGate != nil {
+		epoch = g.phaseGate.Snapshot().EpochIndex
+	}
+	create := (*Gateway).createRotationEscrow
+	if gatewayCreateDepletionEscrow != nil {
+		create = gatewayCreateDepletionEscrow
+	}
+	result, err := create(g, ctx, settings, model, rotationRoleRegular, epoch)
+	if err != nil {
+		return fmt.Errorf("create replacement escrow: %w", err)
+	}
+	log.Printf("escrow_depletion_replacement_created old_escrow=%s new_escrow=%d model=%q reason=%s tx_hash=%s",
+		id, result.EscrowID, model.ModelID, reason, result.TxHash)
+	g.deactivateAndSettleDevshardByID(id, reason)
+	return nil
+}
+
+func replacementModelForDepletedEscrow(settings GatewaySettings, modelID string) (EscrowRotationModelSettings, bool) {
+	if !settings.EscrowRotation.Enabled {
+		return EscrowRotationModelSettings{}, false
+	}
+	modelID = strings.TrimSpace(modelID)
+	for _, model := range normalizedEscrowRotationModels(settings) {
+		if model.ModelID == modelID && model.Amount > 0 && strings.TrimSpace(model.PrivateKeyEnv) != "" {
+			return model, true
+		}
+	}
+	return EscrowRotationModelSettings{}, false
+}
+
 func (g *Gateway) scheduleAutoSettlement(id, reason string) {
 	if g.store == nil {
 		log.Printf("auto_settle_skipped escrow=%s reason=%s error=missing_gateway_store", id, reason)
@@ -2683,7 +2954,7 @@ func (g *Gateway) scheduleAutoSettlement(id, reason string) {
 
 		for attempt := 1; attempt <= autoSettlementMaxAttempts; attempt++ {
 			ctx, cancel := context.WithTimeout(context.Background(), autoSettlementAttemptTimeout)
-			result, err := g.settleDevshardOnChain(ctx, id, adminSettleEscrowRequest{})
+			result, err := gatewaySettleDevshardOnChain(g, ctx, id, adminSettleEscrowRequest{})
 			cancel()
 			if err == nil {
 				log.Printf("auto_settle_submitted escrow=%s reason=%s tx_hash=%s settler=%s",

@@ -58,6 +58,28 @@ func NewPerfStore(dbPath string) (*PerfStore, error) {
 		decision        TEXT NOT NULL,
 		hosts_json      TEXT NOT NULL
 	);
+	CREATE TABLE IF NOT EXISTS request_accounting (
+		request_id   TEXT NOT NULL,
+		escrow_id    TEXT NOT NULL,
+		model        TEXT NOT NULL DEFAULT '',
+		started_at   TEXT NOT NULL,
+		completed_at TEXT NOT NULL DEFAULT '',
+		outcome      TEXT NOT NULL DEFAULT 'running',
+		decision     TEXT NOT NULL DEFAULT '',
+		winner_nonce INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (request_id, escrow_id)
+	);
+	CREATE TABLE IF NOT EXISTS request_accounting_attempts (
+		request_id      TEXT NOT NULL,
+		escrow_id       TEXT NOT NULL,
+		nonce           INTEGER NOT NULL,
+		host_idx        INTEGER NOT NULL,
+		participant_key TEXT NOT NULL DEFAULT '',
+		probe           INTEGER NOT NULL DEFAULT 0,
+		winner          INTEGER NOT NULL DEFAULT 0,
+		created_at      TEXT NOT NULL,
+		PRIMARY KEY (request_id, escrow_id, nonce)
+	);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -80,9 +102,32 @@ func NewPerfStore(dbPath string) (*PerfStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate perf request log: %w", err)
 	}
+	for _, col := range []struct {
+		table string
+		name  string
+		ddl   string
+	}{
+		{"request_accounting", "model", "TEXT NOT NULL DEFAULT ''"},
+		{"request_accounting", "completed_at", "TEXT NOT NULL DEFAULT ''"},
+		{"request_accounting", "outcome", "TEXT NOT NULL DEFAULT 'running'"},
+		{"request_accounting", "decision", "TEXT NOT NULL DEFAULT ''"},
+		{"request_accounting", "winner_nonce", "INTEGER NOT NULL DEFAULT 0"},
+		{"request_accounting_attempts", "participant_key", "TEXT NOT NULL DEFAULT ''"},
+		{"request_accounting_attempts", "probe", "INTEGER NOT NULL DEFAULT 0"},
+		{"request_accounting_attempts", "winner", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureColumn(db, col.table, col.name, col.ddl); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate request accounting: %w", err)
+		}
+	}
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS perf_host_samples_source_idx ON perf_host_samples(source_escrow, source_sample_id) WHERE source_sample_id IS NOT NULL`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create perf source index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS request_accounting_attempts_lookup_idx ON request_accounting_attempts(request_id, escrow_id)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create request accounting attempt index: %w", err)
 	}
 
 	return &PerfStore{db: db, path: dbPath}, nil

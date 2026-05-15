@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,16 +14,19 @@ import (
 
 func TestNormalizeChatRequestDefaultsAndCapsOutputTokens(t *testing.T) {
 	oldDefault := DefaultRequestMaxTokens
-	DefaultRequestMaxTokens = 10_000
+	oldCap := RequestMaxTokensCap
+	DefaultRequestMaxTokens = 3_072
+	RequestMaxTokensCap = 4_096
 	t.Cleanup(func() {
 		DefaultRequestMaxTokens = oldDefault
+		RequestMaxTokensCap = oldCap
 	})
 
 	body, req, err := normalizeChatRequest([]byte(`{"messages":[{"role":"user","content":"hello"}]}`))
 	require.NoError(t, err)
-	require.EqualValues(t, 10_000, req.MaxTokens)
+	require.EqualValues(t, 3_072, req.MaxTokens)
 	require.Zero(t, req.MaxCompletionTokens)
-	require.Contains(t, string(body), `"max_tokens":10000`)
+	require.Contains(t, string(body), `"max_tokens":3072`)
 	require.NotContains(t, string(body), `"max_completion_tokens"`)
 
 	body, req, err = normalizeChatRequest([]byte(`{"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`))
@@ -41,10 +45,10 @@ func TestNormalizeChatRequestDefaultsAndCapsOutputTokens(t *testing.T) {
 
 	body, req, err = normalizeChatRequest([]byte(`{"max_tokens":10001,"max_completion_tokens":20000,"messages":[{"role":"user","content":"hello"}]}`))
 	require.NoError(t, err)
-	require.EqualValues(t, 10_000, req.MaxTokens)
-	require.EqualValues(t, 10_000, req.MaxCompletionTokens)
-	require.Contains(t, string(body), `"max_tokens":10000`)
-	require.Contains(t, string(body), `"max_completion_tokens":10000`)
+	require.EqualValues(t, 4_096, req.MaxTokens)
+	require.EqualValues(t, 4_096, req.MaxCompletionTokens)
+	require.Contains(t, string(body), `"max_tokens":4096`)
+	require.Contains(t, string(body), `"max_completion_tokens":4096`)
 
 	body, req, err = normalizeChatRequest([]byte(`{"max_tokens":64,"max_completion_tokens":10000,"messages":[{"role":"user","content":"hello"}]}`))
 	require.NoError(t, err)
@@ -52,6 +56,72 @@ func TestNormalizeChatRequestDefaultsAndCapsOutputTokens(t *testing.T) {
 	require.EqualValues(t, 64, req.MaxCompletionTokens)
 	require.Contains(t, string(body), `"max_tokens":64`)
 	require.Contains(t, string(body), `"max_completion_tokens":64`)
+}
+
+func TestNormalizeChatRequestUsesProvidedOutputTokenLimits(t *testing.T) {
+	limits := outputTokenLimits{DefaultMaxTokens: 2_048, MaxTokensCap: 3_584}
+
+	body, req, err := normalizeChatRequestForAuthAndLimits([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), false, limits)
+	require.NoError(t, err)
+	require.EqualValues(t, 2_048, req.MaxTokens)
+	require.Contains(t, string(body), `"max_tokens":2048`)
+
+	body, req, err = normalizeChatRequestForAuthAndLimits([]byte(`{"max_tokens":4096,"messages":[{"role":"user","content":"hello"}]}`), false, limits)
+	require.NoError(t, err)
+	require.EqualValues(t, 3_584, req.MaxTokens)
+	require.Contains(t, string(body), `"max_tokens":3584`)
+}
+
+func TestPrepareChatRequestBodyAdminAuthBypassesOutputTokenCap(t *testing.T) {
+	oldDefault := DefaultRequestMaxTokens
+	oldCap := RequestMaxTokensCap
+	DefaultRequestMaxTokens = 3_072
+	RequestMaxTokensCap = 4_096
+	t.Cleanup(func() {
+		DefaultRequestMaxTokens = oldDefault
+		RequestMaxTokensCap = oldCap
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"max_tokens": 20000,
+		"max_completion_tokens": 30000,
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	req = req.WithContext(context.WithValue(req.Context(), adminAuthContextKey{}, true))
+
+	body, chatReq, err := prepareChatRequestBody(req)
+	require.NoError(t, err)
+	require.EqualValues(t, 20_000, chatReq.MaxTokens)
+	require.EqualValues(t, 20_000, chatReq.MaxCompletionTokens)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 20_000, raw["max_tokens"])
+	require.EqualValues(t, 20_000, raw["max_completion_tokens"])
+}
+
+func TestPrepareChatRequestBodyAdminAuthKeepsMaxCompletionTokensAboveDefault(t *testing.T) {
+	oldDefault := DefaultRequestMaxTokens
+	oldCap := RequestMaxTokensCap
+	DefaultRequestMaxTokens = 3_072
+	RequestMaxTokensCap = 4_096
+	t.Cleanup(func() {
+		DefaultRequestMaxTokens = oldDefault
+		RequestMaxTokensCap = oldCap
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"max_completion_tokens": 30000,
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	req = req.WithContext(context.WithValue(req.Context(), adminAuthContextKey{}, true))
+
+	body, chatReq, err := prepareChatRequestBody(req)
+	require.NoError(t, err)
+	require.EqualValues(t, 30_000, chatReq.MaxTokens)
+	require.EqualValues(t, 30_000, chatReq.MaxCompletionTokens)
+	require.NotContains(t, string(body), `"max_tokens"`)
+	require.Contains(t, string(body), `"max_completion_tokens":30000`)
 }
 
 func TestNormalizeChatRequestCapsChoices(t *testing.T) {
@@ -71,11 +141,14 @@ func TestNormalizeChatRequestCapsChoices(t *testing.T) {
 	require.NotContains(t, string(body), `"n"`)
 }
 
-func TestNormalizeChatRequestStripsMinTokensAboveEffectiveMax(t *testing.T) {
+func TestNormalizeChatRequestClampsMinTokensAboveEffectiveMax(t *testing.T) {
 	oldDefault := DefaultRequestMaxTokens
-	DefaultRequestMaxTokens = 2_000
+	oldCap := RequestMaxTokensCap
+	DefaultRequestMaxTokens = 1_000
+	RequestMaxTokensCap = 2_000
 	t.Cleanup(func() {
 		DefaultRequestMaxTokens = oldDefault
+		RequestMaxTokensCap = oldCap
 	})
 
 	body, req, err := normalizeChatRequest([]byte(`{
@@ -89,14 +162,17 @@ func TestNormalizeChatRequestStripsMinTokensAboveEffectiveMax(t *testing.T) {
 	var raw map[string]any
 	require.NoError(t, json.Unmarshal(body, &raw))
 	require.EqualValues(t, 2_000, raw["max_tokens"])
-	require.NotContains(t, raw, "min_tokens")
+	require.EqualValues(t, 2_000, raw["min_tokens"])
 }
 
 func TestNormalizeChatRequestKeepsMinTokensWithinEffectiveMax(t *testing.T) {
 	oldDefault := DefaultRequestMaxTokens
-	DefaultRequestMaxTokens = 2_000
+	oldCap := RequestMaxTokensCap
+	DefaultRequestMaxTokens = 1_000
+	RequestMaxTokensCap = 2_000
 	t.Cleanup(func() {
 		DefaultRequestMaxTokens = oldDefault
+		RequestMaxTokensCap = oldCap
 	})
 
 	body, req, err := normalizeChatRequest([]byte(`{
@@ -396,6 +472,79 @@ func TestPrepareChatRequestBodyNormalizesTextContentParts(t *testing.T) {
 	messages := raw["messages"].([]any)
 	message := messages[0].(map[string]any)
 	require.Equal(t, "hello\nworld", message["content"])
+}
+
+func TestPrepareChatRequestBodyNormalizesEmptyAssistantToolCallContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "empty", content: `""`},
+		{name: "whitespace", content: `" "`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+				"messages": [
+					{"role": "user", "content": "What is 2+2?"},
+					{"role": "assistant", "content": `+tt.content+`, "tool_calls": [{
+						"id": "call_1",
+						"type": "function",
+						"function": {"name": "web_search", "arguments": "{\"query\":\"2+2\"}"}
+					}]},
+					{"role": "tool", "content": "4", "tool_call_id": "call_1"}
+				]
+			}`))
+
+			body, _, err := prepareChatRequestBody(req)
+			require.NoError(t, err)
+
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			messages := raw["messages"].([]any)
+			assistant := messages[1].(map[string]any)
+			require.Contains(t, assistant, "content")
+			require.Nil(t, assistant["content"])
+		})
+	}
+}
+
+func TestPrepareChatRequestBodyNormalizesEmptyToolContent(t *testing.T) {
+	tests := []struct {
+		name         string
+		contentField string
+	}{
+		{name: "empty", contentField: `"content": "",`},
+		{name: "whitespace", contentField: `"content": " ",`},
+		{name: "null", contentField: `"content": null,`},
+		{name: "missing"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+				"messages": [
+					{"role": "user", "content": "What is 2+2?"},
+					{"role": "assistant", "content": null, "tool_calls": [{
+						"id": "call_1",
+						"type": "function",
+						"function": {"name": "web_search", "arguments": "{\"query\":\"2+2\"}"}
+					}]},
+					{"role": "tool", `+tt.contentField+` "tool_call_id": "call_1"}
+				]
+			}`))
+
+			body, _, err := prepareChatRequestBody(req)
+			require.NoError(t, err)
+
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			messages := raw["messages"].([]any)
+			tool := messages[2].(map[string]any)
+			require.Equal(t, emptyToolResultContent, tool["content"])
+		})
+	}
 }
 
 func TestPrepareChatRequestBodyRejectsNonTextContentParts(t *testing.T) {

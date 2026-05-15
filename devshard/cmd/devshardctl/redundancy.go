@@ -34,6 +34,18 @@ const emptyStreamBodySampleLimit = 256 * 1024
 
 const longResponseFailureExemption = 280 * time.Second
 
+var (
+	nonStreamingReducedMaxTokensFallbackDelay = 140 * time.Second
+	nonStreamingNoContentTimeout              = 280 * time.Second
+	nonStreamingMaxAttemptWait                = 320 * time.Second
+)
+
+type nonStreamingReducedMaxTokensTimeoutError struct{}
+
+func (e *nonStreamingReducedMaxTokensTimeoutError) Error() string {
+	return "inference: no non-empty response after retrying with reduced max_tokens"
+}
+
 // sseChunkHasContent reports whether the given bytes contain at least one SSE
 // data event carrying a non-empty payload that an OpenAI-compatible client can
 // surface. `content`, `reasoning`, `reasoning_content`, non-empty
@@ -766,14 +778,15 @@ func (e *Redundancy) participantKeyForHost(hostIdx int) string {
 
 // inflight tracks one in-flight inference and its timing.
 type inflight struct {
-	prepared  *user.PreparedInference
-	hostIdx   int
-	hostID    string
-	nonce     uint64
-	escrowID  string
-	sendTime  time.Time
-	escalated bool
-	probe     bool
+	prepared        *user.PreparedInference
+	hostIdx         int
+	hostID          string
+	nonce           uint64
+	escrowID        string
+	sendTime        time.Time
+	escalated       bool
+	probe           bool
+	excludePairwise bool
 
 	receiptOnce sync.Once
 	receiptTime time.Time
@@ -1152,6 +1165,7 @@ func (e *Redundancy) RunInference(ctx context.Context, params user.InferencePara
 	settleCtx, _ := ensureRequestLogContext(context.Background())
 	settleCtx = logging.PropagateRequestID(settleCtx, ctx)
 	logRequestStage(ctx, "runner_started", "escrow", e.devshardID, "input_tokens", params.InputLength, "model", params.Model)
+	e.recordAccountingRequestStart(ctx, params)
 
 	// triedParticipants is the per-request memory the picker uses to
 	// avoid re-dispatching to a participant this request has already
@@ -1273,7 +1287,7 @@ func (e *Redundancy) prepareInflight(ctx context.Context, params user.InferenceP
 			}
 			return nil, fmt.Errorf("prepare: %w", res.err)
 		}
-		return &inflight{
+		inf := &inflight{
 			prepared:     res.prepared,
 			hostIdx:      res.prepared.HostIdx(),
 			hostID:       e.session.HostLabel(res.prepared.HostIdx()),
@@ -1283,7 +1297,9 @@ func (e *Redundancy) prepareInflight(ctx context.Context, params user.InferenceP
 			done:         make(chan struct{}),
 			receiptCh:    make(chan struct{}),
 			firstTokenCh: make(chan struct{}),
-		}, nil
+		}
+		e.recordAccountingAttempt(ctx, inf)
+		return inf, nil
 	}
 }
 
@@ -1441,6 +1457,46 @@ func (e *Redundancy) startAdditionalInflight(streamCtx, settleCtx context.Contex
 	}
 	e.startInflight(settleCtx, next, race, params)
 	return next
+}
+
+func reducedMaxTokensParams(params user.InferenceParams) (user.InferenceParams, bool) {
+	if params.MaxTokens <= 1 {
+		return params, false
+	}
+	reducedMaxTokens := params.MaxTokens / 2
+	if reducedMaxTokens == 0 {
+		reducedMaxTokens = 1
+	}
+	prompt, ok := rewritePromptMaxTokens(params.Prompt, reducedMaxTokens)
+	if !ok {
+		return params, false
+	}
+	params.Prompt = prompt
+	params.MaxTokens = reducedMaxTokens
+	return params, true
+}
+
+func rewritePromptMaxTokens(prompt []byte, maxTokens uint64) ([]byte, bool) {
+	var raw map[string]any
+	if err := json.Unmarshal(prompt, &raw); err != nil {
+		return nil, false
+	}
+	_, hasMaxCompletionTokens := raw["max_completion_tokens"]
+	_, hasMaxTokens := raw["max_tokens"]
+	if hasMaxCompletionTokens {
+		raw["max_completion_tokens"] = maxTokens
+	}
+	if hasMaxTokens || !hasMaxCompletionTokens {
+		raw["max_tokens"] = maxTokens
+	}
+	if minTokens, ok := numericJSONValueAsUint64(raw["min_tokens"]); ok && minTokens > maxTokens {
+		raw["min_tokens"] = maxTokens
+	}
+	updated, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	return updated, true
 }
 
 func (e *Redundancy) maybeAddPairwiseWinnerHoldCandidate(race *raceGroup, params user.InferenceParams, trigger, next *inflight) {
@@ -1608,10 +1664,15 @@ func (e *Redundancy) winningInflightTerminalFailure(inf *inflight) (failed bool,
 }
 
 func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []*inflight, race *raceGroup, params user.InferenceParams, decision Decision, triedParticipants map[string]bool) error {
-	doneCh := make(chan *inflight, e.maxAttempts())
+	doneCh := make(chan *inflight, e.maxAttempts()+1)
 	for _, inf := range attempts {
 		e.watchInflightDone(inf, doneCh)
 	}
+	requestStart := time.Now()
+	if len(attempts) > 0 && !attempts[0].sendTime.IsZero() {
+		requestStart = attempts[0].sendTime
+	}
+	reducedMaxTokensFallbackStarted := false
 
 	for {
 		winner := race.winnerNonce()
@@ -1663,6 +1724,26 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 				"max_attempts", maxAttempts,
 			)
 		}
+		var reducedFallbackTimer *time.Timer
+		var reducedFallbackC <-chan time.Time
+		if !params.Stream && !reducedMaxTokensFallbackStarted && winner == 0 {
+			wait := time.Until(requestStart.Add(nonStreamingReducedMaxTokensFallbackDelay))
+			if wait < 0 {
+				wait = 0
+			}
+			reducedFallbackTimer = time.NewTimer(wait)
+			reducedFallbackC = reducedFallbackTimer.C
+		}
+		var nonStreamingTimeoutTimer *time.Timer
+		var nonStreamingTimeoutC <-chan time.Time
+		if !params.Stream && winner == 0 {
+			wait := time.Until(requestStart.Add(nonStreamingNoContentTimeout))
+			if wait < 0 {
+				wait = 0
+			}
+			nonStreamingTimeoutTimer = time.NewTimer(wait)
+			nonStreamingTimeoutC = nonStreamingTimeoutTimer.C
+		}
 		var stallTimer *time.Timer
 		var stallC <-chan time.Time
 		if winner != 0 {
@@ -1678,10 +1759,29 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 			}
 		}
 		if allInflightsDone(attempts) && escalationC == nil {
-			if stallTimer != nil {
-				stopTimer(stallTimer)
+			if !params.Stream && winner == 0 && time.Now().Before(requestStart.Add(nonStreamingNoContentTimeout)) {
+				if !reducedMaxTokensFallbackStarted && time.Now().Before(requestStart.Add(nonStreamingReducedMaxTokensFallbackDelay)) && len(attempts) < maxAttempts {
+					trigger := attempts[len(attempts)-1]
+					trigger.escalated = true
+					if next := e.startAdditionalInflight(streamCtx, settleCtx, race, params, "attempt_failed", trigger, "attempt_failed", triedParticipants); next != nil {
+						attempts = append(attempts, next)
+						e.watchInflightDone(next, doneCh)
+					}
+				}
+				// Wait until the request-level no-content deadline so a reduced
+				// max-token fallback can run even if earlier attempts ended empty.
+			} else {
+				if stallTimer != nil {
+					stopTimer(stallTimer)
+				}
+				if reducedFallbackTimer != nil {
+					stopTimer(reducedFallbackTimer)
+				}
+				if nonStreamingTimeoutTimer != nil {
+					stopTimer(nonStreamingTimeoutTimer)
+				}
+				return e.finishRaceOutcome(settleCtx, attempts, params, decision, winner, raceFinishOptions{recordFailureSamples: true})
 			}
-			return e.finishRaceOutcome(settleCtx, attempts, params, decision, winner, raceFinishOptions{recordFailureSamples: true})
 		}
 
 		select {
@@ -1724,6 +1824,42 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 					e.watchInflightDone(next, doneCh)
 				}
 			}
+		case <-reducedFallbackC:
+			if reducedMaxTokensFallbackStarted || race.winnerNonce() != 0 {
+				break
+			}
+			reducedMaxTokensFallbackStarted = true
+			reducedParams, ok := reducedMaxTokensParams(params)
+			if !ok {
+				break
+			}
+			trigger := attempts[len(attempts)-1]
+			trigger.escalated = true
+			if next := e.startAdditionalInflight(streamCtx, settleCtx, race, reducedParams, "response_timeout_wait_elapsed", trigger, "response_timeout_reduced_max_tokens", triedParticipants); next != nil {
+				next.excludePairwise = true
+				attempts = append(attempts, next)
+				e.watchInflightDone(next, doneCh)
+			}
+		case <-nonStreamingTimeoutC:
+			if race.winnerNonce() != 0 {
+				break
+			}
+			e.cancelPendingInflights(settleCtx, attempts, "non_stream_no_content_timeout")
+			e.waitForInflightsDoneUntil(settleCtx, attempts, requestStart.Add(nonStreamingMaxAttemptWait))
+			opts := raceFinishOptions{
+				recordFailureSamples:            true,
+				nonStreamingReducedTokenTimeout: true,
+			}
+			go func() {
+				if err := e.finishRaceOutcome(settleCtx, attempts, params, decision, 0, opts); err != nil {
+					var timeoutErr *nonStreamingReducedMaxTokensTimeoutError
+					if errors.As(err, &timeoutErr) {
+						return
+					}
+					logRequestStage(settleCtx, "background_finish_failed", "escrow", e.devshardID, "error", err)
+				}
+			}()
+			return &nonStreamingReducedMaxTokensTimeoutError{}
 		case <-stallC:
 			w := race.winnerNonce()
 			winning := inflightByNonce(attempts, w)
@@ -1766,6 +1902,12 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 
 		if escalationTimer != nil {
 			stopTimer(escalationTimer)
+		}
+		if reducedFallbackTimer != nil {
+			stopTimer(reducedFallbackTimer)
+		}
+		if nonStreamingTimeoutTimer != nil {
+			stopTimer(nonStreamingTimeoutTimer)
 		}
 		if stallTimer != nil {
 			stopTimer(stallTimer)
@@ -1814,6 +1956,9 @@ func (e *Redundancy) escalationForInflight(inf *inflight, params user.InferenceP
 		if inflightFinished(inf) {
 			return escalationTrigger{}, false
 		}
+		if !params.Stream {
+			return escalationTrigger{}, false
+		}
 		return escalationTrigger{
 			inf:      inf,
 			deadline: time.Now(),
@@ -1833,12 +1978,7 @@ func (e *Redundancy) escalationForInflight(inf *inflight, params user.InferenceP
 		}, true
 	}
 	if !params.Stream {
-		return escalationTrigger{
-			inf:      inf,
-			deadline: inf.sendTime.Add(nonStreamingFallbackDelay(params.InputLength)),
-			stage:    "response_timeout_wait_elapsed",
-			reason:   "response_timeout",
-		}, true
+		return escalationTrigger{}, false
 	}
 	if !inf.firstToken.IsZero() {
 		return escalationTrigger{}, false
@@ -1911,8 +2051,9 @@ func (e *Redundancy) monitorInflight(ctx context.Context, inf *inflight, race *r
 }
 
 type raceFinishOptions struct {
-	forceTreatAsFailure  bool
-	recordFailureSamples bool
+	forceTreatAsFailure             bool
+	recordFailureSamples            bool
+	nonStreamingReducedTokenTimeout bool
 }
 
 func (e *Redundancy) finishRaceWhenPendingDone(ctx context.Context, attempts []*inflight, params user.InferenceParams, decision Decision, winnerNonce uint64, opts raceFinishOptions) {
@@ -2012,6 +2153,58 @@ func (e *Redundancy) waitForClientTimedOutAttempts(ctx context.Context, winnerNo
 		}
 	}
 	return false
+}
+
+func (e *Redundancy) cancelPendingInflights(ctx context.Context, attempts []*inflight, reason string) {
+	for _, inf := range pendingInflights(attempts) {
+		logInferenceStage(ctx, inf.escrowID, inf.nonce, "speculative_attempt_canceled",
+			"host", inf.hostID,
+			"reason", reason,
+		)
+		if inf.cancel != nil {
+			inf.cancel()
+		}
+	}
+}
+
+func (e *Redundancy) waitForInflightsDoneUntil(ctx context.Context, attempts []*inflight, deadline time.Time) {
+	pending := pendingInflights(attempts)
+	if len(pending) == 0 {
+		return
+	}
+	done := make(chan struct{}, len(pending))
+	for _, inf := range pending {
+		inf := inf
+		go func() {
+			<-inf.done
+			done <- struct{}{}
+		}()
+	}
+	remaining := len(pending)
+	for remaining > 0 {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			logRequestStage(ctx, "non_stream_attempt_wait_limit_reached",
+				"escrow", e.devshardID,
+				"pending", remaining,
+				"wait_limit_ms", nonStreamingMaxAttemptWait.Milliseconds(),
+			)
+			return
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-done:
+			stopTimer(timer)
+			remaining--
+		case <-timer.C:
+			logRequestStage(ctx, "non_stream_attempt_wait_limit_reached",
+				"escrow", e.devshardID,
+				"pending", remaining,
+				"wait_limit_ms", nonStreamingMaxAttemptWait.Milliseconds(),
+			)
+			return
+		}
+	}
 }
 
 // waitForPendingLosers waits for all not-yet-done attempts to close their done
@@ -2138,6 +2331,26 @@ func (e *Redundancy) longResponseFailureExempt(inf *inflight) bool {
 	return longResponseFailureExempt(inf, e.session)
 }
 
+func longNonStreamEmptyFailureExempt(inf *inflight, params user.InferenceParams) bool {
+	if inf == nil || inf.probe || params.Stream || inf.sendTime.IsZero() {
+		return false
+	}
+	if !isEmptyStreamAttempt(inf) {
+		return false
+	}
+	return time.Since(inf.sendTime) >= longResponseFailureExemption
+}
+
+func attemptCountsAsSuccessfulForPerf(inf *inflight, params user.InferenceParams, session *user.Session) bool {
+	if inf == nil {
+		return false
+	}
+	if longNonStreamEmptyFailureExempt(inf, params) {
+		return true
+	}
+	return inf.resp != nil && inf.resp.ConfirmedAt > 0 && !isEmptyStreamAttempt(inf) && session != nil && session.IsNonceFinished(inf.nonce)
+}
+
 func isFailedStreamAttempt(inf *inflight) bool {
 	return isEmptyStreamAttempt(inf) || isErrorStreamAttempt(inf)
 }
@@ -2259,6 +2472,9 @@ func (e *Redundancy) recordStalledWinnerFailureOnce(inf *inflight, params user.I
 	if e.longResponseFailureExempt(inf) {
 		return
 	}
+	if longNonStreamEmptyFailureExempt(inf, params) {
+		return
+	}
 	inf.sampleOnce.Do(func() {
 		participantKey := e.participantKeyForHost(inf.hostIdx)
 		sample := RequestSample{
@@ -2326,6 +2542,13 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 	}
 	if winner := inflightByNonce(attempts, winnerNonce); winner != nil {
 		winnerIdx = winner.hostIdx
+	}
+	if opts.nonStreamingReducedTokenTimeout {
+		for _, inf := range attempts {
+			if inf.excludePairwise {
+				inf.escalated = true
+			}
+		}
 	}
 
 	var (
@@ -2420,6 +2643,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		}
 		if hostErr := hostApplicationErrorFromAttempts(attempts, winnerNonce); hostErr != nil {
 			logRequestStage(ctx, "request_failed", "escrow", e.devshardID, "error", hostErr)
+			e.completeAccountingRequest(ctx, 0, decision, "failed")
 			e.logRequestSettled(ctx, 0, decision, "failed")
 			e.checkEscrowMissing(ctx, attempts)
 			return hostErr
@@ -2428,9 +2652,16 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		if opts.forceTreatAsFailure && anySucceeded {
 			errMsg = "inference: winner failed after streaming started (alternate completion ignored)"
 		}
+		if opts.nonStreamingReducedTokenTimeout {
+			errMsg = (&nonStreamingReducedMaxTokensTimeoutError{}).Error()
+		}
 		logRequestStage(ctx, "request_failed", "escrow", e.devshardID, "error", errMsg)
+		e.completeAccountingRequest(ctx, 0, decision, "failed")
 		e.logRequestSettled(ctx, 0, decision, "failed")
 		e.checkEscrowMissing(ctx, attempts)
+		if opts.nonStreamingReducedTokenTimeout {
+			return &nonStreamingReducedMaxTokensTimeoutError{}
+		}
 		return fmt.Errorf("%s", errMsg)
 	}
 
@@ -2440,7 +2671,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 			continue
 		}
 		e.recordSampleOnce(inf, params)
-		involvement = append(involvement, e.buildInvolvement(inf, winnerNonce))
+		involvement = append(involvement, e.buildInvolvement(inf, winnerNonce, params))
 	}
 	e.perf.RecordRequest(RequestRecord{
 		Timestamp:     time.Now(),
@@ -2501,6 +2732,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		}
 	}
 
+	e.completeAccountingRequest(ctx, winnerNonce, decision, "success")
 	logRequestStage(ctx, "request_succeeded", "escrow", e.devshardID, "winner_nonce", winnerNonce, "decision", decision.Reason)
 	if len(failed) == 0 {
 		e.logRequestSettled(ctx, winnerNonce, decision, "success")
@@ -2530,7 +2762,7 @@ func (e *Redundancy) resolvedWinnerNonce(attempts []*inflight, winnerNonce uint6
 		if inf.probe {
 			continue
 		}
-		if e.session.IsNonceFinished(inf.nonce) {
+		if e.session.IsNonceFinished(inf.nonce) && !isFailedStreamAttempt(inf) {
 			return inf.nonce
 		}
 	}
@@ -2558,16 +2790,49 @@ func (e *Redundancy) logRequestSettled(ctx context.Context, winnerNonce uint64, 
 	)
 }
 
-func (e *Redundancy) buildInvolvement(inf *inflight, winnerNonce uint64) HostInvolvement {
-	notFailedStream := !isFailedStreamAttempt(inf)
-	hi := HostInvolvement{
+func (e *Redundancy) recordAccountingRequestStart(ctx context.Context, params user.InferenceParams) {
+	requestID, ok := requestLogFromContext(ctx)
+	if !ok || requestID == "" || e.perf == nil {
+		return
+	}
+	e.perf.RecordAccountingRequestStart(requestID, e.devshardID, params.Model, time.Now())
+}
+
+func (e *Redundancy) recordAccountingAttempt(ctx context.Context, inf *inflight) {
+	requestID, ok := requestLogFromContext(ctx)
+	if !ok || requestID == "" || e.perf == nil || inf == nil {
+		return
+	}
+	e.perf.RecordAccountingAttempt(RequestAccountingAttempt{
+		RequestID:      requestID,
+		EscrowID:       inf.escrowID,
+		Nonce:          inf.nonce,
 		HostIdx:        inf.hostIdx,
 		ParticipantKey: e.participantKeyForHost(inf.hostIdx),
-		Nonce:          inf.nonce,
-		OutputChunks:   inf.outputChunks.Load(),
-		Responsive:     inf.resp != nil && inf.resp.ConfirmedAt > 0 && notFailedStream,
-		Finished:       e.session.IsNonceFinished(inf.nonce) && notFailedStream,
-		Winner:         inf.nonce == winnerNonce,
+		Probe:          inf.probe,
+		CreatedAt:      time.Now(),
+	})
+}
+
+func (e *Redundancy) completeAccountingRequest(ctx context.Context, winnerNonce uint64, decision Decision, outcome string) {
+	requestID, ok := requestLogFromContext(ctx)
+	if !ok || requestID == "" || e.perf == nil {
+		return
+	}
+	e.perf.CompleteAccountingRequest(requestID, e.devshardID, winnerNonce, decision.Reason, outcome, time.Now())
+}
+
+func (e *Redundancy) buildInvolvement(inf *inflight, winnerNonce uint64, params user.InferenceParams) HostInvolvement {
+	successfulForPerf := attemptCountsAsSuccessfulForPerf(inf, params, e.session)
+	hi := HostInvolvement{
+		HostIdx:         inf.hostIdx,
+		ParticipantKey:  e.participantKeyForHost(inf.hostIdx),
+		Nonce:           inf.nonce,
+		OutputChunks:    inf.outputChunks.Load(),
+		Responsive:      successfulForPerf,
+		Finished:        successfulForPerf,
+		Winner:          inf.nonce == winnerNonce,
+		ExcludePairwise: inf.excludePairwise,
 	}
 	if !inf.sendTime.IsZero() {
 		if !inf.receiptTime.IsZero() {
@@ -2585,11 +2850,11 @@ func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams) {
 	if inf.probe {
 		return
 	}
-	// Empty streams are participant faults and count as non-responsive. An
-	// OpenAI-style error response is different: the host responded with a
-	// meaningful application error, so it should not trigger empty-stream
-	// quarantine or be routed away as silent/non-responsive.
-	responsive := inf.resp != nil && inf.resp.ConfirmedAt > 0 && !isEmptyStreamAttempt(inf)
+	// Long non-stream responses that end empty around the client timeout are
+	// still useful timing samples, but should not be treated like fast empty
+	// stream faults for participant quarantine.
+	longNonStreamEmptyExempt := longNonStreamEmptyFailureExempt(inf, params)
+	responsive := attemptCountsAsSuccessfulForPerf(inf, params, e.session)
 	participantKey := e.participantKeyForHost(inf.hostIdx)
 	sample := RequestSample{
 		HostIdx:        inf.hostIdx,
@@ -2606,9 +2871,9 @@ func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams) {
 	e.perf.Record(sample)
 	if e.participantLimiter != nil {
 		switch {
-		case isEmptyStreamAttempt(inf):
+		case isEmptyStreamAttempt(inf) && !longNonStreamEmptyExempt:
 			e.participantLimiter.ObserveEmptyStream(participantKey)
-		case e.session.IsNonceFinished(inf.nonce):
+		case e.session.IsNonceFinished(inf.nonce) && !longNonStreamEmptyExempt:
 			e.participantLimiter.ObserveSuccessfulInference(participantKey)
 		}
 	}

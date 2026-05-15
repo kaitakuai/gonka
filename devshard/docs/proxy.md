@@ -67,21 +67,21 @@ curl -X 'POST' http://localhost:8080/v1/finalize \
   > ./settle.json
 ```
 
-## Settle Escrow
+This top-level endpoint is for a single-devshard gateway and returns settlement
+JSON only. On a multi-devshard gateway, use the per-devshard route or the admin
+settle route below.
+
+## Settle Escrow On Chain
 
 ```bash
-./inferenced tx inference \
-  settle-devshard-escrow \
-  settle.json \
-  --from dev1 \
-  --keyring-backend file \
-  --home ~/testnet-2 \
-  --chain-id gonka-testnet-2 \
-  --node http://localhost:26657 \
-  --gas auto \
-  --gas-adjustment 1.5 \
-  --fees 500000ngonka -y
+curl -X POST http://localhost:8080/v1/admin/devshards/42/settle \
+  -H "Authorization: Bearer $DEVSHARD_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"private_key_env":"DEVSHARD_PRIVATE_KEY"}'
 ```
+
+The admin settle endpoint locally deactivates the devshard, finalizes it if
+needed, signs `MsgSettleDevshardEscrow`, and broadcasts the transaction.
 
 ## Endpoints
 
@@ -114,7 +114,7 @@ Standard OpenAI chat completion format. The full request body is forwarded as th
 Request fields used by the proxy:
 
 - `model` -- passed to InferenceParams (falls back to `DEVSHARD_MODEL`)
-- `max_tokens` -- passed to InferenceParams (default 2048)
+- `max_tokens` / `max_completion_tokens` -- passed to InferenceParams. If neither is set, the gateway adds `max_tokens` using `default_request_max_tokens` (default `3072`). If one is set above `request_max_tokens_cap` (default `4096`), the gateway caps it before forwarding. Both values can be overridden per model inside `model_limits`.
 - `stream` -- if true, response is SSE; if false, response is a single JSON object
 
 Returns 429 if another inference is already in flight.
@@ -124,6 +124,9 @@ Returns 429 if another inference is already in flight.
 Admin endpoint. Triggers devshard finalization and returns settlement JSON.
 
 No request body needed. Response is the settlement payload ready for `inferenced tx inference settle-devshard-escrow`.
+For multi-devshard gateways, call `/devshard/{id}/v1/finalize` for manual
+payload generation, or prefer `/v1/admin/devshards/{id}/settle` to finalize and
+broadcast the settlement in one step.
 
 ### GET /v1/status
 
@@ -345,8 +348,8 @@ The `api_key` is required by the SDK but ignored by the proxy.
 
 After all inferences are done:
 
-1. POST to `/v1/finalize` with `Authorization: Bearer $DEVSHARD_ADMIN_API_KEY` -- the proxy runs the multi-phase finalization protocol, collects host signatures, and returns settlement JSON.
-2. Submit the settlement on-chain: `inferenced tx inference settle-devshard-escrow settlement.json --from <user>`
+1. POST to `/v1/admin/devshards/{id}/settle` with `Authorization: Bearer $DEVSHARD_ADMIN_API_KEY` and a signing key such as `{"private_key_env":"DEVSHARD_PRIVATE_KEY"}`.
+2. The gateway locally deactivates the devshard, runs finalization if needed, collects host signatures, and broadcasts `MsgSettleDevshardEscrow` on-chain.
 
 The proxy holds the session open until finalization. Once finalized, the session cannot accept new inferences.
 

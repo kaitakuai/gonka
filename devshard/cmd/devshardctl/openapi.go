@@ -68,7 +68,7 @@ const openapiSpec = `{
                 "properties": {
                   "model": { "type": "string", "description": "Model name. Falls back to server default." },
                   "stream": { "type": "boolean", "default": false },
-                  "max_tokens": { "type": "integer", "default": 2048 },
+                  "max_tokens": { "type": "integer", "default": 3072, "maximum": 4096 },
                   "messages": {
                     "type": "array",
                     "items": {
@@ -176,6 +176,97 @@ const openapiSpec = `{
         "responses": {
           "200": { "description": "Settlement payload JSON" },
           "409": { "description": "Session not yet finalized" }
+        }
+      }
+    },
+    "/v1/admin/devshards/import": {
+      "post": {
+        "summary": "Import existing devshard state",
+        "description": "Admin endpoint. Loads an existing devshard state database into this gateway, inactive by default, so it can be inspected, finalized, settled, or later reactivated without entering pooled /v1/chat/completions routing immediately.",
+        "security": [{ "AdminBearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["id", "storage_path"],
+                "properties": {
+                  "id": { "type": "string", "description": "Devshard escrow ID." },
+                  "private_key": { "type": "string", "description": "Hex-encoded private key. Prefer private_key_env for operational use." },
+                  "private_key_env": { "type": "string", "description": "Environment variable containing the private key, for example DEVSHARD_PRIVATE_KEY." },
+                  "model": { "type": "string", "description": "Model ID associated with the escrow." },
+                  "storage_path": { "type": "string", "description": "Path to the existing escrow state.db as seen by this gateway container." },
+                  "protocol_version": { "type": "string", "description": "Optional devshard protocol version." },
+                  "active": { "type": "boolean", "default": false, "description": "Whether to make the imported escrow routable immediately. Defaults to false." },
+                  "perf_path": { "type": "string", "description": "Optional path to a source gateway perf.db. Request accounting rows for this escrow ID are copied into the current gateway perf.db." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Devshard imported" },
+          "400": { "description": "Invalid request or runtime could not be loaded" },
+          "409": { "description": "Devshard already exists" },
+          "500": { "description": "Persist or accounting import failed" }
+        }
+      }
+    },
+    "/v1/admin/devshards/{id}/settle": {
+      "post": {
+        "summary": "Settle devshard escrow",
+        "description": "Admin endpoint. Locally deactivates the devshard, finalizes it if needed, signs MsgSettleDevshardEscrow, and broadcasts the settlement transaction on-chain.",
+        "security": [{ "AdminBearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Devshard escrow ID"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "private_key": { "type": "string", "description": "Hex-encoded private key. Prefer private_key_env for operational use." },
+                  "private_key_env": { "type": "string", "description": "Environment variable containing the private key, for example DEVSHARD_PRIVATE_KEY." },
+                  "chain_id": { "type": "string", "description": "Optional chain ID override." },
+                  "fee_denom": { "type": "string", "description": "Optional fee denomination override." },
+                  "fee_amount": { "type": "integer", "description": "Optional fee amount override." },
+                  "gas_limit": { "type": "integer", "description": "Optional gas limit override." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Settlement transaction submitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "escrow_id": { "type": "integer" },
+                    "active": { "type": "boolean" },
+                    "tx_hash": { "type": "string" },
+                    "settler": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid request or missing settlement key" },
+          "404": { "description": "Devshard not found" },
+          "409": { "description": "Devshard has active requests" },
+          "502": { "description": "Finalize or settlement broadcast failed" }
         }
       }
     },

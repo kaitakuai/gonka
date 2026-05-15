@@ -159,6 +159,7 @@ func mustLoadBootstrapOptions(flags cliFlags, baseStorageDir string) bootstrapOp
 		PublicAPI:               opts.publicAPI,
 		DefaultModel:            opts.defaultModel,
 		DefaultRequestMaxTokens: uint64(readInt64Env("GATEWAY_DEFAULT_MAX_TOKENS", int64(DefaultRequestMaxTokens))),
+		RequestMaxTokensCap:     uint64(readInt64Env("GATEWAY_MAX_TOKENS_CAP", int64(RequestMaxTokensCap))),
 		MaxConcurrentRequests:   readInt64Env("GATEWAY_MAX_CONCURRENT_REQUESTS", defaultMaxConcurrentRequests),
 		MaxInputTokensInFlight:  readInt64Env("GATEWAY_MAX_INPUT_TOKENS_IN_FLIGHT", 0),
 		TxGasLimit:              uint64(readInt64Env("DEVSHARD_TX_GAS_LIMIT", 0)),
@@ -319,6 +320,7 @@ func mustBootstrapGatewayState(gatewayStore *GatewayStore, opts bootstrapOptions
 func mustBuildGateway(gatewayStore *GatewayStore, gatewayState GatewayState, baseStorageDir string) *Gateway {
 	gatewayState.Settings = gatewayState.Settings.WithTuningDefaults()
 	DefaultRequestMaxTokens = gatewayState.Settings.DefaultRequestMaxTokens
+	RequestMaxTokensCap = gatewayState.Settings.RequestMaxTokensCap
 	applyGatewayTuningSettings(gatewayState.Settings)
 
 	perfStore, err := NewPerfStore(filepath.Join(baseStorageDir, "perf.db"))
@@ -495,7 +497,7 @@ func buildGatewayHandler(gateway *Gateway, opts runtimeOptions) http.Handler {
 
 func serveGateway(handler http.Handler, port string, runtimeCount int) {
 	addr := ":" + port
-	log.Printf("devshardctl gateway listening on %s (devshards=%d default_max_tokens=%d)", addr, runtimeCount, DefaultRequestMaxTokens)
+	log.Printf("devshardctl gateway listening on %s (devshards=%d default_max_tokens=%d max_tokens_cap=%d)", addr, runtimeCount, DefaultRequestMaxTokens, RequestMaxTokensCap)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("server: %v", err)
 	}

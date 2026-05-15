@@ -197,16 +197,17 @@ func (r *hostRing) stats(participantKey string, hostIdx int, windowStart time.Ti
 
 // HostInvolvement describes one host's participation in a user request.
 type HostInvolvement struct {
-	HostIdx        int     `json:"host_idx"`
-	ParticipantKey string  `json:"participant_key,omitempty"`
-	Nonce          uint64  `json:"nonce"`
-	OutputChunks   int64   `json:"output_chunks"`
-	ReceiptTimeMs  float64 `json:"receipt_time_ms"`
-	FirstTokenMs   float64 `json:"first_token_ms"`
-	TotalTimeMs    float64 `json:"total_time_ms"`
-	Responsive     bool    `json:"responsive"`
-	Finished       bool    `json:"finished"`
-	Winner         bool    `json:"winner"`
+	HostIdx         int     `json:"host_idx"`
+	ParticipantKey  string  `json:"participant_key,omitempty"`
+	Nonce           uint64  `json:"nonce"`
+	OutputChunks    int64   `json:"output_chunks"`
+	ReceiptTimeMs   float64 `json:"receipt_time_ms"`
+	FirstTokenMs    float64 `json:"first_token_ms"`
+	TotalTimeMs     float64 `json:"total_time_ms"`
+	Responsive      bool    `json:"responsive"`
+	Finished        bool    `json:"finished"`
+	Winner          bool    `json:"winner"`
+	ExcludePairwise bool    `json:"exclude_pairwise,omitempty"`
 }
 
 // RequestRecord logs a single user-facing inference request.

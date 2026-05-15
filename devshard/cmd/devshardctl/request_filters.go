@@ -21,6 +21,11 @@ type chatRequest struct {
 	N                   uint64 `json:"n"`
 }
 
+type outputTokenLimits struct {
+	DefaultMaxTokens uint64
+	MaxTokensCap     uint64
+}
+
 type chatRequestFilterError struct {
 	status  int
 	message string
@@ -65,6 +70,10 @@ func readLimitedChatRequestBody(r *http.Request) ([]byte, error) {
 }
 
 func prepareChatRequestBody(r *http.Request) ([]byte, chatRequest, error) {
+	return prepareChatRequestBodyWithTokenLimits(r, defaultOutputTokenLimits())
+}
+
+func prepareChatRequestBodyWithTokenLimits(r *http.Request, limits outputTokenLimits) ([]byte, chatRequest, error) {
 	body, err := readLimitedChatRequestBody(r)
 	if err != nil {
 		return nil, chatRequest{}, err
@@ -73,10 +82,19 @@ func prepareChatRequestBody(r *http.Request) ([]byte, chatRequest, error) {
 	if err != nil {
 		return nil, chatRequest{}, err
 	}
-	return normalizeChatRequest(body)
+	return normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits)
 }
 
 func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
+	return normalizeChatRequestForAuth(body, false)
+}
+
+func normalizeChatRequestForAuth(body []byte, adminAuthenticated bool) ([]byte, chatRequest, error) {
+	return normalizeChatRequestForAuthAndLimits(body, adminAuthenticated, defaultOutputTokenLimits())
+}
+
+func normalizeChatRequestForAuthAndLimits(body []byte, adminAuthenticated bool, limits outputTokenLimits) ([]byte, chatRequest, error) {
+	limits = normalizedOutputTokenLimits(limits)
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, chatRequest{}, badChatRequest("parse request: %v", err)
@@ -98,8 +116,8 @@ func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
 	_, hasMaxCompletionTokens := raw["max_completion_tokens"]
 	switch {
 	case hasMaxTokens && hasMaxCompletionTokens:
-		req.MaxTokens = capOutputTokens(req.MaxTokens)
-		req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens)
+		req.MaxTokens = capOutputTokens(req.MaxTokens, true, adminAuthenticated, limits)
+		req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens, true, adminAuthenticated, limits)
 		if req.MaxCompletionTokens < req.MaxTokens {
 			req.MaxTokens = req.MaxCompletionTokens
 		} else {
@@ -108,14 +126,14 @@ func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
 		raw["max_tokens"] = req.MaxTokens
 		raw["max_completion_tokens"] = req.MaxCompletionTokens
 	case hasMaxTokens:
-		req.MaxTokens = capOutputTokens(req.MaxTokens)
+		req.MaxTokens = capOutputTokens(req.MaxTokens, true, adminAuthenticated, limits)
 		raw["max_tokens"] = req.MaxTokens
 	case hasMaxCompletionTokens:
-		req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens)
+		req.MaxCompletionTokens = capOutputTokens(req.MaxCompletionTokens, true, adminAuthenticated, limits)
 		req.MaxTokens = req.MaxCompletionTokens
 		raw["max_completion_tokens"] = req.MaxCompletionTokens
 	default:
-		req.MaxTokens = capOutputTokens(0)
+		req.MaxTokens = capOutputTokens(0, false, adminAuthenticated, limits)
 		raw["max_tokens"] = req.MaxTokens
 	}
 	stripMinTokensAboveMax(raw, req.MaxTokens)
@@ -190,12 +208,30 @@ func moonshotThinkingEnabled(value any) (bool, bool) {
 	}
 }
 
-func capOutputTokens(value uint64) uint64 {
-	if value == 0 {
-		return DefaultRequestMaxTokens
+func defaultOutputTokenLimits() outputTokenLimits {
+	return outputTokenLimits{
+		DefaultMaxTokens: DefaultRequestMaxTokens,
+		MaxTokensCap:     RequestMaxTokensCap,
 	}
-	if DefaultRequestMaxTokens > 0 && value > DefaultRequestMaxTokens {
-		return DefaultRequestMaxTokens
+}
+
+func normalizedOutputTokenLimits(limits outputTokenLimits) outputTokenLimits {
+	if limits.DefaultMaxTokens == 0 {
+		limits.DefaultMaxTokens = DefaultRequestMaxTokens
+	}
+	if limits.MaxTokensCap == 0 {
+		limits.MaxTokensCap = RequestMaxTokensCap
+	}
+	return limits
+}
+
+func capOutputTokens(value uint64, explicitlySet bool, bypassLimit bool, limits outputTokenLimits) uint64 {
+	limits = normalizedOutputTokenLimits(limits)
+	if value == 0 {
+		return limits.DefaultMaxTokens
+	}
+	if explicitlySet && !bypassLimit && limits.MaxTokensCap > 0 && value > limits.MaxTokensCap {
+		return limits.MaxTokensCap
 	}
 	return value
 }
@@ -216,7 +252,7 @@ func stripMinTokensAboveMax(request map[string]any, maxTokens uint64) {
 		return
 	}
 	if value > maxTokens {
-		delete(request, "min_tokens")
+		request["min_tokens"] = maxTokens
 	}
 }
 

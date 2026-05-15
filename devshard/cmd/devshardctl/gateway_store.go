@@ -15,6 +15,7 @@ type GatewaySettings struct {
 	PublicAPI               string                       `json:"public_api"`
 	DefaultModel            string                       `json:"default_model"`
 	DefaultRequestMaxTokens uint64                       `json:"default_request_max_tokens"`
+	RequestMaxTokensCap     uint64                       `json:"request_max_tokens_cap"`
 	MaxConcurrentRequests   int64                        `json:"max_concurrent_requests"`
 	MaxInputTokensInFlight  int64                        `json:"max_input_tokens_in_flight"`
 	ModelLimits             []GatewayModelLimitSettings  `json:"model_limits,omitempty"`
@@ -28,9 +29,11 @@ type GatewaySettings struct {
 }
 
 type GatewayModelLimitSettings struct {
-	ModelID                string `json:"model_id"`
-	MaxConcurrentRequests  int64  `json:"max_concurrent_requests"`
-	MaxInputTokensInFlight int64  `json:"max_input_tokens_in_flight"`
+	ModelID                 string `json:"model_id"`
+	MaxConcurrentRequests   int64  `json:"max_concurrent_requests"`
+	MaxInputTokensInFlight  int64  `json:"max_input_tokens_in_flight"`
+	DefaultRequestMaxTokens uint64 `json:"default_request_max_tokens,omitempty"`
+	RequestMaxTokensCap     uint64 `json:"request_max_tokens_cap,omitempty"`
 }
 
 type GatewayModelAccessSettings struct {
@@ -96,6 +99,12 @@ func DefaultGatewaySettingsTuning() (ParticipantThrottleSettings, RedundancySett
 
 func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 	participantDefaults, redundancyDefaults, perfDefaults := DefaultGatewaySettingsTuning()
+	if s.DefaultRequestMaxTokens == 0 {
+		s.DefaultRequestMaxTokens = 3_072
+	}
+	if s.RequestMaxTokensCap == 0 {
+		s.RequestMaxTokensCap = 4_096
+	}
 	s.Disabled = s.Disabled.WithDefaults()
 	if s.ParticipantThrottle == (ParticipantThrottleSettings{}) {
 		s.ParticipantThrottle = participantDefaults
@@ -213,6 +222,7 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			public_api TEXT NOT NULL DEFAULT '',
 			default_model TEXT NOT NULL,
 			default_request_max_tokens INTEGER NOT NULL,
+			request_max_tokens_cap INTEGER NOT NULL DEFAULT 4096,
 			max_concurrent_requests INTEGER NOT NULL DEFAULT 512,
 			max_input_tokens_in_flight INTEGER NOT NULL,
 			model_limits_json TEXT NOT NULL DEFAULT '',
@@ -285,6 +295,10 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 	if err := ensureGatewaySettingsColumn(db, "model_access_json", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate gateway model access: %w", err)
+	}
+	if err := ensureGatewaySettingsColumn(db, "request_max_tokens_cap", "INTEGER NOT NULL DEFAULT 4096"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway max token cap: %w", err)
 	}
 	if err := ensureGatewaySettingsTuningColumns(db); err != nil {
 		db.Close()
@@ -361,7 +375,7 @@ func (s *GatewayStore) Close() error {
 func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 	var state GatewayState
 	row := s.db.QueryRow(`
-		SELECT chain_rest, public_api, default_model, default_request_max_tokens,
+		SELECT chain_rest, public_api, default_model, default_request_max_tokens, request_max_tokens_cap,
 		       max_concurrent_requests, max_input_tokens_in_flight, model_limits_json, model_access_json, tx_gas_limit,
 		       participant_request_burst, participant_recovery_per_minute,
 		       participant_http_quarantine_ms, participant_transport_failure_quarantine_ms,
@@ -390,6 +404,7 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.PublicAPI,
 		&state.Settings.DefaultModel,
 		&state.Settings.DefaultRequestMaxTokens,
+		&state.Settings.RequestMaxTokensCap,
 		&state.Settings.MaxConcurrentRequests,
 		&state.Settings.MaxInputTokensInFlight,
 		&modelLimitsJSON,
@@ -507,7 +522,7 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 
 	if _, err := tx.Exec(`
 		INSERT INTO gateway_settings (
-			id, chain_rest, public_api, default_model, default_request_max_tokens,
+			id, chain_rest, public_api, default_model, default_request_max_tokens, request_max_tokens_cap,
 			max_concurrent_requests, max_input_tokens_in_flight, model_limits_json, model_access_json, tx_gas_limit,
 			participant_request_burst, participant_recovery_per_minute,
 			participant_http_quarantine_ms, participant_transport_failure_quarantine_ms,
@@ -525,11 +540,12 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 			escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_models_json,
 			gateway_disabled_enabled, gateway_disabled_message, gateway_disabled_new_url,
 			updated_at
-		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(settings.ChainREST),
 		strings.TrimSpace(settings.PublicAPI),
 		strings.TrimSpace(settings.DefaultModel),
 		settings.DefaultRequestMaxTokens,
+		settings.RequestMaxTokensCap,
 		settings.MaxConcurrentRequests,
 		settings.MaxInputTokensInFlight,
 		mustMarshalGatewayModelLimits(settings.ModelLimits),
@@ -587,6 +603,7 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    public_api = ?,
 		    default_model = ?,
 		    default_request_max_tokens = ?,
+		    request_max_tokens_cap = ?,
 		    max_concurrent_requests = ?,
 		    max_input_tokens_in_flight = ?,
 		    model_limits_json = ?,
@@ -629,6 +646,7 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		strings.TrimSpace(settings.PublicAPI),
 		strings.TrimSpace(settings.DefaultModel),
 		settings.DefaultRequestMaxTokens,
+		settings.RequestMaxTokensCap,
 		settings.MaxConcurrentRequests,
 		settings.MaxInputTokensInFlight,
 		mustMarshalGatewayModelLimits(settings.ModelLimits),

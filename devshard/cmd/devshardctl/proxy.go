@@ -64,14 +64,18 @@ var inferenceStatusName = map[types.InferenceStatus]string{
 
 // Proxy is the OpenAI-compatible HTTP proxy backed by a devshard session.
 type Proxy struct {
-	session    *user.Session
-	sm         *state.StateMachine
-	escrowID   string
-	model      string
-	redundancy *Redundancy
-	perf       *PerfTracker
-	phaseGate  *ChainPhaseGate
+	session                 *user.Session
+	sm                      *state.StateMachine
+	escrowID                string
+	model                   string
+	redundancy              *Redundancy
+	perf                    *PerfTracker
+	phaseGate               *ChainPhaseGate
+	defaultRequestMaxTokens uint64
+	requestMaxTokensCap     uint64
 }
+
+const emptyToolResultContent = "<empty tool result>"
 
 // normalizeContent converts text-only multi-part content arrays to simple strings.
 // [{"type":"text","text":"A"},{"type":"text","text":"B"}] -> "A\nB"
@@ -92,8 +96,18 @@ func normalizeContent(body []byte) ([]byte, error) {
 
 	changed := false
 	for i, msg := range msgs {
+		role := rawMessageString(msg["role"])
 		contentRaw, ok := msg["content"]
 		if !ok {
+			if role == "tool" {
+				placeholder, _ := json.Marshal(emptyToolResultContent)
+				msgs[i]["content"] = placeholder
+				changed = true
+			}
+			continue
+		}
+		if normalizeEmptyContent(msg, role, contentRaw) {
+			changed = true
 			continue
 		}
 		var parts []map[string]any
@@ -131,6 +145,48 @@ func normalizeContent(body []byte) ([]byte, error) {
 	return out, nil
 }
 
+func normalizeEmptyContent(msg map[string]json.RawMessage, role string, contentRaw json.RawMessage) bool {
+	if string(contentRaw) == "null" {
+		if role == "tool" {
+			placeholder, _ := json.Marshal(emptyToolResultContent)
+			msg["content"] = placeholder
+			return true
+		}
+		return false
+	}
+
+	var content string
+	if err := json.Unmarshal(contentRaw, &content); err != nil {
+		return false
+	}
+	if strings.TrimSpace(content) != "" {
+		return false
+	}
+
+	switch role {
+	case "assistant":
+		if _, hasToolCalls := msg["tool_calls"]; hasToolCalls {
+			msg["content"] = []byte("null")
+			return true
+		}
+		if _, hasFunctionCall := msg["function_call"]; hasFunctionCall {
+			msg["content"] = []byte("null")
+			return true
+		}
+	case "tool":
+		placeholder, _ := json.Marshal(emptyToolResultContent)
+		msg["content"] = placeholder
+		return true
+	}
+	return false
+}
+
+func rawMessageString(raw json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
 func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, _ := ensureRequestLogContext(r.Context())
 	r = r.WithContext(ctx)
@@ -145,7 +201,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, req, err := prepareChatRequestBody(r)
+	body, req, err := prepareChatRequestBodyWithTokenLimits(r, p.outputTokenLimits())
 	if err != nil {
 		logRequestStage(ctx, "proxy_read_body_failed", "error", err)
 		writeGatewayJSONError(w, chatRequestErrorStatus(err, http.StatusBadRequest), err.Error())
@@ -177,6 +233,16 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.handleNonStreaming(w, r, params)
 	}
+}
+
+func (p *Proxy) outputTokenLimits() outputTokenLimits {
+	if p == nil {
+		return defaultOutputTokenLimits()
+	}
+	return normalizedOutputTokenLimits(outputTokenLimits{
+		DefaultMaxTokens: p.defaultRequestMaxTokens,
+		MaxTokensCap:     p.requestMaxTokensCap,
+	})
 }
 
 // deferredWriter delays WriteHeader(200) until the first Write call.
@@ -706,6 +772,132 @@ func (p *Proxy) handleStatus(w http.ResponseWriter, r *http.Request) {
 		status.BlockReason = snapshot.BlockReason
 	}
 	writeJSON(w, status)
+}
+
+type requestAccountingCostResponse struct {
+	WinnerActualCost        uint64 `json:"winner_actual_cost"`
+	OtherAttemptsActualCost uint64 `json:"other_attempts_actual_cost"`
+	AllAttemptsActualCost   uint64 `json:"all_attempts_actual_cost"`
+}
+
+type requestAccountingAttemptResponse struct {
+	Nonce          uint64 `json:"nonce"`
+	HostIdx        int    `json:"host_idx"`
+	ParticipantKey string `json:"participant_key,omitempty"`
+	Probe          bool   `json:"probe"`
+	Winner         bool   `json:"winner"`
+	Status         string `json:"status"`
+	Model          string `json:"model,omitempty"`
+	ExecutorSlot   uint32 `json:"executor_slot,omitempty"`
+	InputLength    uint64 `json:"input_length,omitempty"`
+	MaxTokens      uint64 `json:"max_tokens,omitempty"`
+	InputTokens    uint64 `json:"input_tokens,omitempty"`
+	OutputTokens   uint64 `json:"output_tokens,omitempty"`
+	ReservedCost   uint64 `json:"reserved_cost,omitempty"`
+	ActualCost     uint64 `json:"actual_cost,omitempty"`
+	StartedAt      int64  `json:"started_at,omitempty"`
+	ConfirmedAt    int64  `json:"confirmed_at,omitempty"`
+	CreatedAt      string `json:"created_at,omitempty"`
+}
+
+type requestAccountingResponse struct {
+	RequestID   string                             `json:"request_id"`
+	EscrowID    string                             `json:"escrow_id"`
+	Model       string                             `json:"model,omitempty"`
+	Outcome     string                             `json:"outcome"`
+	Decision    string                             `json:"decision,omitempty"`
+	WinnerNonce uint64                             `json:"winner_nonce,omitempty"`
+	Winner      *requestAccountingAttemptResponse  `json:"winner,omitempty"`
+	Attempts    []requestAccountingAttemptResponse `json:"attempts"`
+	Cost        requestAccountingCostResponse      `json:"cost"`
+	StartedAt   string                             `json:"started_at,omitempty"`
+	CompletedAt string                             `json:"completed_at,omitempty"`
+}
+
+func (p *Proxy) handleRequestAccounting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	requestID := strings.TrimSpace(r.PathValue("request_id"))
+	if requestID == "" {
+		http.Error(w, `{"error":{"message":"request_id is required"}}`, http.StatusBadRequest)
+		return
+	}
+	if p.perf == nil {
+		http.Error(w, `{"error":{"message":"request accounting unavailable"}}`, http.StatusServiceUnavailable)
+		return
+	}
+	rec, ok, err := p.perf.FindAccountingRequest(requestID, p.escrowID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"request %s not found for devshard %s"}}`, requestID, p.escrowID), http.StatusNotFound)
+		return
+	}
+
+	stateSnapshot := p.sm.SnapshotState()
+	resp := requestAccountingResponse{
+		RequestID:   rec.RequestID,
+		EscrowID:    rec.EscrowID,
+		Model:       rec.Model,
+		Outcome:     rec.Outcome,
+		Decision:    rec.Decision,
+		WinnerNonce: rec.WinnerNonce,
+		Attempts:    make([]requestAccountingAttemptResponse, 0, len(rec.Attempts)),
+	}
+	if !rec.StartedAt.IsZero() {
+		resp.StartedAt = rec.StartedAt.Format(time.RFC3339Nano)
+	}
+	if !rec.CompletedAt.IsZero() {
+		resp.CompletedAt = rec.CompletedAt.Format(time.RFC3339Nano)
+	}
+
+	for _, attempt := range rec.Attempts {
+		view := requestAccountingAttemptResponse{
+			Nonce:          attempt.Nonce,
+			HostIdx:        attempt.HostIdx,
+			ParticipantKey: attempt.ParticipantKey,
+			Probe:          attempt.Probe,
+			Winner:         attempt.Winner || attempt.Nonce == rec.WinnerNonce,
+			Status:         "not_in_state",
+		}
+		if !attempt.CreatedAt.IsZero() {
+			view.CreatedAt = attempt.CreatedAt.Format(time.RFC3339Nano)
+		}
+		if inf, found := stateSnapshot.Inferences[attempt.Nonce]; found && inf != nil {
+			status := inferenceStatusName[inf.Status]
+			if status == "" {
+				status = fmt.Sprintf("unknown(%d)", inf.Status)
+			}
+			view.Status = status
+			view.Model = inf.Model
+			view.ExecutorSlot = inf.ExecutorSlot
+			view.InputLength = inf.InputLength
+			view.MaxTokens = inf.MaxTokens
+			view.InputTokens = inf.InputTokens
+			view.OutputTokens = inf.OutputTokens
+			view.ReservedCost = inf.ReservedCost
+			view.ActualCost = inf.ActualCost
+			view.StartedAt = inf.StartedAt
+			view.ConfirmedAt = inf.ConfirmedAt
+			if view.Winner {
+				resp.Cost.WinnerActualCost += inf.ActualCost
+			} else {
+				resp.Cost.OtherAttemptsActualCost += inf.ActualCost
+			}
+			resp.Cost.AllAttemptsActualCost += inf.ActualCost
+		}
+		resp.Attempts = append(resp.Attempts, view)
+		if view.Winner {
+			winner := view
+			resp.Winner = &winner
+		}
+	}
+
+	writeJSON(w, resp)
 }
 
 func (p *Proxy) admissionError() error {
