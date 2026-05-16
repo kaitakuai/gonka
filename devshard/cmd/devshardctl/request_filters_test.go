@@ -189,6 +189,44 @@ func TestNormalizeChatRequestKeepsMinTokensWithinEffectiveMax(t *testing.T) {
 	require.EqualValues(t, 128, raw["min_tokens"])
 }
 
+func TestNormalizeChatRequestStripsTemperatureAboveMax(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"temperature": 999999
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 2.0, raw["temperature"])
+}
+
+func TestNormalizeChatRequestKeepsTemperatureWithinMax(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"temperature": 1.5
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 1.5, raw["temperature"])
+}
+
+func TestNormalizeChatRequestForcesValidationLogprobs(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"logprobs": false,
+		"top_logprobs": 20
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Equal(t, true, raw["logprobs"])
+	require.EqualValues(t, 5, raw["top_logprobs"])
+}
+
 func TestNormalizeChatRequestStripsEmptyTools(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"tool_choice": "auto",
