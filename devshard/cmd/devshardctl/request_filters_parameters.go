@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -25,7 +26,9 @@ const (
 type RequestFilterStage int
 
 const (
+	// PreValidation rules run on the raw request document before we decode and validate it.
 	RequestFilterStagePreValidation RequestFilterStage = iota
+	// PostLimits rules run after max token defaults/caps are resolved back into the document.
 	RequestFilterStagePostLimits
 )
 
@@ -33,27 +36,32 @@ type ParameterSupport int
 
 const (
 	ParameterSupportPassthrough ParameterSupport = iota
+	// Strip drops an unsupported field but keeps the request itself valid.
 	ParameterSupportStrip
+	// Reject fails the request because forwarding it would violate the upstream contract.
 	ParameterSupportReject
+	// Sanitize rewrites a field into an allowed shape or value range.
 	ParameterSupportSanitize
+	// Force overwrites the field with a gateway-owned value.
 	ParameterSupportForce
 )
+
+// ParameterRule describes one transformation for a field at a specific pipeline stage.
+type ParameterRule struct {
+	Stage   RequestFilterStage
+	Support ParameterSupport
+	Handler ParameterHandler
+}
 
 type VLLMParameter struct {
 	Name     string
 	Category ParameterCategory
-	Stage    RequestFilterStage
-	Support  ParameterSupport
-	Handler  ParameterHandler
+	Rules    []ParameterRule
 }
 
 type ParameterHandler interface {
 	Apply(*RequestFilterContext, VLLMParameter) error
 }
-
-type NoopParameterHandler struct{}
-
-func (NoopParameterHandler) Apply(_ *RequestFilterContext, _ VLLMParameter) error { return nil }
 
 type StripParameterHandler struct{}
 
@@ -145,6 +153,7 @@ func (h SanitizeStringListParameterHandler) Apply(ctx *RequestFilterContext, par
 	return nil
 }
 
+// SanitizeFloatParameterHandler normalizes numeric knobs from either JSON numbers or string-encoded numbers.
 type SanitizeFloatParameterHandler struct {
 	StripNonFinite bool
 	Max            *float64
@@ -155,20 +164,16 @@ func (h SanitizeFloatParameterHandler) Apply(ctx *RequestFilterContext, paramete
 	if !ok {
 		return nil
 	}
-	if stringValue, ok := value.(string); ok {
-		if h.StripNonFinite && isNonFiniteString(stringValue) {
-			ctx.Document.Delete(parameter.Name)
-		}
-		return nil
-	}
 	number, ok := numericJSONValueAsFloat64(value)
 	if !ok {
+		ctx.Document.Delete(parameter.Name)
 		return nil
 	}
 	if h.StripNonFinite && (math.IsNaN(number) || math.IsInf(number, 0)) {
 		ctx.Document.Delete(parameter.Name)
 		return nil
 	}
+	ctx.Document.Set(parameter.Name, number)
 	if h.Max != nil && number > *h.Max {
 		ctx.Document.Set(parameter.Name, *h.Max)
 	}
@@ -375,116 +380,133 @@ type VLLMParameterCatalog struct {
 	parameters []VLLMParameter
 }
 
+var defaultParameterCatalog = defaultVLLMParameterCatalog()
+
+// The catalog is the single source of truth for how each supported OpenAI/vLLM field is treated.
 func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 	return VLLMParameterCatalog{parameters: []VLLMParameter{
-		newPassthroughParameter("model", ParameterCategoryString),
-		newPassthroughParameter("stream", ParameterCategoryBool),
-		newPassthroughParameter("messages", ParameterCategoryObjectArray),
-		newPassthroughParameter("max_tokens", ParameterCategoryIntRange),
-		newPassthroughParameter("max_completion_tokens", ParameterCategoryIntRange),
-		newPassthroughParameter("min_tokens", ParameterCategoryIntRange),
-		newPassthroughParameter("n", ParameterCategoryIntRange),
-		newPassthroughParameter("temperature", ParameterCategoryFloatRange),
-		newPassthroughParameter("top_p", ParameterCategoryFloatRange),
-		newPassthroughParameter("top_k", ParameterCategoryIntRange),
-		newPassthroughParameter("min_p", ParameterCategoryFloatRange),
-		newPassthroughParameter("repetition_penalty", ParameterCategoryFloatRange),
-		newPassthroughParameter("logit_bias", ParameterCategoryIntToFloat),
-		newPassthroughParameter("bad_words", ParameterCategoryStringList),
-		newPassthroughParameter("stop", ParameterCategoryStringList),
-		newPassthroughParameter("stop_token_ids", ParameterCategoryIntList),
-		newPassthroughParameter("allowed_token_ids", ParameterCategoryIntList),
-		newPassthroughParameter("seed", ParameterCategoryIntRange),
-		newPassthroughParameter("ignore_eos", ParameterCategoryBool),
-		newPassthroughParameter("skip_special_tokens", ParameterCategoryBool),
-		newPassthroughParameter("detokenize", ParameterCategoryBool),
-		newPassthroughParameter("thinking", ParameterCategoryObject),
-		newPassthroughParameter("chat_template_kwargs", ParameterCategoryObject),
-		newPassthroughParameter("tools", ParameterCategoryObjectArray),
-		newPassthroughParameter("tool_choice", ParameterCategoryString),
-		newPassthroughParameter("response_format", ParameterCategoryObject),
-		newStrippedParameter("presence_penalty", ParameterCategoryFloatRange, RequestFilterStagePreValidation),
-		newStrippedParameter("frequency_penalty", ParameterCategoryFloatRange, RequestFilterStagePreValidation),
-		newStrippedParameter("structured_outputs", ParameterCategoryObject, RequestFilterStagePreValidation),
-		newStrippedParameter("prompt_logprobs", ParameterCategoryIntRange, RequestFilterStagePreValidation),
-		newStrippedParameter("use_beam_search", ParameterCategoryBool, RequestFilterStagePreValidation),
-		newStrippedParameter("truncate_prompt_tokens", ParameterCategoryIntRange, RequestFilterStagePreValidation),
-		newConditionalParameter("min_tokens", ParameterCategoryIntRange, RequestFilterStagePreValidation, ParameterSupportStrip, ConditionalStripParameterHandler{
-			Predicate: func(ctx *RequestFilterContext) bool {
-				return ctx.Document.Has("stop_token_ids")
-			},
-		}),
-		newSanitizedParameter("bad_words", ParameterCategoryStringList, RequestFilterStagePreValidation, SanitizeStringListParameterHandler{
-			Keep: func(value string) bool {
-				return strings.TrimSpace(value) != ""
-			},
-			DropFieldIfEmpty: true,
-		}),
-		newSanitizedParameter("tools", ParameterCategoryObjectArray, RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}),
-		newRejectedParameter("enforced_tokens", ParameterCategoryAny, RequestFilterStagePreValidation, unsupportedChatParameterMessage("enforced_tokens")),
-		newRejectedNestedStringValueParameter("response_format", "type", "json_object", ParameterCategoryObject, RequestFilterStagePreValidation, unsupportedChatParameterMessage("response_format.type=json_object")),
-		newRejectedNestedStringValueParameter("response_format", "type", "json_schema", ParameterCategoryObject, RequestFilterStagePreValidation, unsupportedChatParameterMessage("response_format.type=json_schema")),
-		newRejectedParameter("guided_regex", ParameterCategoryAny, RequestFilterStagePreValidation, unsupportedChatParameterMessage("guided_regex")),
-		newRejectedParameter("guided_grammar", ParameterCategoryAny, RequestFilterStagePreValidation, unsupportedChatParameterMessage("guided_grammar")),
-		newRejectedParameter("guided_json", ParameterCategoryAny, RequestFilterStagePreValidation, unsupportedChatParameterMessage("guided_json")),
-		newRejectedParameter("guided_choice", ParameterCategoryAny, RequestFilterStagePreValidation, unsupportedChatParameterMessage("guided_choice")),
-		newRejectedStringValueParameter("tool_choice", "required", ParameterCategoryString, RequestFilterStagePreValidation, unsupportedChatParameterMessage("tool_choice=required")),
-		newSanitizedParameter("structured_outputs.regex", ParameterCategoryObject, RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: rejectStructuredOutputsRegex}),
-		newSanitizedParameter("n", ParameterCategoryIntRange, RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}),
-		newSanitizedParameter("min_tokens", ParameterCategoryIntRange, RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
-		newSanitizedParameter("temperature", ParameterCategoryFloatRange, RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
-		newSanitizedParameter("top_p", ParameterCategoryFloatRange, RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newSanitizedParameter("top_k", ParameterCategoryIntRange, RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newSanitizedParameter("min_p", ParameterCategoryFloatRange, RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newSanitizedParameter("repetition_penalty", ParameterCategoryFloatRange, RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newSanitizedParameter("logit_bias", ParameterCategoryIntToFloat, RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true}),
-		newForcedParameter("logprobs", ParameterCategoryBool, RequestFilterStagePostLimits, true),
-		newForcedParameter("top_logprobs", ParameterCategoryIntRange, RequestFilterStagePostLimits, 5),
+		newParameter("model", ParameterCategoryString),
+		newParameter("stream", ParameterCategoryBool),
+		newParameter("messages", ParameterCategoryObjectArray),
+		newParameter("max_tokens", ParameterCategoryIntRange),
+		newParameter("max_completion_tokens", ParameterCategoryIntRange),
+		newParameter("n", ParameterCategoryIntRange).
+			withSanitizeRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}),
+		newParameter("temperature", ParameterCategoryFloatRange).
+			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
+		newParameter("top_p", ParameterCategoryFloatRange).
+			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
+		newParameter("top_k", ParameterCategoryIntRange).
+			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
+		newParameter("min_p", ParameterCategoryFloatRange).
+			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
+		newParameter("repetition_penalty", ParameterCategoryFloatRange).
+			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
+		newParameter("logit_bias", ParameterCategoryIntToFloat).
+			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true}),
+		newParameter("stop", ParameterCategoryStringList),
+		newParameter("stop_token_ids", ParameterCategoryIntList),
+		newParameter("seed", ParameterCategoryIntRange),
+		newParameter("skip_special_tokens", ParameterCategoryBool),
+		newParameter("detokenize", ParameterCategoryBool),
+		newParameter("thinking", ParameterCategoryObject),
+		newParameter("chat_template_kwargs", ParameterCategoryObject),
+		newParameter("tool_choice", ParameterCategoryString).
+			withRejectRule(RequestFilterStagePreValidation, RejectStringValueParameterHandler{Value: "required", Message: unsupportedChatParameterMessage("tool_choice=required")}),
+		newParameter("response_format", ParameterCategoryObject).
+			withRejectRule(RequestFilterStagePreValidation, RejectNestedStringValueParameterHandler{Parent: "response_format", Field: "type", Value: "json_object", Message: unsupportedChatParameterMessage("response_format.type=json_object")}).
+			withRejectRule(RequestFilterStagePreValidation, RejectNestedStringValueParameterHandler{Parent: "response_format", Field: "type", Value: "json_schema", Message: unsupportedChatParameterMessage("response_format.type=json_schema")}),
+		newParameter("presence_penalty", ParameterCategoryFloatRange).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("frequency_penalty", ParameterCategoryFloatRange).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("structured_outputs", ParameterCategoryObject).
+			withStripRule(RequestFilterStagePreValidation).
+			withSanitizeRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: rejectStructuredOutputsRegex}),
+		newParameter("prompt_logprobs", ParameterCategoryIntRange).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("use_beam_search", ParameterCategoryBool).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("truncate_prompt_tokens", ParameterCategoryIntRange).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("allowed_token_ids", ParameterCategoryIntList).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("ignore_eos", ParameterCategoryBool).
+			withStripRule(RequestFilterStagePreValidation),
+		newParameter("min_tokens", ParameterCategoryIntRange).
+			withConditionalStripRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
+				Predicate: func(ctx *RequestFilterContext) bool {
+					return ctx.Document.Has("stop_token_ids")
+				},
+			}).
+			withSanitizeRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
+		newParameter("bad_words", ParameterCategoryStringList).
+			withSanitizeRule(RequestFilterStagePreValidation, SanitizeStringListParameterHandler{
+				Keep: func(value string) bool {
+					return strings.TrimSpace(value) != ""
+				},
+				DropFieldIfEmpty: true,
+			}),
+		newParameter("tools", ParameterCategoryObjectArray).
+			withSanitizeRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}),
+		newParameter("enforced_tokens", ParameterCategoryAny).
+			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("enforced_tokens")}),
+		newParameter("guided_regex", ParameterCategoryAny).
+			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_regex")}),
+		newParameter("guided_grammar", ParameterCategoryAny).
+			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_grammar")}),
+		newParameter("guided_json", ParameterCategoryAny).
+			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_json")}),
+		newParameter("guided_choice", ParameterCategoryAny).
+			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_choice")}),
+		newParameter("logprobs", ParameterCategoryBool).
+			withForceRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
+		newParameter("top_logprobs", ParameterCategoryIntRange).
+			withForceRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: 5}),
 	}}
 }
 
 func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilterContext) error {
 	for _, parameter := range c.parameters {
-		if parameter.Stage != stage || parameter.Handler == nil {
-			continue
-		}
-		if err := parameter.Handler.Apply(ctx, parameter); err != nil {
-			return err
+		for _, rule := range parameter.Rules {
+			if rule.Stage != stage || rule.Handler == nil {
+				continue
+			}
+			if err := rule.Handler.Apply(ctx, parameter); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func newPassthroughParameter(name string, category ParameterCategory) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Support: ParameterSupportPassthrough, Handler: NoopParameterHandler{}}
+func newParameter(name string, category ParameterCategory) VLLMParameter {
+	return VLLMParameter{Name: name, Category: category}
 }
 
-func newStrippedParameter(name string, category ParameterCategory, stage RequestFilterStage) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Stage: stage, Support: ParameterSupportStrip, Handler: StripParameterHandler{}}
+func (p VLLMParameter) appendRule(stage RequestFilterStage, support ParameterSupport, handler ParameterHandler) VLLMParameter {
+	p.Rules = append(p.Rules, ParameterRule{Stage: stage, Support: support, Handler: handler})
+	return p
 }
 
-func newRejectedParameter(name string, category ParameterCategory, stage RequestFilterStage, message string) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Stage: stage, Support: ParameterSupportReject, Handler: RejectParameterHandler{Message: message}}
+func (p VLLMParameter) withStripRule(stage RequestFilterStage) VLLMParameter {
+	return p.appendRule(stage, ParameterSupportStrip, StripParameterHandler{})
 }
 
-func newRejectedStringValueParameter(name string, value string, category ParameterCategory, stage RequestFilterStage, message string) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Stage: stage, Support: ParameterSupportReject, Handler: RejectStringValueParameterHandler{Value: value, Message: message}}
+func (p VLLMParameter) withConditionalStripRule(stage RequestFilterStage, handler ConditionalStripParameterHandler) VLLMParameter {
+	return p.appendRule(stage, ParameterSupportStrip, handler)
 }
 
-func newRejectedNestedStringValueParameter(parent string, field string, value string, category ParameterCategory, stage RequestFilterStage, message string) VLLMParameter {
-	return VLLMParameter{Name: parent + "." + field, Category: category, Stage: stage, Support: ParameterSupportReject, Handler: RejectNestedStringValueParameterHandler{Parent: parent, Field: field, Value: value, Message: message}}
+func (p VLLMParameter) withRejectRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
+	return p.appendRule(stage, ParameterSupportReject, handler)
 }
 
-func newSanitizedParameter(name string, category ParameterCategory, stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Stage: stage, Support: ParameterSupportSanitize, Handler: handler}
+func (p VLLMParameter) withSanitizeRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
+	return p.appendRule(stage, ParameterSupportSanitize, handler)
 }
 
-func newForcedParameter(name string, category ParameterCategory, stage RequestFilterStage, value any) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Stage: stage, Support: ParameterSupportForce, Handler: ForceLiteralParameterHandler{Value: value}}
-}
-
-func newConditionalParameter(name string, category ParameterCategory, stage RequestFilterStage, support ParameterSupport, handler ParameterHandler) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category, Stage: stage, Support: support, Handler: handler}
+func (p VLLMParameter) withForceRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
+	return p.appendRule(stage, ParameterSupportForce, handler)
 }
 
 func stripEmptyToolsAndToolChoice(ctx *RequestFilterContext, _ VLLMParameter) error {
@@ -507,11 +529,6 @@ func rejectStructuredOutputsRegex(ctx *RequestFilterContext, _ VLLMParameter) er
 	return nil
 }
 
-func isNonFiniteString(value string) bool {
-	lower := strings.ToLower(strings.TrimSpace(value))
-	return lower == "nan" || lower == "inf" || lower == "+inf" || lower == "-inf" || lower == "infinity" || lower == "+infinity" || lower == "-infinity"
-}
-
 func floatPointer(value float64) *float64 {
 	return &value
 }
@@ -528,6 +545,9 @@ func numericJSONValueAsFloat64(value any) (float64, bool) {
 		return float64(v), true
 	case json.Number:
 		number, err := v.Float64()
+		return number, err == nil
+	case string:
+		number, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 		return number, err == nil
 	default:
 		return 0, false

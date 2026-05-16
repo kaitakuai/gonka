@@ -12,6 +12,7 @@ import (
 const MaxChatRequestBodySize = 10 * 1024 * 1024
 const MaxChatRequestChoices = 5
 const MaxTemperature = 2.0
+const MaxRepetitionPenalty = 2.0
 const kimiK26ModelID = "moonshotai/Kimi-K2.6"
 const emptyToolResultContent = "<empty tool result>"
 
@@ -59,8 +60,8 @@ type ChatRequestPipeline struct {
 
 func defaultChatRequestPipeline() ChatRequestPipeline {
 	return ChatRequestPipeline{
-		parameters: defaultVLLMParameterCatalog(),
-		messages:   defaultChatMessageProcessor(),
+		parameters: defaultParameterCatalog,
+		messages:   defaultMessageProcessor,
 	}
 }
 
@@ -101,9 +102,6 @@ func (p ChatRequestPipeline) ApplyModelOverrides(body []byte, req chatRequest, m
 		return nil, chatRequest{}, err
 	}
 	translateKimiThinkingForVLLM(ctx.Document.raw)
-	if err := p.parameters.Apply(RequestFilterStagePreValidation, ctx); err != nil {
-		return nil, chatRequest{}, err
-	}
 	updatedBody, err := ctx.Document.Marshal()
 	if err != nil {
 		return nil, chatRequest{}, err
@@ -256,7 +254,7 @@ func capOutputTokens(value uint64, explicitlySet bool, bypassLimit bool, limits 
 }
 
 func unsupportedChatParameterMessage(name string) string {
-	return fmt.Sprintf("parameter %q is unsupported", name)
+	return fmt.Sprintf("feature %q is temporarily unavailable", name)
 }
 
 func numericJSONValueAsUint64(value any) (uint64, bool) {

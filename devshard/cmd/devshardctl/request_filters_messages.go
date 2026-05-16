@@ -35,6 +35,8 @@ type ChatMessageProcessor struct {
 	roles map[string]MessageRolePolicy
 }
 
+var defaultMessageProcessor = defaultChatMessageProcessor()
+
 func defaultChatMessageProcessor() ChatMessageProcessor {
 	policies := []MessageRolePolicy{
 		{Role: MessageRoleDeveloper, DisallowedFields: []string{"tool_calls", "tool_call_id", "function_call"}, ContentRule: MessageContentRequired},
@@ -51,13 +53,13 @@ func defaultChatMessageProcessor() ChatMessageProcessor {
 	return ChatMessageProcessor{roles: byRole}
 }
 
+// normalizeContent performs compatibility rewrites that make legacy/client-variant payloads pass the stricter validator below.
 func normalizeContent(body []byte) ([]byte, error) {
 	document, err := decodeChatRequestDocument(body)
 	if err != nil {
-		return body, nil
+		return nil, err
 	}
-	processor := defaultChatMessageProcessor()
-	if err := processor.NormalizeDocument(document); err != nil {
+	if err := defaultMessageProcessor.NormalizeDocument(document); err != nil {
 		return nil, err
 	}
 	updatedBody, err := document.Marshal()
@@ -67,6 +69,7 @@ func normalizeContent(body []byte) ([]byte, error) {
 	return updatedBody, nil
 }
 
+// NormalizeDocument only fixes shapes we intentionally accept, for example empty tool content or text-part arrays.
 func (p ChatMessageProcessor) NormalizeDocument(document *ChatRequestDocument) error {
 	messages, ok := document.Array("messages")
 	if !ok {
@@ -119,6 +122,7 @@ func (p ChatMessageProcessor) normalizeMissingContent(message map[string]any, ro
 	return false
 }
 
+// Empty assistant content is allowed only when a call payload is present; empty tool content is normalized to a sentinel string.
 func (p ChatMessageProcessor) normalizeEmptyContent(message map[string]any, role string) bool {
 	content, exists := message["content"]
 	if !exists {
@@ -152,6 +156,7 @@ func (p ChatMessageProcessor) normalizeEmptyContent(message map[string]any, role
 	return false
 }
 
+// ValidateDocument enforces the OpenAI-compatible message contract and makes sure tool responses match earlier assistant tool_calls.
 func (p ChatMessageProcessor) ValidateDocument(document *ChatRequestDocument) error {
 	rawMessages, exists := document.Array("messages")
 	if !exists {
@@ -224,7 +229,7 @@ func (p ChatMessageProcessor) ValidateDocument(document *ChatRequestDocument) er
 }
 
 func validateOpenAICompatChatMessages(request map[string]any) error {
-	return defaultChatMessageProcessor().ValidateDocument(&ChatRequestDocument{raw: request})
+	return defaultMessageProcessor.ValidateDocument(&ChatRequestDocument{raw: request})
 }
 
 func validateToolCallsField(message map[string]any, messageIndex int) ([]string, bool, error) {
@@ -343,10 +348,8 @@ func validateNonEmptyContent(content any) error {
 	}
 }
 
+// We only accept text parts here because the gateway normalizes typed text content into a plain string before forwarding.
 func requiredTextContentPart(part map[string]any, partIndex int) (string, error) {
-	if len(part) != 2 {
-		return "", fmt.Errorf("[%d] must only include type and text", partIndex)
-	}
 	partType, err := requiredNonEmptyString(part, "type")
 	if err != nil {
 		return "", fmt.Errorf("[%d].type: %w", partIndex, err)
