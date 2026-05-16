@@ -227,6 +227,45 @@ func TestNormalizeChatRequestForcesValidationLogprobs(t *testing.T) {
 	require.EqualValues(t, 5, raw["top_logprobs"])
 }
 
+func TestNormalizeChatRequestStripsPromptLogprobs(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"prompt_logprobs": 20
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	_, exists := raw["prompt_logprobs"]
+	require.False(t, exists)
+}
+
+TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"stop_token_ids": [163586, 9999999],
+		"min_tokens": 1
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	_, exists := raw["min_tokens"]
+	require.False(t, exists)
+}
+
+func TestNormalizeChatRequestKeepsMinTokensWithoutStopTokenIds(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"min_tokens": 5
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 5, raw["min_tokens"])
+}
+
 func TestNormalizeChatRequestStripsEmptyTools(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"tool_choice": "auto",
