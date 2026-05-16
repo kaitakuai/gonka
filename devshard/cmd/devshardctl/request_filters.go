@@ -290,6 +290,7 @@ func stripUnsupportedChatRequestParameters(request map[string]any) {
 	delete(request, "presence_penalty")
 	delete(request, "frequency_penalty")
 	delete(request, "structured_outputs")
+	delete(request, "prompt_logprobs")
 	if _, hasStopIDs := request["stop_token_ids"]; hasStopIDs {
 		delete(request, "min_tokens")
 	}

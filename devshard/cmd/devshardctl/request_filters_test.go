@@ -189,7 +189,20 @@ func TestNormalizeChatRequestKeepsMinTokensWithinEffectiveMax(t *testing.T) {
 	require.EqualValues(t, 128, raw["min_tokens"])
 }
 
-func TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
+func TestNormalizeChatRequestStripsPromptLogprobs(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"prompt_logprobs": 20
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	_, exists := raw["prompt_logprobs"]
+	require.False(t, exists)
+}
+
+TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"messages": [{"role": "user", "content": "hi"}],
 		"stop_token_ids": [163586, 9999999],
