@@ -11,6 +11,7 @@ import (
 
 const MaxChatRequestBodySize = 10 * 1024 * 1024
 const MaxChatRequestChoices = 5
+const MaxTemperature = 2.0
 const kimiK26ModelID = "moonshotai/Kimi-K2.6"
 
 type chatRequest struct {
@@ -137,6 +138,8 @@ func normalizeChatRequestForAuthAndLimits(body []byte, adminAuthenticated bool, 
 		raw["max_tokens"] = req.MaxTokens
 	}
 	stripMinTokensAboveMax(raw, req.MaxTokens)
+	stripTemperatureAboveMax(raw)
+	forceValidationLogprobs(raw)
 	if _, hasN := raw["n"]; hasN {
 		req.N = capChatRequestChoices(req.N)
 		raw["n"] = req.N
@@ -254,6 +257,21 @@ func stripMinTokensAboveMax(request map[string]any, maxTokens uint64) {
 	if value > maxTokens {
 		request["min_tokens"] = maxTokens
 	}
+}
+
+func stripTemperatureAboveMax(request map[string]any) {
+	value, ok := request["temperature"].(float64)
+	if !ok {
+		return
+	}
+	if value > MaxTemperature {
+		request["temperature"] = MaxTemperature
+	}
+}
+
+func forceValidationLogprobs(request map[string]any) {
+	request["logprobs"] = true
+	request["top_logprobs"] = 5
 }
 
 func numericJSONValueAsUint64(value any) (uint64, bool) {
