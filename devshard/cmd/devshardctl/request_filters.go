@@ -291,6 +291,9 @@ func stripUnsupportedChatRequestParameters(request map[string]any) {
 	delete(request, "frequency_penalty")
 	delete(request, "structured_outputs")
 	delete(request, "prompt_logprobs")
+	if _, hasStopIDs := request["stop_token_ids"]; hasStopIDs {
+		delete(request, "min_tokens")
+	}
 	if tools, ok := request["tools"].([]any); ok && len(tools) == 0 {
 		delete(request, "tools")
 		delete(request, "tool_choice")
