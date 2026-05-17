@@ -124,6 +124,25 @@ func TestPrepareChatRequestBodyAdminAuthKeepsMaxCompletionTokensAboveDefault(t *
 	require.Contains(t, string(body), `"max_completion_tokens":30000`)
 }
 
+func TestPrepareChatRequestBodyPreservesLargeIntegerFields(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"seed": 9007199254740993,
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+
+	body, _, err := prepareChatRequestBody(req)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	require.NoError(t, decoder.Decode(&raw))
+	seed, ok := raw["seed"].(json.Number)
+	require.True(t, ok)
+	require.Equal(t, "9007199254740993", seed.String())
+	require.Contains(t, string(body), `"seed":9007199254740993`)
+}
+
 func TestNormalizeChatRequestCapsChoices(t *testing.T) {
 	body, req, err := normalizeChatRequest([]byte(`{"n":1638400,"messages":[{"role":"user","content":"hello"}]}`))
 	require.NoError(t, err)
@@ -227,20 +246,40 @@ func TestNormalizeChatRequestForcesValidationLogprobs(t *testing.T) {
 	require.EqualValues(t, 5, raw["top_logprobs"])
 }
 
-func TestNormalizeChatRequestStripsPromptLogprobs(t *testing.T) {
+func TestNormalizeChatRequestForcesLogprobsTrue(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"messages": [{"role": "user", "content": "hi"}],
-		"prompt_logprobs": 20
+		"logprobs": false
 	}`))
 	require.NoError(t, err)
 
 	var raw map[string]any
 	require.NoError(t, json.Unmarshal(body, &raw))
-	_, exists := raw["prompt_logprobs"]
-	require.False(t, exists)
+	require.Equal(t, true, raw["logprobs"])
 }
 
-TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
+func TestNormalizeChatRequestForcesTopLogprobsFive(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"top_logprobs": 1
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 5, raw["top_logprobs"])
+}
+
+func TestNormalizeChatRequestRejectsPromptLogprobs(t *testing.T) {
+	_, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"prompt_logprobs": 20
+	}`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "prompt_logprobs")
+}
+
+func TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"messages": [{"role": "user", "content": "hi"}],
 		"stop_token_ids": [163586, 9999999],
@@ -252,6 +291,19 @@ TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &raw))
 	_, exists := raw["min_tokens"]
 	require.False(t, exists)
+}
+
+func TestNormalizeChatRequestConditionalMinTokensRuleTrueBranch(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"stop_token_ids": [7],
+		"min_tokens": 3
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.NotContains(t, raw, "min_tokens")
 }
 
 func TestNormalizeChatRequestKeepsMinTokensWithoutStopTokenIds(t *testing.T) {
@@ -266,6 +318,18 @@ func TestNormalizeChatRequestKeepsMinTokensWithoutStopTokenIds(t *testing.T) {
 	require.EqualValues(t, 5, raw["min_tokens"])
 }
 
+func TestNormalizeChatRequestConditionalMinTokensRuleFalseBranch(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"messages": [{"role": "user", "content": "hi"}],
+		"min_tokens": 3
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 3, raw["min_tokens"])
+}
+
 func TestNormalizeChatRequestStripsEmptyTools(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"tool_choice": "auto",
@@ -278,6 +342,258 @@ func TestNormalizeChatRequestStripsEmptyTools(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &raw))
 	require.NotContains(t, raw, "tools")
 	require.NotContains(t, raw, "tool_choice")
+}
+
+func TestNormalizeChatRequestKeepsToolChoiceAutoWithTools(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"tool_choice": "auto",
+		"tools": [{"type": "function", "function": {"name": "x", "description": "x", "parameters": {"type": "object"}}}],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Equal(t, "auto", raw["tool_choice"])
+	require.Contains(t, raw, "tools")
+}
+
+func TestNormalizeChatRequestRejectsUnsupportedVLLMParameters(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "beam search", body: `{"use_beam_search":true,"messages":[{"role":"user","content":"hello"}]}`, want: "use_beam_search"},
+		{name: "truncate prompt tokens", body: `{"truncate_prompt_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, want: "truncate_prompt_tokens"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestNormalizeChatRequestRejectsContractViolatingVLLMParameters(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "allowed token ids", body: `{"allowed_token_ids":[1,2,3],"messages":[{"role":"user","content":"hello"}]}`, want: "allowed_token_ids"},
+		{name: "ignore eos", body: `{"ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}`, want: "ignore_eos"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestNormalizeChatRequestStripsEmptyBadWords(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"bad_words": ["", "   ", "keep"],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Equal(t, []any{"keep"}, raw["bad_words"])
+
+	body, _, err = normalizeChatRequest([]byte(`{
+		"bad_words": ["", "\t", "\n"],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+	raw = map[string]any{}
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.NotContains(t, raw, "bad_words")
+}
+
+func TestNormalizeChatRequestStripsWhitespaceOnlyBadWordsResearchCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		badWords string
+		want     []any
+	}{
+		{name: "empty string", badWords: `[""]`},
+		{name: "empty then keep", badWords: `["", "foo"]`, want: []any{"foo"}},
+		{name: "keep then empty", badWords: `["foo", ""]`, want: []any{"foo"}},
+		{name: "ascii space", badWords: `[" "]`},
+		{name: "multiple empties", badWords: `["", "", ""]`},
+		{name: "tab", badWords: `["\t"]`},
+		{name: "line feed", badWords: `["\n"]`},
+		{name: "non breaking space", badWords: `["\u00A0"]`},
+		{name: "cjk space", badWords: `["\u3000"]`},
+		{name: "carriage return", badWords: `["\r"]`},
+		{name: "vertical tab", badWords: `["\u000B"]`},
+		{name: "form feed", badWords: `["\u000C"]`},
+		{name: "multi space", badWords: `["  "]`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, err := normalizeChatRequest([]byte(`{
+				"bad_words": ` + tt.badWords + `,
+				"messages": [{"role": "user", "content": "hello"}]
+			}`))
+			require.NoError(t, err)
+
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			if tt.want == nil {
+				require.NotContains(t, raw, "bad_words")
+				return
+			}
+			require.Equal(t, tt.want, raw["bad_words"])
+		})
+	}
+}
+
+func TestNormalizeChatRequestKeepsSafeBadWordsResearchCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		badWords string
+		want     []any
+	}{
+		{name: "simple token", badWords: `["foo"]`, want: []any{"foo"}},
+		{name: "empty list", badWords: `[]`},
+		{name: "single character", badWords: `["a"]`, want: []any{"a"}},
+		{name: "two words", badWords: `["foo", "bar"]`, want: []any{"foo", "bar"}},
+		{name: "zero width space", badWords: `["\u200B"]`, want: []any{"\u200B"}},
+		{name: "nul", badWords: `["\u0000"]`, want: []any{"\u0000"}},
+		{name: "bom", badWords: `["\uFEFF"]`, want: []any{"\uFEFF"}},
+		{name: "zero width joiner", badWords: `["\u200D"]`, want: []any{"\u200D"}},
+		{name: "zero width non joiner", badWords: `["\u200C"]`, want: []any{"\u200C"}},
+		{name: "combining mark", badWords: `["\u0301"]`, want: []any{"\u0301"}},
+		{name: "variation selector", badWords: `["\uFE0F"]`, want: []any{"\uFE0F"}},
+		{name: "left padded", badWords: `[" a"]`, want: []any{" a"}},
+		{name: "right padded", badWords: `["a "]`, want: []any{"a "}},
+		{name: "emoji", badWords: `["😀"]`, want: []any{"😀"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, err := normalizeChatRequest([]byte(`{
+				"bad_words": ` + tt.badWords + `,
+				"messages": [{"role": "user", "content": "hello"}]
+			}`))
+			require.NoError(t, err)
+
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			if tt.want == nil {
+				require.NotContains(t, raw, "bad_words")
+				return
+			}
+			require.Equal(t, tt.want, raw["bad_words"])
+		})
+	}
+}
+
+func TestNormalizeChatRequestStripsNonFiniteSamplingValues(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"temperature": "nan",
+		"top_p": "inf",
+		"min_p": "-inf",
+		"repetition_penalty": "infinity",
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.NotContains(t, raw, "temperature")
+	require.NotContains(t, raw, "top_p")
+	require.NotContains(t, raw, "min_p")
+	require.NotContains(t, raw, "repetition_penalty")
+}
+
+func TestNormalizeChatRequestParsesStringEncodedSamplingValues(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"temperature": "1.2",
+		"top_p": "0.5",
+		"top_k": "40",
+		"min_p": "0.1",
+		"repetition_penalty": "1.2",
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.EqualValues(t, 1.2, raw["temperature"])
+	require.EqualValues(t, 0.5, raw["top_p"])
+	require.EqualValues(t, 40, raw["top_k"])
+	require.EqualValues(t, 0.1, raw["min_p"])
+	require.EqualValues(t, 1.2, raw["repetition_penalty"])
+}
+
+func TestNormalizeChatRequestStripsInvalidStringEncodedSamplingValues(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"temperature": "wat",
+		"top_p": "",
+		"top_k": "1.2.3",
+		"min_p": "--1",
+		"repetition_penalty": "not-a-number",
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.NotContains(t, raw, "temperature")
+	require.NotContains(t, raw, "top_p")
+	require.NotContains(t, raw, "top_k")
+	require.NotContains(t, raw, "min_p")
+	require.NotContains(t, raw, "repetition_penalty")
+}
+
+func TestNormalizeChatRequestSanitizesRepetitionPenalty(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"repetition_penalty": 5,
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Equal(t, MaxRepetitionPenalty, raw["repetition_penalty"])
+
+	body, _, err = normalizeChatRequest([]byte(`{
+		"repetition_penalty": "5.0",
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+	raw = map[string]any{}
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Equal(t, MaxRepetitionPenalty, raw["repetition_penalty"])
+}
+
+func TestNormalizeChatRequestStripsOutOfRangeLogitBias(t *testing.T) {
+	body, _, err := normalizeChatRequest([]byte(`{
+		"logit_bias": {"0": 1e30, "1": 10, "2": -101},
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.Equal(t, map[string]any{"1": float64(10)}, raw["logit_bias"])
+
+	body, _, err = normalizeChatRequest([]byte(`{
+		"logit_bias": {"0": 1e30},
+		"messages": [{"role": "user", "content": "hello"}]
+	}`))
+	require.NoError(t, err)
+	raw = map[string]any{}
+	require.NoError(t, json.Unmarshal(body, &raw))
+	require.NotContains(t, raw, "logit_bias")
 }
 
 func TestApplyKimiRequestOverrides(t *testing.T) {
@@ -331,12 +647,13 @@ func TestApplyKimiRequestOverrides(t *testing.T) {
 			wantToolChoice: "auto",
 		},
 		{
-			name:           "structured outputs removed",
+			name:           "structured outputs unchanged",
 			body:           `{"model":"moonshotai/Kimi-K2.6","stream":false,"structured_outputs":{"schema":{"type":"object"}},"messages":[{"role":"user","content":"hello"}]}`,
 			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
 			model:          kimiK26ModelID,
 			wantStream:     false,
 			wantToolChoice: nil,
+			wantStructured: true,
 		},
 		{
 			name:           "non kimi unchanged",
@@ -372,6 +689,12 @@ func TestApplyKimiRequestOverrides(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNormalizeContentRejectsInvalidJSON(t *testing.T) {
+	_, err := normalizeContent([]byte(`{"messages":[`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "parse request")
 }
 
 func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T) {
@@ -444,31 +767,22 @@ func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T
 	}
 }
 
-func TestNormalizeChatRequestStripsStructuredOutputsBeforeValidation(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"model": "Qwen/Test",
-		"structured_outputs": {"regex": "[a-z]+"},
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.NotContains(t, raw, "structured_outputs")
-}
-
-func TestNormalizeChatRequestStripsUnsupportedPenaltyFields(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"presence_penalty": 1.2,
-		"frequency_penalty": 0.8,
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.NotContains(t, raw, "presence_penalty")
-	require.NotContains(t, raw, "frequency_penalty")
+func TestNormalizeChatRequestRejectsUnsupportedPenaltyFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "presence penalty", body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`, want: "presence_penalty"},
+		{name: "frequency penalty", body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`, want: "frequency_penalty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
 }
 
 func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
@@ -478,6 +792,11 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 		want string
 	}{
 		{
+			name: "unknown top level field",
+			body: `{"custom_param":true,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "custom_param",
+		},
+		{
 			name: "enforced tokens",
 			body: `{"enforced_tokens":["x"],"messages":[{"role":"user","content":"hello"}]}`,
 			want: "enforced_tokens",
@@ -485,7 +804,7 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 		{
 			name: "json object response format",
 			body: `{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "json_object",
+			want: "response_format",
 		},
 		{
 			name: "guided regex",
@@ -496,6 +815,71 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			name: "guided grammar",
 			body: `{"guided_grammar":"root ::= item","messages":[{"role":"user","content":"hello"}]}`,
 			want: "guided_grammar",
+		},
+		{
+			name: "json schema response format",
+			body: `{"response_format":{"type":"json_schema"},"messages":[{"role":"user","content":"hello"}]}`,
+			want: "response_format",
+		},
+		{
+			name: "nested json schema response format",
+			body: `{"response_format":{"json_schema":{"name":"r","schema":{"type":"object"}}},"messages":[{"role":"user","content":"hello"}]}`,
+			want: "response_format",
+		},
+		{
+			name: "guided json",
+			body: `{"guided_json":{"type":"object"},"messages":[{"role":"user","content":"hello"}]}`,
+			want: "guided_json",
+		},
+		{
+			name: "guided choice",
+			body: `{"guided_choice":["a","b"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "guided_choice",
+		},
+		{
+			name: "tool choice required",
+			body: `{"tool_choice":"required","tools":[{"type":"function","function":{"name":"x","description":"x","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "tool_choice=required",
+		},
+		{
+			name: "structured outputs",
+			body: `{"structured_outputs":{"regex":"[a-z]+"},"messages":[{"role":"user","content":"hello"}]}`,
+			want: "structured_outputs",
+		},
+		{
+			name: "presence penalty",
+			body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "presence_penalty",
+		},
+		{
+			name: "frequency penalty",
+			body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "frequency_penalty",
+		},
+		{
+			name: "prompt logprobs",
+			body: `{"prompt_logprobs":20,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "prompt_logprobs",
+		},
+		{
+			name: "beam search",
+			body: `{"use_beam_search":true,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "use_beam_search",
+		},
+		{
+			name: "truncate prompt tokens",
+			body: `{"truncate_prompt_tokens":16,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "truncate_prompt_tokens",
+		},
+		{
+			name: "allowed token ids",
+			body: `{"allowed_token_ids":[1,2,3],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "allowed_token_ids",
+		},
+		{
+			name: "ignore eos",
+			body: `{"ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "ignore_eos",
 		},
 	}
 
@@ -645,11 +1029,6 @@ func TestPrepareChatRequestBodyRejectsNonTextContentParts(t *testing.T) {
 			body: `{"messages":[{"role":"user","content":[{"type":"custom","text":"hello"}]}]}`,
 			want: `unsupported value "custom"`,
 		},
-		{
-			name: "text with extra field",
-			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"hello","image_url":{"url":"https://example.com/image.png"}}]}]}`,
-			want: `must only include type and text`,
-		},
 	}
 
 	for _, tt := range tests {
@@ -661,6 +1040,28 @@ func TestPrepareChatRequestBodyRejectsNonTextContentParts(t *testing.T) {
 			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
 		})
 	}
+}
+
+func TestPrepareChatRequestBodyAllowsExtraFieldsOnTextContentParts(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"messages": [{
+			"role": "user",
+			"content": [{
+				"type": "text",
+				"text": "hello",
+				"cache_control": {"type": "ephemeral"}
+			}]
+		}]
+	}`))
+
+	body, _, err := prepareChatRequestBody(req)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(body, &raw))
+	messages := raw["messages"].([]any)
+	message := messages[0].(map[string]any)
+	require.Equal(t, "hello", message["content"])
 }
 
 func TestPrepareChatRequestBodyRejectsBodiesLargerThanTenMiB(t *testing.T) {

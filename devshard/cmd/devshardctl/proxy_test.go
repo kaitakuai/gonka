@@ -879,6 +879,9 @@ func TestLongNonStreamEmptyResponseRecordsTimingWithoutQuarantine(t *testing.T) 
 	env := setupTestProxyWithClients(t, []user.HostClient{streamContentThenStallClient{}})
 	limiter := NewParticipantRequestLimiter(10, 10)
 	env.proxy.redundancy.participantLimiter = limiter
+	oldWindow := ParticipantPerfWindow
+	ParticipantPerfWindow = 24 * time.Hour
+	t.Cleanup(func() { ParticipantPerfWindow = oldWindow })
 	participantKey := env.session.HostParticipantKey(0)
 	params := defaultParams()
 	params.Stream = false
