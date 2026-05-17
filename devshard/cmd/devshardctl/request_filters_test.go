@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -911,6 +912,80 @@ func TestNormalizeChatRequestResponseFormatPipeline(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "depth")
 		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+}
+
+func TestNormalizeChatRequestEnforcesListCaps(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "stop too many entries",
+			body: `{"stop":[` + strings.Repeat(`"a",`, 16) + `"b"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "stop",
+		},
+		{
+			name: "stop entry too long",
+			body: `{"stop":["` + strings.Repeat("a", 257) + `"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "stop[0]",
+		},
+		{
+			name: "stop_token_ids too many entries",
+			body: `{"stop_token_ids":[` + strings.Repeat(`1,`, 64) + `2],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "stop_token_ids",
+		},
+		{
+			name: "bad_words too many entries",
+			body: `{"bad_words":[` + strings.Repeat(`"a",`, 64) + `"b"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "bad_words",
+		},
+		{
+			name: "bad_words entry too long",
+			body: `{"bad_words":["` + strings.Repeat("a", 129) + `"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "bad_words[0]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+		})
+	}
+}
+
+func TestNormalizeChatRequestEnforcesLogitBiasMapCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"logit_bias":{`)
+	for i := 0; i < 1025; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"`)
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(`":1`)
+	}
+	b.WriteString(`},"messages":[{"role":"user","content":"hello"}]}`)
+
+	_, _, err := normalizeChatRequest([]byte(b.String()))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "logit_bias")
+	require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+}
+
+func TestNormalizeChatRequestAcceptsListCapsAtLimit(t *testing.T) {
+	t.Run("stop at exact entry limit", func(t *testing.T) {
+		body := `{"stop":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 16), ",") + `],"messages":[{"role":"user","content":"hello"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.NoError(t, err)
+	})
+	t.Run("stop_token_ids at exact entry limit", func(t *testing.T) {
+		body := `{"stop_token_ids":[` + strings.TrimSuffix(strings.Repeat(`1,`, 64), ",") + `],"messages":[{"role":"user","content":"hello"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.NoError(t, err)
 	})
 }
 

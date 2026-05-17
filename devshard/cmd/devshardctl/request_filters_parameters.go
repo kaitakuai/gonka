@@ -156,12 +156,16 @@ type SanitizeFloatMapParameterHandler struct {
 	Min              *float64
 	Max              *float64
 	DropFieldIfEmpty bool
+	MaxEntries int
 }
 
 func (h SanitizeFloatMapParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
 	raw, ok := ctx.Document.Object(parameter.Name)
 	if !ok {
 		return nil
+	}
+	if h.MaxEntries > 0 && len(raw) > h.MaxEntries {
+		return badChatRequest("%s: map size %d exceeds limit %d", parameter.Name, len(raw), h.MaxEntries)
 	}
 	for key, value := range raw {
 		number, ok := numericJSONValueAsFloat64(value)
@@ -227,6 +231,38 @@ func (h ClampUintToFieldParameterHandler) Apply(ctx *RequestFilterContext, param
 	}
 	if value > maxValue {
 		ctx.Document.Set(parameter.Name, maxValue)
+	}
+	return nil
+}
+
+// LengthCapListParameterHandler bounds the number of entries in a JSON array, and
+// optionally the byte length of each string entry. Used for fields like `stop`,
+// `stop_token_ids`, and `bad_words` -- vLLM scans every entry against every generated
+// token, so unbounded arrays linearly slow inference. MaxEntries=0 disables the array cap,
+// MaxEntryLen=0 disables the per-string cap (use 0 for int-only arrays).
+type LengthCapListParameterHandler struct {
+	MaxEntries  int
+	MaxEntryLen int
+}
+
+func (h LengthCapListParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
+	raw, ok := ctx.Document.Array(parameter.Name)
+	if !ok {
+		return nil
+	}
+	if h.MaxEntries > 0 && len(raw) > h.MaxEntries {
+		return badChatRequest("%s: array length %d exceeds limit %d", parameter.Name, len(raw), h.MaxEntries)
+	}
+	if h.MaxEntryLen > 0 {
+		for i, item := range raw {
+			s, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if len(s) > h.MaxEntryLen {
+				return badChatRequest("%s[%d]: string length %d exceeds limit %d", parameter.Name, i, len(s), h.MaxEntryLen)
+			}
+		}
 	}
 	return nil
 }
@@ -505,6 +541,9 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("messages"),
 		newParameter("max_tokens"),
 		newParameter("max_completion_tokens"),
+		newParameter("seed"),
+		newParameter("skip_special_tokens"),
+		newParameter("detokenize"),
 		newParameter("n").
 			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}),
 		newParameter("temperature").
@@ -518,14 +557,23 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("repetition_penalty").
 			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
 		newParameter("logit_bias").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true}),
-		newParameter("stop"),
-		newParameter("stop_token_ids"),
-		newParameter("seed"),
-		newParameter("skip_special_tokens"),
-		newParameter("detokenize"),
-		newParameter("thinking"),
-		newParameter("chat_template_kwargs"),
+			withRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true, MaxEntries: 1024}),
+		newParameter("stop").
+			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 16, MaxEntryLen: 256}),
+		newParameter("stop_token_ids").
+			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 64}),
+		newParameter("thinking").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ThinkingValidator{},
+			}),
+		newParameter("chat_template_kwargs").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ChatTemplateKwargsValidator{
+					MaxDepth: 5,
+					MaxSize:  16 * 1024,
+					MaxNodes: 128,
+				},
+			}),
 		newParameter("tool_choice").
 			withRule(RequestFilterStagePreValidation, RejectStringValueParameterHandler{Value: "required", Message: unsupportedChatParameterMessage("tool_choice=required")}),
 		newParameter("min_tokens").
@@ -541,9 +589,19 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					return strings.TrimSpace(value) != ""
 				},
 				DropFieldIfEmpty: true,
-			}),
+			}).
+			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 64, MaxEntryLen: 128}),
 		newParameter("tools").
-			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}),
+			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}).
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ToolsValidator{
+					MaxDepth:  5,
+					MaxSize:   16 * 1024,
+					MaxNodes:  128,
+					MaxBranch: 16,
+					MaxEnum:   256,
+				},
+			}),
 		newParameter("logprobs").
 			withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
 		newParameter("top_logprobs").

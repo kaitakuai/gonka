@@ -32,21 +32,21 @@ Anything not on this whitelist does not reach the model. That is the contract.
 | `top_k` | int range | PostLimits sanitize | Strips `NaN`/`±Inf`. vLLM-specific. |
 | `min_p` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. vLLM-specific. |
 | `repetition_penalty` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. Capped at `MaxRepetitionPenalty` (2.0). |
-| `logit_bias` | int→float map | PostLimits sanitize (`SanitizeFloatMapParameterHandler`) | Keeps numeric entries in `[-100, 100]`. Drops the field if the map is empty after sanitization. |
-| `stop` | string list | — | Pass-through. |
-| `stop_token_ids` | int list | — | Pass-through. vLLM-specific. |
+| `logit_bias` | int→float map | PostLimits sanitize (`SanitizeFloatMapParameterHandler`) | Keeps numeric entries in `[-100, 100]`. Drops the field if the map is empty after sanitization. Map size capped at 1024 entries (rejected with HTTP 400 over the cap). |
+| `stop` | string list | PreValidation length cap (`LengthCapListParameterHandler`) | Pass-through within bounds. Rejected if `len(stop) > 16` or any entry's string length > 256 bytes. |
+| `stop_token_ids` | int list | PreValidation length cap (`LengthCapListParameterHandler`) | Pass-through within bounds. Rejected if `len(stop_token_ids) > 64`. |
 | `seed` | int range | — | Pass-through. |
 | `skip_special_tokens` | bool | — | Pass-through. vLLM-specific. |
 | `detokenize` | bool | — | Pass-through. vLLM-specific. |
-| `thinking` | object | — | Pass-through. Kimi-K2 specific (`{"type": "enabled"|"disabled"}`). For `moonshotai/Kimi-K2.6` it is also mirrored into `chat_template_kwargs.thinking` via `applyKimiRequestOverrides`. |
-| `chat_template_kwargs` | object | — | Pass-through. Used for provider-specific chat templates (Qwen, Kimi). |
+| `thinking` | object | PreValidation validate (`paramvalidators.ThinkingValidator`) | Must be `{"type": "enabled" \| "disabled"}`. Any other shape rejected. For `moonshotai/Kimi-K2.6` it is mirrored into `chat_template_kwargs.thinking` via `applyKimiRequestOverrides`. |
+| `chat_template_kwargs` | object | PreValidation validate (`paramvalidators.ChatTemplateKwargsValidator`) | Pass-through within plain-object bounds: depth ≤ 5, nodes ≤ 128, serialized size ≤ 16 KiB. Anything over those caps is rejected before vLLM's Jinja template renderer sees it. |
 | `tool_choice` | string | PreValidation reject | Pass-through except `"required"` — rejected because the upstream contract does not honor it on the vLLM path. Stripped together with `tools` if `tools` arrives empty. |
 | `min_tokens` | int range | PreValidation conditional strip + PostLimits clamp | Dropped if `stop_token_ids` is also set (vLLM rejects the combination). Otherwise clamped to ≤ `max_tokens`. |
-| `bad_words` | string list | PreValidation sanitize | Empty/whitespace strings are removed. Field is dropped if the resulting list is empty. |
-| `tools` | object array | PreValidation sanitize | If the array is empty, both `tools` and `tool_choice` are removed (vLLM rejects empty `tools`). |
+| `bad_words` | string list | PreValidation sanitize + length cap | Empty/whitespace strings are removed. Field is dropped if the resulting list is empty. Then `len(bad_words) ≤ 64`, per-entry length ≤ 128 bytes. |
+| `tools` | object array | PreValidation sanitize + schema validate (`paramvalidators.ToolsValidator`) | Empty arrays drop both `tools` and `tool_choice`. Every `tools[].function.parameters` is walked as a JSON Schema with the same bounds as `response_format` (depth ≤ 5, nodes ≤ 128, branch arms ≤ 16, enum ≤ 256, size ≤ 16 KiB, `$ref`/`$defs`/`definitions` forbidden). vLLM compiles tool argument schemas through the same grammar path as `response_format`, so the bounds must match. |
 | `logprobs` | bool | PostLimits force | Forced to `true` for the gateway's observability pipeline regardless of what the client sent. |
 | `top_logprobs` | int range | PostLimits force | Forced to `5` for the same reason. |
-| `response_format` | object | PreValidation validate (`paramvalidators.ResponseFormatValidator`) | Accepted with bounds. `type` must be one of `text` / `json_object` / `json_schema`. For `json_schema`, the schema is walked once and rejected if depth > 5, nodes > 128, branch arms (anyOf/oneOf/allOf) > 16, enum > 256, serialized size > 16 KiB, or the schema contains `$ref` / `$defs` / `definitions`. See "Validation invariants" below for the policy. |
+| `response_format` | object | PreValidation validate (`paramvalidators.ResponseFormatValidator`) | Accepted with bounds. `type` must be one of `text` / `json_object` / `json_schema`. For `json_schema`, the schema is walked once and rejected if depth > 5, nodes > 128, branch arms (anyOf/oneOf/allOf) > 16, enum > 256, serialized size > 16 KiB, or the schema contains `$ref` / `$defs` / `definitions`. |
 
 ### Messages contract (recap)
 
@@ -59,22 +59,27 @@ Enforced by `request_filters_messages.go`:
 - Content parts: only `{"type": "text", "text": "..."}` is accepted. Typed arrays of text parts are flattened to a single string before forwarding.
 - Empty tool `content` is normalized to a sentinel string; missing tool `content` is also normalized.
 
+## Pass-throughs that are safe by type contract
+
+These fields are accepted as known catalog entries without any per-rule validation because their JSON type alone bounds the value space: `model`, `stream`, `messages` (covered by `defaultChatMessageProcessor.ValidateDocument`), `max_tokens` / `max_completion_tokens` (covered by `applyOutputTokenLimits`), `seed`, `skip_special_tokens`, `detokenize`. Everything else that reaches vLLM is bounded by an explicit catalog rule (see the Supported table).
+
 ## Unsupported parameters (rejected)
 
-Every OpenAI / vLLM / provider-specific field that is **not** in the table above is rejected at `PreValidation`. The error response is HTTP 400 with body `feature "<name>" is temporarily unavailable`.
+Every OpenAI / vLLM / provider-specific field that is **not** in the Supported table is rejected at `PreValidation`. The error response is HTTP 400 with body `feature "<name>" is temporarily unavailable`.
 
-The groupings below are not exhaustive — they document the gaps we know clients hit, mostly drawn from comparable gateways (Hermes, OpenClaw, Kilo):
+Grouped by why the field is off:
 
-| Group | Examples we reject today | Notes |
-| --- | --- | --- |
-| Structured output (other than `response_format`) | `guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `enforced_tokens` | `response_format` is now supported with bounds (see Supported table). The vLLM-specific `guided_*` family stays rejected because it bypasses the same safety bounds. |
-| Sampling | `frequency_penalty`, `presence_penalty` | Easy to add (numeric range sanitize, similar to `temperature`). Not yet validated end-to-end against the vLLM build we run. |
-| Tool-calling extensions | `parallel_tool_calls`, `tool_choice="required"` | Provider compatibility differs; we keep them off until we can pin behavior. |
-| Routing / metadata | `metadata`, `service_tier`, `user`, `seed_override`, `extra_body`, `extra_headers`, `provider`, `plugins`, `tags` | Vendor-specific; no inference-side meaning for vLLM. |
-| Caching / observability | `store`, `prompt_cache_key`, `stream_options` | Could be safely stripped before forward, but currently rejected to avoid silent semantic drift. |
-| Reasoning (non-vLLM-native) | `reasoning_effort`, `reasoning`, `thinking_config`, `enable_thinking` | Use `thinking` + `chat_template_kwargs` instead (see "Supported"). |
+| Group | Examples we reject today | Origin | Why off |
+| --- | --- | --- | --- |
+| Sampling penalties | `frequency_penalty`, `presence_penalty` | Kilo, OpenClaw, OpenAI canonical | vLLM supports them. Trivially safe to add via `SanitizeFloatParameterHandler` with range `[-2, 2]`. Pending only because we have not validated end-to-end on the vLLM build we run. **Smallest concrete next addition.** |
+| Structured-output (non-`response_format`) | `guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `enforced_tokens`, `structured_outputs` | vLLM-native | Bypasses the response_format safety bounds. Same grammar-compiler attack surface; would need its own validator. |
+| Tool-calling extensions | `parallel_tool_calls`, `tool_choice="required"` | OpenClaw, OpenAI | Provider compatibility differs and `required` is rejected by upstream contract on the vLLM path. |
+| Routing / metadata | `metadata`, `service_tier`, `user`, `extra_body`, `extra_headers`, `provider`, `plugins`, `tags`, `seed_override` | Hermes, OpenClaw, Kilo | Vendor-specific; no inference-side meaning for vLLM. `extra_body` / `extra_headers` are open-ended escape hatches and break the whitelist contract. |
+| Caching / observability | `store`, `prompt_cache_key`, `stream_options` | OpenAI / OpenClaw / Hermes | OpenAI-specific (`store`, `prompt_cache_key`) or streaming-format hint (`stream_options`). Could be safely stripped before forwarding, but currently rejected to avoid silent semantic drift in usage accounting. |
+| Reasoning (non-vLLM-native) | `reasoning_effort`, `reasoning` (object), `thinking_config`, `enable_thinking` | Hermes (multi-provider), OpenClaw (Qwen/Kimi), Gemini | Use `thinking` + `chat_template_kwargs` instead. Provider-specific reasoning fields are wrapper concerns, not what vLLM speaks. |
+| Provider-specific extras | `extra_body.vl_high_resolution_images` (Qwen), `extra_body.provider` (OpenRouter), `extra_body.tags` (Nous), `extra_body.thinking_config` (Gemini), `extra_body.plugins` (OpenRouter), `messages[].reasoning_content` (Kimi multi-turn replay), `tools[].function.strict` (OpenAI strict schema), `chat_template_kwargs.preserve_thinking` (Qwen wrapper) | Hermes, OpenClaw | Single-vendor attribution / wrapping fields. No vLLM equivalent. |
 
-If you see a new field in this list that you need, add it to the catalog with the smallest safe rule — see "Validation improvements".
+If you see a field here that you need, add it to the catalog with the smallest safe rule — see "Validation improvements".
 
 ## How to use the gateway
 
@@ -186,13 +191,27 @@ Status: **implemented** as a pure validator in subpackage `cmd/devshardctl/param
 
 Calibrate the thresholds (depth, size, nodes) by running the new handler against the sample structured-output schemas from production clients before raising any limit.
 
-### Other validators worth tightening (later)
+### Validator inventory (implemented)
 
-- **`logit_bias`**: currently sanitized but does not cap the map size. A `logit_bias` with 100k entries is still forwarded. Suggest `len(map) ≤ 1024`.
-- **`stop` / `bad_words`**: no cap on the number of entries or per-entry length. Suggest `len(list) ≤ 16`, per-entry length ≤ 256.
-- **`tools`**: no cap on the schema depth/size of each `tools[].function.parameters`. The same depth/byte/key invariants from `response_format` should apply, because vLLM compiles tool argument schemas through the same grammar path.
-- **`messages`**: total `messages` byte size has only the 10 MiB body cap. Long single-message content can still pass; the existing token-limit check happens later in the agent stack, not in this layer.
-- **Catalog generation**: today the catalog is hand-written. As more fields land, it would be worth generating the doc above from the catalog (`go test` artifact or `go generate`) so this file does not drift.
+All HIGH/MEDIUM/LOW gaps from the original audit are now closed. Cross-reference: catalog wire-up in `defaultVLLMParameterCatalog()`; pure validator types in `paramvalidators/`.
+
+| Field | Validator | Bounds |
+| --- | --- | --- |
+| `response_format` | `paramvalidators.ResponseFormatValidator` | depth ≤ 5, nodes ≤ 128, anyOf/oneOf/allOf ≤ 16, enum ≤ 256, size ≤ 16 KiB; `$ref`/`$defs`/`definitions` banned |
+| `tools[].function.parameters` | `paramvalidators.ToolsValidator` (reuses `SchemaBounds`) | identical bounds to `response_format` (same vLLM grammar path) |
+| `chat_template_kwargs` | `paramvalidators.ChatTemplateKwargsValidator` (uses `ObjectBounds`) | plain-object depth ≤ 5, nodes ≤ 128, size ≤ 16 KiB |
+| `thinking` | `paramvalidators.ThinkingValidator` | exactly `{"type": "enabled" \| "disabled"}` |
+| `stop` | `LengthCapListParameterHandler` | `len ≤ 16`, per-entry ≤ 256 bytes |
+| `stop_token_ids` | `LengthCapListParameterHandler` | `len ≤ 64` |
+| `bad_words` | `SanitizeStringListParameterHandler` + `LengthCapListParameterHandler` | sanitize first (drop empty), then `len ≤ 64`, per-entry ≤ 128 bytes |
+| `logit_bias` | `SanitizeFloatMapParameterHandler` (with `MaxEntries`) | range `[-100, 100]` + `len ≤ 1024` |
+
+Schema-walk rejection categories are exposed as sentinel errors: `ErrSchemaDepth`, `ErrSchemaNodes`, `ErrSchemaSize`, `ErrSchemaRef`, `ErrSchemaEnum`, `ErrSchemaBranch`. They are shared by `SchemaBounds` (JSON-Schema-aware, used for `response_format` and `tools`) and `ObjectBounds` (plain-object, used for `chat_template_kwargs`). The original response_format-specific sentinels (`ErrResponseFormatDepth` etc.) remain as aliases for backward compatibility.
+
+### Still open (smaller items)
+
+- **`messages` total byte size** — only the 10 MiB body cap exists. Per-message content size is bounded later by token-limit logic, not by a structural validator at this layer.
+- **Catalog generation** — the Supported table above is hand-written. `go generate` could derive it from the catalog so this file does not drift.
 
 ## Performance characteristics
 
@@ -200,12 +219,14 @@ End-to-end `normalizeChatRequest` (Apple M2 Pro, `-benchtime=2s`):
 
 | Body | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- |
-| Minimal (47 B) | 2,742 | 2,450 | 43 |
-| Typical (132 B) | 4,311 | 2,947 | 67 |
-| Heavy (560 B) | 16,039 | 11,695 | 209 |
-| WithResponseFormat (279 B) | 9,437 | 6,776 | 139 |
-| RejectedUnknown (72 B) | 1,869 | 2,146 | 36 |
-| **RejectedRecursive (7.5 KiB attack)** | **1,058** | **72** | **2** |
+| Minimal (47 B) | 2,799 | 2,450 | 43 |
+| Typical (132 B) | 4,432 | 2,947 | 67 |
+| Heavy (560 B) | 17,609 | 12,160 | 223 |
+| WithResponseFormat (279 B) | 9,611 | 6,776 | 139 |
+| RejectedUnknown (72 B) | 1,870 | 2,170 | 36 |
+| **RejectedRecursive (7.5 KiB attack)** | **1,063** | **96** | **2** |
+
+The Heavy body now exercises `ToolsValidator` (walks `tools[].function.parameters` for each tool) and `ChatTemplateKwargsValidator`, which adds ~1.2 µs / ~14 allocs vs before the new validators landed. The reject-recursive attack path is unchanged because the body-level depth pre-scan still bails out first.
 
 `response_format` validator in isolation (`paramvalidators/response_format_test.go`):
 

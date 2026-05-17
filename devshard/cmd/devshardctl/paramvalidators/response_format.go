@@ -5,28 +5,33 @@
 package paramvalidators
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 )
 
-// Sentinel errors for response_format rejection categories. Wrap them with fmt.Errorf("%w: ...")
-// when adding parameter context (limit values, encountered values); callers can identify the
-// rejection class via errors.Is even when the formatted message changes.
+// Sentinel errors specific to response_format wrapper shape. Schema-walk rejection categories
+// (depth/nodes/size/ref/enum/branch) live in schema_bounds.go as ErrSchema* and are aliased
+// below for backward compatibility with existing call sites and tests.
 var (
 	ErrResponseFormatShape       = errors.New("response_format: invalid wrapper shape")
 	ErrResponseFormatType        = errors.New("response_format.type: missing or unsupported")
 	ErrResponseFormatJSONSchema  = errors.New("response_format.json_schema: invalid wrapper shape")
 	ErrResponseFormatName        = errors.New("response_format.json_schema.name: invalid")
 	ErrResponseFormatSchemaShape = errors.New("response_format.json_schema.schema: invalid shape")
-	ErrResponseFormatSize        = errors.New("response_format.json_schema.schema: serialized size exceeded")
-	ErrResponseFormatDepth       = errors.New("response_format.json_schema.schema: nesting depth exceeded")
-	ErrResponseFormatNodes       = errors.New("response_format.json_schema.schema: node count exceeded")
-	ErrResponseFormatRef         = errors.New("response_format.json_schema.schema: schema reference keyword is forbidden")
-	ErrResponseFormatEnum        = errors.New("response_format.json_schema.schema: enum size exceeded")
-	ErrResponseFormatBranch      = errors.New("response_format.json_schema.schema: schema branch arms exceeded")
+)
+
+// Schema-walk sentinel aliases. Tests can match on either ErrResponseFormatDepth or the
+// underlying ErrSchemaDepth -- they point at the same error value. Prefer ErrSchema* in
+// new code; ErrResponseFormat* is kept so old tests and external callers don't break.
+var (
+	ErrResponseFormatSize   = ErrSchemaSize
+	ErrResponseFormatDepth  = ErrSchemaDepth
+	ErrResponseFormatNodes  = ErrSchemaNodes
+	ErrResponseFormatRef    = ErrSchemaRef
+	ErrResponseFormatEnum   = ErrSchemaEnum
+	ErrResponseFormatBranch = ErrSchemaBranch
 )
 
 // ResponseFormatValidator bounds an OpenAI-compatible response_format payload before it is
@@ -117,89 +122,22 @@ func (v ResponseFormatValidator) validateJSONSchemaWrapper(rf map[string]any) er
 	if !ok {
 		return fmt.Errorf("%w: must be an object", ErrResponseFormatSchemaShape)
 	}
-	// Walk first so depth/nodes/breadth attacks bail out without ever paying for json.Marshal.
-	// json.Marshal is O(input size) and would otherwise serialize attacker-controlled depth-200
-	// payloads in full before we ever reach the depth check.
-	var nodes int
-	if err := v.walkSchema(schema, 1, &nodes); err != nil {
-		return err
+	bounds := SchemaBounds{
+		MaxDepth:  v.MaxDepth,
+		MaxSize:   v.MaxSize,
+		MaxNodes:  v.MaxNodes,
+		MaxBranch: v.MaxBranch,
+		MaxEnum:   v.MaxEnum,
 	}
-	serialized, err := json.Marshal(schema)
-	if err != nil {
-		return fmt.Errorf("%w: cannot be serialized: %v", ErrResponseFormatSchemaShape, err)
+	// Walk first so depth/nodes/breadth attacks bail out without ever paying for json.Marshal
+	// inside CheckSize. json.Marshal is O(input size) and would otherwise serialize an
+	// attacker-controlled depth-200 payload in full before the depth check ever fires.
+	if err := bounds.Walk(schema); err != nil {
+		return fmt.Errorf("response_format.json_schema.schema: %w", err)
 	}
-	if len(serialized) > v.MaxSize {
-		return fmt.Errorf("%w: serialized size exceeds %d bytes", ErrResponseFormatSize, v.MaxSize)
+	if err := bounds.CheckSize(schema); err != nil {
+		return fmt.Errorf("response_format.json_schema.schema: %w", err)
 	}
 	return nil
 }
 
-// walkSchema visits every schema-shaped child of `schema` and applies depth/node/breadth
-// caps and the $ref/$defs/definitions ban. The policy is inverted: instead of an allow-list
-// of JSON-Schema keywords to descend into (which silently grew gaps with every new keyword
-// like `if`/`then`/`contains`/`unevaluatedProperties`/...), we walk EVERY object-valued or
-// array-of-object-valued field, with two narrow exceptions:
-//
-//   - responseFormatDataKeys (enum/const/default/examples/required/dependentRequired):
-//     values are literal data, never schemas. Skipped entirely so attacker-controlled JSON
-//     hidden under them is not chased through.
-//   - responseFormatChildMapKeys (properties/patternProperties/dependentSchemas): values are
-//     maps of name->schema. We descend into each map value as its own child schema rather
-//     than treating the wrapper map as a schema.
-//
-// Unknown JSON keywords with object/array-of-object values are treated as if they could
-// contain schemas. That over-walks slightly (e.g. an attacker's invented key `{"foo": {...}}`
-// costs us one extra node) but never under-walks, which is the property that matters for
-// safely bounding vLLM's grammar compiler. All budgets remain bounded.
-func (v ResponseFormatValidator) walkSchema(schema any, depth int, nodes *int) error {
-	if depth > v.MaxDepth {
-		return fmt.Errorf("%w: limit %d", ErrResponseFormatDepth, v.MaxDepth)
-	}
-	obj, ok := schema.(map[string]any)
-	if !ok {
-		return nil
-	}
-	*nodes++
-	if *nodes > v.MaxNodes {
-		return fmt.Errorf("%w: limit %d", ErrResponseFormatNodes, v.MaxNodes)
-	}
-	for _, forbidden := range forbiddenSchemaKeys {
-		if _, exists := obj[forbidden]; exists {
-			return fmt.Errorf("%w: %q is not allowed", ErrResponseFormatRef, forbidden)
-		}
-	}
-	if enum, ok := obj["enum"].([]any); ok && len(enum) > v.MaxEnum {
-		return fmt.Errorf("%w: limit %d", ErrResponseFormatEnum, v.MaxEnum)
-	}
-	for _, branchKey := range branchSchemaKeys {
-		if arr, ok := obj[branchKey].([]any); ok && len(arr) > v.MaxBranch {
-			return fmt.Errorf("%w: %s limit %d", ErrResponseFormatBranch, branchKey, v.MaxBranch)
-		}
-	}
-	for key, value := range obj {
-		if _, isData := responseFormatDataKeys[key]; isData {
-			continue
-		}
-		switch typed := value.(type) {
-		case map[string]any:
-			if _, isChildMap := responseFormatChildMapKeys[key]; isChildMap {
-				for _, child := range typed {
-					if err := v.walkSchema(child, depth+1, nodes); err != nil {
-						return err
-					}
-				}
-			} else {
-				if err := v.walkSchema(typed, depth+1, nodes); err != nil {
-					return err
-				}
-			}
-		case []any:
-			for _, child := range typed {
-				if err := v.walkSchema(child, depth+1, nodes); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
-}
