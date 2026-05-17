@@ -30,8 +30,7 @@ func TestToolsValidatorAccepts(t *testing.T) {
 	}{
 		{name: "absent", body: `{"messages":[]}`},
 		{name: "empty array", body: `{"tools":[]}`},
-		{name: "tool without function", body: `{"tools":[{"type":"function"}]}`},
-		{name: "tool without parameters", body: `{"tools":[{"type":"function","function":{"name":"x"}}]}`},
+		{name: "parameter-less tool with name", body: `{"tools":[{"type":"function","function":{"name":"x"}}]}`},
 		{name: "simple parameters", body: `{"tools":[` + toolWithParams(`{"type":"object","properties":{"city":{"type":"string"}}}`) + `]}`},
 		{name: "two tools both valid", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"type":"object","properties":{"x":{"type":"number"}}}`) + `]}`},
 		{name: "parameters at depth limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(5)) + `]}`},
@@ -53,6 +52,17 @@ func TestToolsValidatorRejects(t *testing.T) {
 	}{
 		{name: "tools is object", body: `{"tools":{"x":1}}`, wantErr: ErrToolsShape},
 		{name: "tools element is not object", body: `{"tools":["x"]}`, wantErr: ErrToolShape},
+		// OpenAI tool contract: type must declare "function".
+		{name: "type missing", body: `{"tools":[{"function":{"name":"x"}}]}`, wantErr: ErrToolFunctionType},
+		{name: "type not a string", body: `{"tools":[{"type":1,"function":{"name":"x"}}]}`, wantErr: ErrToolFunctionType},
+		{name: "type unknown value", body: `{"tools":[{"type":"plugin","function":{"name":"x"}}]}`, wantErr: ErrToolFunctionType},
+		// function payload required.
+		{name: "function missing", body: `{"tools":[{"type":"function"}]}`, wantErr: ErrToolFunctionShape},
+		{name: "function not an object", body: `{"tools":[{"type":"function","function":"x"}]}`, wantErr: ErrToolFunctionShape},
+		// function.name required.
+		{name: "function name missing", body: `{"tools":[{"type":"function","function":{}}]}`, wantErr: ErrToolFunctionName},
+		{name: "function name empty", body: `{"tools":[{"type":"function","function":{"name":""}}]}`, wantErr: ErrToolFunctionName},
+		{name: "function name not a string", body: `{"tools":[{"type":"function","function":{"name":42}}]}`, wantErr: ErrToolFunctionName},
 		{name: "depth exceeds limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(6)) + `]}`, wantErr: ErrSchemaDepth},
 		{name: "deep recursion attack hidden in tool", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(200)) + `]}`, wantErr: ErrSchemaDepth},
 		{name: "ref hidden in tool parameters", body: `{"tools":[` + toolWithParams(`{"$ref":"#/foo"}`) + `]}`, wantErr: ErrSchemaRef},
@@ -64,7 +74,8 @@ func TestToolsValidatorRejects(t *testing.T) {
 		// Second tool is the bad one -- verifies we walk every element, not just the first.
 		{name: "rejects bad schema in second tool", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"$ref":"#/x"}`) + `]}`, wantErr: ErrSchemaRef},
 		// CVE-2025-48944: same xgrammar / regex crash class on the tools schema path.
-		{name: "bad type in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"something"}`) + `]}`, wantErr: ErrSchemaType},		{name: "bad pattern in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"string","pattern":"("}`) + `]}`, wantErr: ErrSchemaPattern},
+		{name: "bad type in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"something"}`) + `]}`, wantErr: ErrSchemaType},
+		{name: "bad pattern in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"string","pattern":"("}`) + `]}`, wantErr: ErrSchemaPattern},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -27,6 +27,7 @@ var (
 		"seed":42,
 		"n":1,
 		"thinking":{"type":"enabled"},
+		"chat_template_kwargs":{"add_generation_prompt":true,"enable_thinking":true},
 		"tools":[
 			{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}
 		]
@@ -40,12 +41,19 @@ var (
 
 	benchBodyRejectedUnknown = []byte(`{"messages":[{"role":"user","content":"hello"}],"frequency_penalty":1.5}`)
 
-	benchBodyRejectedRecursive = buildBenchPathologicalBody()
+	// Body-level pre-scan rejection path. Nesting 200 deep trips ensureRequestNestingDepth
+	// long before any validator runs, so this measures the pre-scan cost on a worst-case input.
+	benchBodyRejectedDeepBody = buildBenchDeepBodyRejection(200)
+
+	// Schema-walker rejection path. Body nesting stays at ~9 levels (under
+	// MaxRequestNestingDepth=32), but the json_schema is 6 levels deep -- one over the walker's
+	// MaxDepth=5, so SchemaBounds.Walk rejects with ErrSchemaDepth.
+	benchBodyRejectedRecursiveSchema = buildBenchDeepBodyRejection(6)
 )
 
-func buildBenchPathologicalBody() []byte {
+func buildBenchDeepBodyRejection(schemaDepth int) []byte {
 	deep := `{"type":"object"}`
-	for i := 0; i < 200; i++ {
+	for i := 0; i < schemaDepth; i++ {
 		deep = `{"type":"object","properties":{"x":` + deep + `}}`
 	}
 	return []byte(`{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":` + deep + `}},"messages":[{"role":"user","content":"hello"}]}`)
@@ -61,7 +69,8 @@ func BenchmarkNormalizeChatRequest(b *testing.B) {
 		{"Heavy", benchBodyHeavy},
 		{"WithResponseFormat", benchBodyWithResponseFormat},
 		{"RejectedUnknownField", benchBodyRejectedUnknown},
-		{"RejectedRecursiveSchema", benchBodyRejectedRecursive},
+		{"RejectedDeepBody", benchBodyRejectedDeepBody},
+		{"RejectedRecursiveSchema", benchBodyRejectedRecursiveSchema},
 	}
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {

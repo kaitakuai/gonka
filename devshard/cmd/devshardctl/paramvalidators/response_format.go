@@ -11,27 +11,15 @@ import (
 	"strings"
 )
 
-// Sentinel errors specific to response_format wrapper shape. Schema-walk rejection categories
-// (depth/nodes/size/ref/enum/branch) live in schema_bounds.go as ErrSchema* and are aliased
-// below for backward compatibility with existing call sites and tests.
+// Sentinel errors specific to response_format wrapper shape. Schema-walk rejection
+// categories (depth/nodes/size/ref/enum/branch/type/pattern) live in schema_bounds.go
+// as ErrSchema* and are returned wrapped through here.
 var (
 	ErrResponseFormatShape       = errors.New("response_format: invalid wrapper shape")
 	ErrResponseFormatType        = errors.New("response_format.type: missing or unsupported")
 	ErrResponseFormatJSONSchema  = errors.New("response_format.json_schema: invalid wrapper shape")
 	ErrResponseFormatName        = errors.New("response_format.json_schema.name: invalid")
 	ErrResponseFormatSchemaShape = errors.New("response_format.json_schema.schema: invalid shape")
-)
-
-// Schema-walk sentinel aliases. Tests can match on either ErrResponseFormatDepth or the
-// underlying ErrSchemaDepth -- they point at the same error value. Prefer ErrSchema* in
-// new code; ErrResponseFormat* is kept so old tests and external callers don't break.
-var (
-	ErrResponseFormatSize   = ErrSchemaSize
-	ErrResponseFormatDepth  = ErrSchemaDepth
-	ErrResponseFormatNodes  = ErrSchemaNodes
-	ErrResponseFormatRef    = ErrSchemaRef
-	ErrResponseFormatEnum   = ErrSchemaEnum
-	ErrResponseFormatBranch = ErrSchemaBranch
 )
 
 // ResponseFormatValidator bounds an OpenAI-compatible response_format payload before it is
@@ -142,4 +130,3 @@ func (v ResponseFormatValidator) validateJSONSchemaWrapper(rf map[string]any) er
 	}
 	return nil
 }
-

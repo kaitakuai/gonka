@@ -52,17 +52,6 @@ func (h ConditionalStripParameterHandler) Apply(ctx *RequestFilterContext, param
 	return nil
 }
 
-type RejectParameterHandler struct {
-	Message string
-}
-
-func (h RejectParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	if ctx.Document.Has(parameter.Name) {
-		return badChatRequest("%s", h.Message)
-	}
-	return nil
-}
-
 type RejectStringValueParameterHandler struct {
 	Value   string
 	Message string
@@ -70,25 +59,6 @@ type RejectStringValueParameterHandler struct {
 
 func (h RejectStringValueParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
 	current, ok := ctx.Document.String(parameter.Name)
-	if ok && current == h.Value {
-		return badChatRequest("%s", h.Message)
-	}
-	return nil
-}
-
-type RejectNestedStringValueParameterHandler struct {
-	Parent  string
-	Field   string
-	Value   string
-	Message string
-}
-
-func (h RejectNestedStringValueParameterHandler) Apply(ctx *RequestFilterContext, _ VLLMParameter) error {
-	parent, ok := ctx.Document.Object(h.Parent)
-	if !ok {
-		return nil
-	}
-	current, ok := parent[h.Field].(string)
 	if ok && current == h.Value {
 		return badChatRequest("%s", h.Message)
 	}
@@ -156,7 +126,7 @@ type SanitizeFloatMapParameterHandler struct {
 	Min              *float64
 	Max              *float64
 	DropFieldIfEmpty bool
-	MaxEntries int
+	MaxEntries       int
 }
 
 func (h SanitizeFloatMapParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {

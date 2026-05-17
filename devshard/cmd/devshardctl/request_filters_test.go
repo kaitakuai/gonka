@@ -359,42 +359,6 @@ func TestNormalizeChatRequestKeepsToolChoiceAutoWithTools(t *testing.T) {
 	require.Contains(t, raw, "tools")
 }
 
-func TestNormalizeChatRequestRejectsUnsupportedVLLMParameters(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{name: "beam search", body: `{"use_beam_search":true,"messages":[{"role":"user","content":"hello"}]}`, want: "use_beam_search"},
-		{name: "truncate prompt tokens", body: `{"truncate_prompt_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, want: "truncate_prompt_tokens"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := normalizeChatRequest([]byte(tt.body))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.want)
-		})
-	}
-}
-
-func TestNormalizeChatRequestRejectsContractViolatingVLLMParameters(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{name: "allowed token ids", body: `{"allowed_token_ids":[1,2,3],"messages":[{"role":"user","content":"hello"}]}`, want: "allowed_token_ids"},
-		{name: "ignore eos", body: `{"ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}`, want: "ignore_eos"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := normalizeChatRequest([]byte(tt.body))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.want)
-		})
-	}
-}
-
 func TestNormalizeChatRequestStripsEmptyBadWords(t *testing.T) {
 	body, _, err := normalizeChatRequest([]byte(`{
 		"bad_words": ["", "   ", "keep"],
@@ -764,24 +728,6 @@ func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T
 			if tt.wantExtra != nil {
 				require.Equal(t, tt.wantExtra, kwargs["foo"])
 			}
-		})
-	}
-}
-
-func TestNormalizeChatRequestRejectsUnsupportedPenaltyFields(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{name: "presence penalty", body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`, want: "presence_penalty"},
-		{name: "frequency penalty", body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`, want: "frequency_penalty"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := normalizeChatRequest([]byte(tt.body))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.want)
 		})
 	}
 }
@@ -1237,4 +1183,59 @@ func TestPrepareChatRequestBodyAcceptsTenMiBBody(t *testing.T) {
 
 	_, _, err := prepareChatRequestBody(req)
 	require.NoError(t, err)
+}
+
+func TestEnsureRequestNestingDepth(t *testing.T) {
+	// nestedObjects produces `{"a":{"a":...}}` of the given object-nesting depth.
+	nestedObjects := func(depth int) []byte {
+		return []byte(strings.Repeat(`{"a":`, depth) + `1` + strings.Repeat(`}`, depth))
+	}
+
+	t.Run("at limit accepted", func(t *testing.T) {
+		require.NoError(t, ensureRequestNestingDepth(nestedObjects(MaxRequestNestingDepth), MaxRequestNestingDepth))
+	})
+
+	t.Run("one over limit rejected", func(t *testing.T) {
+		err := ensureRequestNestingDepth(nestedObjects(MaxRequestNestingDepth+1), MaxRequestNestingDepth)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "request nesting depth exceeds limit")
+	})
+
+	t.Run("array nesting counts equally", func(t *testing.T) {
+		body := []byte(strings.Repeat(`[`, MaxRequestNestingDepth+1) + `1` + strings.Repeat(`]`, MaxRequestNestingDepth+1))
+		err := ensureRequestNestingDepth(body, MaxRequestNestingDepth)
+		require.Error(t, err)
+	})
+
+	t.Run("braces inside strings do not count", func(t *testing.T) {
+		// Without string-awareness, this body would appear to nest 100 deep.
+		body := []byte(`{"k":"` + strings.Repeat(`{`, 100) + `"}`)
+		require.NoError(t, ensureRequestNestingDepth(body, MaxRequestNestingDepth))
+	})
+
+	t.Run("escaped quote inside string", func(t *testing.T) {
+		// The escaped quote must not exit string mode; the trailing braces inside the
+		// string still must not be counted.
+		body := []byte(`{"k":"x\"` + strings.Repeat(`{`, 100) + `"}`)
+		require.NoError(t, ensureRequestNestingDepth(body, MaxRequestNestingDepth))
+	})
+
+	t.Run("imbalanced closers rebase to zero", func(t *testing.T) {
+		// Excess closers must not let a later valid block bypass the limit by going negative.
+		body := []byte(strings.Repeat(`}`, 50) + strings.Repeat(`{`, MaxRequestNestingDepth+1))
+		err := ensureRequestNestingDepth(body, MaxRequestNestingDepth)
+		require.Error(t, err)
+	})
+}
+
+func TestNormalizeChatRequestRejectsBodyAtNestingLimit(t *testing.T) {
+	// Pipeline-level proof that the pre-scan participates in normalizeChatRequest.
+	deep := `"x"`
+	for i := 0; i < MaxRequestNestingDepth+1; i++ {
+		deep = `{"a":` + deep + `}`
+	}
+	body := `{"messages":[{"role":"user","content":` + deep + `}]}`
+	_, _, err := normalizeChatRequest([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "request nesting depth exceeds limit")
 }

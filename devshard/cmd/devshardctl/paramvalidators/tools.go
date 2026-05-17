@@ -9,20 +9,18 @@ import (
 // through as the shared ErrSchema* values wrapped with a "tools[i].function.parameters:"
 // prefix.
 var (
-	ErrToolsShape       = errors.New("tools: invalid array shape")
-	ErrToolShape        = errors.New("tools[i]: invalid tool shape")
-	ErrToolFunctionType = errors.New("tools[i].type: must be \"function\"")
+	ErrToolsShape        = errors.New("tools: invalid array shape")
+	ErrToolShape         = errors.New("tools[i]: invalid tool shape")
+	ErrToolFunctionType  = errors.New("tools[i].type: must be \"function\"")
+	ErrToolFunctionShape = errors.New("tools[i].function: invalid wrapper shape")
+	ErrToolFunctionName  = errors.New("tools[i].function.name: must be a non-empty string")
 )
 
-// ToolsValidator applies SchemaBounds to every `tools[].function.parameters` schema.
-//
-// vLLM compiles tool argument schemas through the same grammar path as response_format,
-// so the same depth/nodes/branch/enum/size/$ref invariants apply. Without this check, a
-// recursive schema posted inside a tool definition would reach vLLM unbounded.
-//
-// Empty or absent tools is a no-op (the catalog also strips empty `tools` arrays
-// elsewhere). Tools whose `function.parameters` field is absent or non-object are
-// skipped -- they are nominally allowed by the OpenAI spec (parameter-less tools).
+// ToolsValidator enforces the OpenAI tool object contract -- every tool must declare
+// `type: "function"` and a `function` object with a non-empty `name` -- and then bounds
+// `function.parameters` via SchemaBounds (same grammar-compiler attack surface as
+// response_format). Parameter-less tools are allowed by the OpenAI spec, so an absent
+// `parameters` field is a no-op rather than a failure.
 type ToolsValidator struct {
 	MaxDepth      int
 	MaxSize       int
@@ -54,16 +52,20 @@ func (v ToolsValidator) Validate(document map[string]any) error {
 		if !ok {
 			return fmt.Errorf("%w: tools[%d] must be an object", ErrToolShape, i)
 		}
-		// We do not enforce `type: "function"` here -- the OpenAI tool spec allows future
-		// expansion. We only validate the schema if it exists in the expected place.
+		toolType, ok := tool["type"].(string)
+		if !ok || toolType != "function" {
+			return fmt.Errorf("%w (tools[%d])", ErrToolFunctionType, i)
+		}
 		fn, ok := tool["function"].(map[string]any)
 		if !ok {
-			// A tool without a function payload reaches vLLM as a no-op; nothing to bound.
-			continue
+			return fmt.Errorf("%w: tools[%d].function must be an object", ErrToolFunctionShape, i)
+		}
+		name, ok := fn["name"].(string)
+		if !ok || name == "" {
+			return fmt.Errorf("%w (tools[%d])", ErrToolFunctionName, i)
 		}
 		params, ok := fn["parameters"].(map[string]any)
 		if !ok {
-			// Parameter-less tools (no JSON Schema) -- valid per OpenAI spec.
 			continue
 		}
 		if err := bounds.Walk(params); err != nil {

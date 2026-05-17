@@ -6,7 +6,7 @@ Reference for `POST /v1/chat/completions` on devshard. Documents which OpenAI/vL
 
 vLLM crashes on malformed or pathological requests (deep recursive JSON Schema, unsupported routing fields, unbounded objects). To keep the inference node healthy:
 
-1. **Body-level depth scan** (`ensureRequestNestingDepth` in `request_filters_parameters.go`). A byte-level pass bounds *whole-request* JSON nesting at `MaxRequestNestingDepth = 32` before `encoding/json` allocates anything. Without this, a 7 KiB body with 200 levels of nesting expands to ~180 KiB of `map[string]any` wrappers in the decoder — the validator below would still reject it, but the decoder has already paid the cost. The pre-scan defuses that amplification. (This is a different layer from the schema-level `MaxDepth = 5` cap below: the body limit is generous because legitimate requests can be ~10 levels deep through `messages[].content[].text` + `tools[].function.parameters` + `response_format.json_schema.schema`; the schema limit is tight because the grammar compiler in vLLM is the actual attack surface.)
+1. **Body-level depth scan** (`ensureRequestNestingDepth` in `request_filters_parameters.go`). A byte-level pass bounds whole-request JSON nesting at `MaxRequestNestingDepth = 32` before `encoding/json` allocates anything. Rationale and the legitimate-request depth budget live in the code comment over the constant. This is a separate layer from the schema-level `MaxDepth = 5` cap below: the body limit is generous because legitimate requests stack ~10 levels of wrappers; the schema limit is tight because the grammar compiler is the actual attack surface.
 2. Every inbound `/chat/completions` body is then decoded into a generic JSON document.
 3. `VLLMParameterCatalog` (`devshard/cmd/devshardctl/request_filters_parameters.go`) is a closed allow-list. The set of allowed keys is precomputed at catalog construction (no per-request map build). Any top-level field that is not in the catalog is rejected with `feature "<name>" is temporarily unavailable` (HTTP 400) before the request reaches the model.
 4. Parameter rules run in two stages:
@@ -118,7 +118,7 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
 | `tool_choice` | string | PreValidation reject | Pass-through except `"required"` — rejected because the upstream contract does not honor it on the vLLM path. Stripped together with `tools` if `tools` arrives empty. |
 | `min_tokens` | int range | PreValidation conditional strip + PostLimits clamp | Dropped if `stop_token_ids` is also set (vLLM rejects the combination). Otherwise clamped to ≤ `max_tokens`. |
 | `bad_words` | string list | PreValidation sanitize + length cap | Empty/whitespace strings are removed. Field is dropped if the resulting list is empty. Then `len(bad_words) ≤ 64`, per-entry length ≤ 128 bytes. |
-| `tools` | object array | PreValidation sanitize + schema validate (`paramvalidators.ToolsValidator`) | Empty arrays drop both `tools` and `tool_choice`. Every `tools[].function.parameters` is walked as a JSON Schema with the same bounds as `response_format` (depth ≤ 5, nodes ≤ 128, branch arms ≤ 16, enum ≤ 256, size ≤ 16 KiB; `$ref`/`$defs`/`definitions` forbidden; `type` must be a JSON-Schema primitive; `pattern` must compile as a regex within 512 B — CVE-2025-48944). vLLM compiles tool argument schemas through the same grammar path as `response_format`, so the bounds must match. |
+| `tools` | object array | PreValidation sanitize + shape + schema validate (`paramvalidators.ToolsValidator`) | Empty arrays drop both `tools` and `tool_choice`. Each tool must declare `type: "function"` and a `function` object with a non-empty string `name` — the OpenAI tool contract — otherwise rejected before vLLM ever sees the request. If `function.parameters` is present, it is walked as a JSON Schema with the same bounds as `response_format` (depth ≤ 5, nodes ≤ 128, branch arms ≤ 16, enum ≤ 256, size ≤ 16 KiB; `$ref`/`$defs`/`definitions` forbidden; `type` must be a JSON-Schema primitive; `pattern` must compile as a regex within 512 B — CVE-2025-48944). Parameter-less tools are valid. vLLM compiles tool argument schemas through the same grammar path as `response_format`, so the bounds must match. |
 | `logprobs` | bool | PostLimits force | Forced to `true` for the gateway's observability pipeline regardless of what the client sent. |
 | `top_logprobs` | int range | PostLimits force | Forced to `5` for the same reason. |
 | `response_format` | object | PreValidation validate (`paramvalidators.ResponseFormatValidator`) | Accepted with bounds. `type` must be one of `text` / `json_object` / `json_schema`. For `json_schema`, the schema is walked once and rejected if depth > 5, nodes > 128, branch arms (anyOf/oneOf/allOf) > 16, enum > 256, serialized size > 16 KiB, or contains `$ref` / `$defs` / `definitions`. Every schema node's `type` must be a JSON-Schema primitive (`string`/`number`/`integer`/`object`/`boolean`/`array`/`null` or an array of those); `pattern` is byte-capped at 512 B and must compile as a regex (defuses CVE-2025-48944). |
@@ -262,7 +262,7 @@ Implementation: `paramvalidators.ResponseFormatValidator` in `cmd/devshardctl/pa
 
 ### Shared schema-walking infrastructure
 
-Schema-walk rejection categories are exposed as sentinel errors: `ErrSchemaDepth`, `ErrSchemaNodes`, `ErrSchemaSize`, `ErrSchemaRef`, `ErrSchemaEnum`, `ErrSchemaBranch`. They are shared by `SchemaBounds` (JSON-Schema-aware, used for `response_format` and `tools[].function.parameters`) and `ObjectBounds` (plain-object, used for `chat_template_kwargs`). The original response_format-specific sentinels (`ErrResponseFormatDepth` etc.) remain as aliases for backward compatibility.
+Schema-walk rejection categories are exposed as sentinel errors: `ErrSchemaDepth`, `ErrSchemaNodes`, `ErrSchemaSize`, `ErrSchemaRef`, `ErrSchemaEnum`, `ErrSchemaBranch`, `ErrSchemaType`, `ErrSchemaPattern`. They are shared by `SchemaBounds` (JSON-Schema-aware, used for `response_format` and `tools[].function.parameters`) and `ObjectBounds` (plain-object, used for `chat_template_kwargs`).
 
 Calibrate the thresholds (depth, size, nodes) by running the validators against the sample structured-output schemas from production clients before raising any limit.
 
@@ -272,25 +272,28 @@ End-to-end `normalizeChatRequest` (Apple M2 Pro, `-benchtime=2s`):
 
 | Body | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- |
-| Minimal (47 B) | 2,799 | 2,450 | 43 |
-| Typical (132 B) | 4,432 | 2,947 | 67 |
-| Heavy (560 B) | 17,609 | 12,160 | 223 |
-| WithResponseFormat (279 B) | 9,611 | 6,776 | 139 |
-| RejectedUnknown (72 B) | 1,870 | 2,170 | 36 |
-| **RejectedRecursive (7.5 KiB attack)** | **1,063** | **96** | **2** |
+| Minimal (47 B) | 2,958 | 2,450 | 43 |
+| Typical (132 B) | 4,488 | 2,947 | 67 |
+| Heavy (~620 B) | 20,087 | 13,090 | 242 |
+| WithResponseFormat (279 B) | 10,746 | 6,776 | 139 |
+| RejectedUnknown (72 B) | 1,916 | 2,170 | 36 |
+| **RejectedDeepBody (7.5 KiB body-depth attack)** | **1,066** | **96** | **2** |
+| RejectedRecursiveSchema (walker reject) | 8,178 | 7,944 | 102 |
 
-The Heavy body now exercises `ToolsValidator` (walks `tools[].function.parameters` for each tool) and `ChatTemplateKwargsValidator`, which adds ~1.2 µs / ~14 allocs vs before the new validators landed. The reject-recursive attack path is unchanged because the body-level depth pre-scan still bails out first.
+`Heavy` now also carries `chat_template_kwargs` so `ChatTemplateKwargsValidator` is exercised end-to-end. `RejectedDeepBody` measures the body-level pre-scan rejection (depth > 32, never reaches the walker); `RejectedRecursiveSchema` measures the walker rejection on bodies that pass the pre-scan but trip `MaxDepth=5` — that path is ~8× more expensive because it pays for `json.Unmarshal` first.
 
-`response_format` validator in isolation (`paramvalidators/response_format_test.go`):
+`response_format` validator in isolation (`paramvalidators/response_format_bench_test.go`):
 
 | Path | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- |
-| Absent | 8.3 | 0 | 0 |
-| `type=text` / `json_object` | ~17 | 0 | 0 |
-| Simple schema | 1,645 | 640 | 19 |
-| At limits (~121 nodes) | 52,825 | 24,701 | 724 |
-| Rejects recursion attack | 559 | 96 | 2 |
-| Rejects oversized schema | 19,207 | 18,905 | 15 |
+| Absent | 8.7 | 0 | 0 |
+| `type=text` / `json_object` | ~18 | 0 | 0 |
+| Simple schema | 1,763 | 640 | 19 |
+| At limits (~121 nodes) | 55,895 | 24,701 | 724 |
+| Rejects recursion attack | 1,259 | 176 | 4 |
+| Rejects oversized schema | 19,889 | 19,023 | 17 |
+
+The walker `Rejects recursion attack` cost grew from ~560 ns to ~1.3 µs after CVE-2025-48944 type/pattern checks were added on every visited node. Still well under any latency budget.
 
 Bench files: `request_filters_bench_test.go` (pipeline-level) and `paramvalidators/response_format_bench_test.go` (validator-level).
 

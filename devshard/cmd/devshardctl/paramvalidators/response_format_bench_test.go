@@ -6,15 +6,17 @@ import (
 )
 
 // benchValidator returns the production-tuned validator. Reused across benchmarks so we
-// measure the actual configuration that ships, not a synthetic one.
+// measure the actual configuration that ships, not a synthetic one. Keep these constants
+// in sync with the catalog entry in cmd/devshardctl/request_filters_parameters.go.
 func benchValidator() ResponseFormatValidator {
 	return ResponseFormatValidator{
-		MaxDepth:   5,
-		MaxSize:    16 * 1024,
-		MaxNodes:   128,
-		MaxBranch:  16,
-		MaxEnum:    256,
-		MaxNameLen: 64,
+		MaxDepth:      5,
+		MaxSize:       16 * 1024,
+		MaxNodes:      128,
+		MaxBranch:     16,
+		MaxEnum:       256,
+		MaxNameLen:    64,
+		MaxPatternLen: 512,
 	}
 }
 

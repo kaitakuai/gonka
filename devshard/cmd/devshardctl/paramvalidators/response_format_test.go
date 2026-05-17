@@ -50,6 +50,11 @@ func TestResponseFormatValidatorAccepts(t *testing.T) {
 		{name: "schema type as array of primitives", body: jsonSchemaResponseFormatBody(`{"type":["string","null"]}`)},
 		// A reasonable regex pattern under the length cap compiles and is accepted.
 		{name: "schema with valid pattern", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":"^[a-zA-Z0-9_-]+$"}`)},
+		// Co-boundary: hit both MaxDepth=5 and MaxNodes=128 simultaneously. 4 chain levels
+		// + 124 leaf properties = 128 nodes, leaves sit at depth 5.
+		{name: "depth and nodes both at limit", body: jsonSchemaResponseFormatBody(coBoundarySchema(4, 124))},
+		// Size boundary: exactly MaxSize=16384 bytes after json.Marshal. > MaxSize rejects.
+		{name: "marshalled size exactly at limit", body: jsonSchemaResponseFormatBody(schemaOfMarshalledSize(t, 16*1024))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,33 +81,38 @@ func TestResponseFormatValidatorRejects(t *testing.T) {
 		{name: "json_schema name too long", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"` + strings.Repeat("a", 65) + `","schema":{"type":"object"}}}}`, wantErr: ErrResponseFormatName},
 		{name: "json_schema missing schema", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"r"}}}`, wantErr: ErrResponseFormatSchemaShape},
 		{name: "schema not an object", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":"x"}}}`, wantErr: ErrResponseFormatSchemaShape},
-		{name: "depth exceeds limit", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(6)), wantErr: ErrResponseFormatDepth},
-		{name: "deep recursion attack", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(200)), wantErr: ErrResponseFormatDepth},
-		{name: "schema size exceeds 16 KiB", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"` + strings.Repeat("a", 17*1024) + `":{"type":"string"}}}`), wantErr: ErrResponseFormatSize},
-		{name: "schema node count exceeds 128", body: jsonSchemaResponseFormatBody(manyPropertiesSchema(200)), wantErr: ErrResponseFormatNodes},
-		{name: "ref not allowed", body: jsonSchemaResponseFormatBody(`{"$ref":"#/foo"}`), wantErr: ErrResponseFormatRef},
-		{name: "defs not allowed", body: jsonSchemaResponseFormatBody(`{"$defs":{"x":{}}}`), wantErr: ErrResponseFormatRef},
-		{name: "definitions not allowed", body: jsonSchemaResponseFormatBody(`{"definitions":{"x":{}}}`), wantErr: ErrResponseFormatRef},
-		{name: "anyOf exceeds branch limit", body: jsonSchemaResponseFormatBody(`{"anyOf":[` + strings.Repeat(`{"type":"string"},`, 16) + `{"type":"string"}]}`), wantErr: ErrResponseFormatBranch},
-		{name: "oneOf exceeds branch limit", body: jsonSchemaResponseFormatBody(`{"oneOf":[` + strings.Repeat(`{"type":"string"},`, 16) + `{"type":"string"}]}`), wantErr: ErrResponseFormatBranch},
-		{name: "allOf exceeds branch limit", body: jsonSchemaResponseFormatBody(`{"allOf":[` + strings.Repeat(`{"type":"string"},`, 16) + `{"type":"string"}]}`), wantErr: ErrResponseFormatBranch},
-		{name: "enum exceeds limit", body: jsonSchemaResponseFormatBody(bigEnumSchema(257)), wantErr: ErrResponseFormatEnum},
-		{name: "ref deep inside properties", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"x":{"$ref":"#/y"}}}`), wantErr: ErrResponseFormatRef},
+		{name: "depth exceeds limit", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(6)), wantErr: ErrSchemaDepth},
+		{name: "deep recursion attack", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(200)), wantErr: ErrSchemaDepth},
+		{name: "schema size exceeds 16 KiB", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"` + strings.Repeat("a", 17*1024) + `":{"type":"string"}}}`), wantErr: ErrSchemaSize},
+		// Size boundary: MaxSize+1 must reject. CheckSize uses `> MaxSize`, so the off-by-one
+		// risk is right here.
+		{name: "marshalled size one byte over limit", body: jsonSchemaResponseFormatBody(schemaOfMarshalledSize(t, 16*1024+1)), wantErr: ErrSchemaSize},
+		{name: "schema node count exceeds 128", body: jsonSchemaResponseFormatBody(manyPropertiesSchema(200)), wantErr: ErrSchemaNodes},
+		// Node boundary: manyPropertiesSchema(128) = 1 root + 128 children = 129 nodes, one over.
+		{name: "node count one over limit", body: jsonSchemaResponseFormatBody(manyPropertiesSchema(128)), wantErr: ErrSchemaNodes},
+		{name: "ref not allowed", body: jsonSchemaResponseFormatBody(`{"$ref":"#/foo"}`), wantErr: ErrSchemaRef},
+		{name: "defs not allowed", body: jsonSchemaResponseFormatBody(`{"$defs":{"x":{}}}`), wantErr: ErrSchemaRef},
+		{name: "definitions not allowed", body: jsonSchemaResponseFormatBody(`{"definitions":{"x":{}}}`), wantErr: ErrSchemaRef},
+		{name: "anyOf exceeds branch limit", body: jsonSchemaResponseFormatBody(`{"anyOf":[` + strings.Repeat(`{"type":"string"},`, 16) + `{"type":"string"}]}`), wantErr: ErrSchemaBranch},
+		{name: "oneOf exceeds branch limit", body: jsonSchemaResponseFormatBody(`{"oneOf":[` + strings.Repeat(`{"type":"string"},`, 16) + `{"type":"string"}]}`), wantErr: ErrSchemaBranch},
+		{name: "allOf exceeds branch limit", body: jsonSchemaResponseFormatBody(`{"allOf":[` + strings.Repeat(`{"type":"string"},`, 16) + `{"type":"string"}]}`), wantErr: ErrSchemaBranch},
+		{name: "enum exceeds limit", body: jsonSchemaResponseFormatBody(bigEnumSchema(257)), wantErr: ErrSchemaEnum},
+		{name: "ref deep inside properties", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"x":{"$ref":"#/y"}}}`), wantErr: ErrSchemaRef},
 		// Regression: walker must traverse every schema-valued keyword. Hiding a deep nest or a
 		// $ref under if/then/else/contains/not/propertyNames/unevaluated*/dependentSchemas
 		// previously bypassed the validator.
-		{name: "depth via if chain", body: jsonSchemaResponseFormatBody(nestedIfSchema(200)), wantErr: ErrResponseFormatDepth},
-		{name: "depth via then chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("then", 200)), wantErr: ErrResponseFormatDepth},
-		{name: "depth via else chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("else", 200)), wantErr: ErrResponseFormatDepth},
-		{name: "depth via contains chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("contains", 200)), wantErr: ErrResponseFormatDepth},
-		{name: "depth via not chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("not", 200)), wantErr: ErrResponseFormatDepth},
-		{name: "depth via propertyNames chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("propertyNames", 200)), wantErr: ErrResponseFormatDepth},
-		{name: "depth via unevaluatedProperties chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("unevaluatedProperties", 200)), wantErr: ErrResponseFormatDepth},
-		{name: "ref hidden under if", body: jsonSchemaResponseFormatBody(`{"if":{"$ref":"#/x"}}`), wantErr: ErrResponseFormatRef},
-		{name: "ref hidden under contains", body: jsonSchemaResponseFormatBody(`{"contains":{"$ref":"#/x"}}`), wantErr: ErrResponseFormatRef},
-		{name: "ref hidden under not", body: jsonSchemaResponseFormatBody(`{"not":{"$ref":"#/x"}}`), wantErr: ErrResponseFormatRef},
-		{name: "ref hidden under dependentSchemas", body: jsonSchemaResponseFormatBody(`{"dependentSchemas":{"x":{"$ref":"#/y"}}}`), wantErr: ErrResponseFormatRef},
-		{name: "defs hidden under then", body: jsonSchemaResponseFormatBody(`{"then":{"$defs":{"x":{}}}}`), wantErr: ErrResponseFormatRef},
+		{name: "depth via if chain", body: jsonSchemaResponseFormatBody(nestedIfSchema(200)), wantErr: ErrSchemaDepth},
+		{name: "depth via then chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("then", 200)), wantErr: ErrSchemaDepth},
+		{name: "depth via else chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("else", 200)), wantErr: ErrSchemaDepth},
+		{name: "depth via contains chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("contains", 200)), wantErr: ErrSchemaDepth},
+		{name: "depth via not chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("not", 200)), wantErr: ErrSchemaDepth},
+		{name: "depth via propertyNames chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("propertyNames", 200)), wantErr: ErrSchemaDepth},
+		{name: "depth via unevaluatedProperties chain", body: jsonSchemaResponseFormatBody(nestedKeywordSchema("unevaluatedProperties", 200)), wantErr: ErrSchemaDepth},
+		{name: "ref hidden under if", body: jsonSchemaResponseFormatBody(`{"if":{"$ref":"#/x"}}`), wantErr: ErrSchemaRef},
+		{name: "ref hidden under contains", body: jsonSchemaResponseFormatBody(`{"contains":{"$ref":"#/x"}}`), wantErr: ErrSchemaRef},
+		{name: "ref hidden under not", body: jsonSchemaResponseFormatBody(`{"not":{"$ref":"#/x"}}`), wantErr: ErrSchemaRef},
+		{name: "ref hidden under dependentSchemas", body: jsonSchemaResponseFormatBody(`{"dependentSchemas":{"x":{"$ref":"#/y"}}}`), wantErr: ErrSchemaRef},
+		{name: "defs hidden under then", body: jsonSchemaResponseFormatBody(`{"then":{"$defs":{"x":{}}}}`), wantErr: ErrSchemaRef},
 		// CVE-2025-48944: bad `type` value crashes xgrammar's C++ grammar compiler.
 		{name: "bad schema type string", body: jsonSchemaResponseFormatBody(`{"type":"something"}`), wantErr: ErrSchemaType},
 		{name: "bad schema type array entry", body: jsonSchemaResponseFormatBody(`{"type":["string","weird"]}`), wantErr: ErrSchemaType},
@@ -163,6 +173,59 @@ func manyPropertiesSchema(count int) string {
 	}
 	b.WriteString(`}}`)
 	return b.String()
+}
+
+// coBoundarySchema constructs a schema that sits at both the depth and node-count limit
+// simultaneously: a single-property chain of `chainDepth` levels, with `leafProps` empty
+// sibling properties at the deepest level. Total nodes = chainDepth + leafProps; depth =
+// chainDepth + 1 (leaves are one step deeper than the chain).
+func coBoundarySchema(chainDepth, leafProps int) string {
+	var b strings.Builder
+	for i := 0; i < chainDepth-1; i++ {
+		b.WriteString(`{"type":"object","properties":{"a":`)
+	}
+	b.WriteString(`{"type":"object","properties":{`)
+	for i := 0; i < leafProps; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"p`)
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(`":{}`)
+	}
+	b.WriteString(`}}`)
+	for i := 0; i < chainDepth-1; i++ {
+		b.WriteString(`}}`)
+	}
+	return b.String()
+}
+
+// schemaOfMarshalledSize returns a JSON-Schema map whose post-Marshal byte length equals
+// `want`. Used to exercise the CheckSize boundary without guessing wrapper overhead.
+func schemaOfMarshalledSize(tb testing.TB, want int) string {
+	tb.Helper()
+	build := func(padLen int) []byte {
+		s := `{"type":"string","description":"` + strings.Repeat("a", padLen) + `"}`
+		var m map[string]any
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			tb.Fatalf("unmarshal: %v", err)
+		}
+		out, err := json.Marshal(m)
+		if err != nil {
+			tb.Fatalf("marshal: %v", err)
+		}
+		return out
+	}
+	for padLen := want - 64; padLen < want+64; padLen++ {
+		if padLen < 0 {
+			continue
+		}
+		if len(build(padLen)) == want {
+			return string(build(padLen))
+		}
+	}
+	tb.Fatalf("could not build schema of marshalled size %d", want)
+	return ""
 }
 
 func bigEnumSchema(n int) string {
