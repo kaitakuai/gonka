@@ -270,17 +270,13 @@ func TestNormalizeChatRequestForcesTopLogprobsFive(t *testing.T) {
 	require.EqualValues(t, 5, raw["top_logprobs"])
 }
 
-func TestNormalizeChatRequestStripsPromptLogprobs(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
+func TestNormalizeChatRequestRejectsPromptLogprobs(t *testing.T) {
+	_, _, err := normalizeChatRequest([]byte(`{
 		"messages": [{"role": "user", "content": "hi"}],
 		"prompt_logprobs": 20
 	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	_, exists := raw["prompt_logprobs"]
-	require.False(t, exists)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "prompt_logprobs")
 }
 
 func TestNormalizeChatRequestStripsMinTokensWhenStopTokenIdsPresent(t *testing.T) {
@@ -362,32 +358,40 @@ func TestNormalizeChatRequestKeepsToolChoiceAutoWithTools(t *testing.T) {
 	require.Contains(t, raw, "tools")
 }
 
-func TestNormalizeChatRequestStripsUnsupportedVLLMParameters(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"use_beam_search": true,
-		"truncate_prompt_tokens": 16,
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.NotContains(t, raw, "use_beam_search")
-	require.NotContains(t, raw, "truncate_prompt_tokens")
+func TestNormalizeChatRequestRejectsUnsupportedVLLMParameters(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "beam search", body: `{"use_beam_search":true,"messages":[{"role":"user","content":"hello"}]}`, want: "use_beam_search"},
+		{name: "truncate prompt tokens", body: `{"truncate_prompt_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, want: "truncate_prompt_tokens"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
 }
 
-func TestNormalizeChatRequestStripsContractViolatingVLLMParameters(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"allowed_token_ids": [1, 2, 3],
-		"ignore_eos": true,
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.NotContains(t, raw, "allowed_token_ids")
-	require.NotContains(t, raw, "ignore_eos")
+func TestNormalizeChatRequestRejectsContractViolatingVLLMParameters(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "allowed token ids", body: `{"allowed_token_ids":[1,2,3],"messages":[{"role":"user","content":"hello"}]}`, want: "allowed_token_ids"},
+		{name: "ignore eos", body: `{"ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}`, want: "ignore_eos"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
 }
 
 func TestNormalizeChatRequestStripsEmptyBadWords(t *testing.T) {
@@ -763,31 +767,22 @@ func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T
 	}
 }
 
-func TestNormalizeChatRequestStripsStructuredOutputsBeforeValidation(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"model": "Qwen/Test",
-		"structured_outputs": {"regex": "[a-z]+"},
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.NotContains(t, raw, "structured_outputs")
-}
-
-func TestNormalizeChatRequestStripsUnsupportedPenaltyFields(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"presence_penalty": 1.2,
-		"frequency_penalty": 0.8,
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.NotContains(t, raw, "presence_penalty")
-	require.NotContains(t, raw, "frequency_penalty")
+func TestNormalizeChatRequestRejectsUnsupportedPenaltyFields(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "presence penalty", body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`, want: "presence_penalty"},
+		{name: "frequency penalty", body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`, want: "frequency_penalty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+		})
+	}
 }
 
 func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
@@ -796,6 +791,11 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 		body string
 		want string
 	}{
+		{
+			name: "unknown top level field",
+			body: `{"custom_param":true,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "custom_param",
+		},
 		{
 			name: "enforced tokens",
 			body: `{"enforced_tokens":["x"],"messages":[{"role":"user","content":"hello"}]}`,
@@ -835,6 +835,46 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			name: "tool choice required",
 			body: `{"tool_choice":"required","tools":[{"type":"function","function":{"name":"x","description":"x","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hello"}]}`,
 			want: "tool_choice=required",
+		},
+		{
+			name: "structured outputs",
+			body: `{"structured_outputs":{"regex":"[a-z]+"},"messages":[{"role":"user","content":"hello"}]}`,
+			want: "structured_outputs",
+		},
+		{
+			name: "presence penalty",
+			body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "presence_penalty",
+		},
+		{
+			name: "frequency penalty",
+			body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "frequency_penalty",
+		},
+		{
+			name: "prompt logprobs",
+			body: `{"prompt_logprobs":20,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "prompt_logprobs",
+		},
+		{
+			name: "beam search",
+			body: `{"use_beam_search":true,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "use_beam_search",
+		},
+		{
+			name: "truncate prompt tokens",
+			body: `{"truncate_prompt_tokens":16,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "truncate_prompt_tokens",
+		},
+		{
+			name: "allowed token ids",
+			body: `{"allowed_token_ids":[1,2,3],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "allowed_token_ids",
+		},
+		{
+			name: "ignore eos",
+			body: `{"ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}`,
+			want: "ignore_eos",
 		},
 	}
 

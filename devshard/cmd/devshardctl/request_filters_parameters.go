@@ -275,6 +275,14 @@ type ChatRequestDocument struct {
 	raw map[string]any
 }
 
+func (d *ChatRequestDocument) Keys() []string {
+	keys := make([]string, 0, len(d.raw))
+	for key := range d.raw {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
 func decodeChatRequestDocument(body []byte) (*ChatRequestDocument, error) {
 	var raw map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -416,23 +424,6 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("response_format", ParameterCategoryObject).
 			withRejectRule(RequestFilterStagePreValidation, RejectNestedStringValueParameterHandler{Parent: "response_format", Field: "type", Value: "json_object", Message: unsupportedChatParameterMessage("response_format.type=json_object")}).
 			withRejectRule(RequestFilterStagePreValidation, RejectNestedStringValueParameterHandler{Parent: "response_format", Field: "type", Value: "json_schema", Message: unsupportedChatParameterMessage("response_format.type=json_schema")}),
-		newParameter("presence_penalty", ParameterCategoryFloatRange).
-			withStripRule(RequestFilterStagePreValidation),
-		newParameter("frequency_penalty", ParameterCategoryFloatRange).
-			withStripRule(RequestFilterStagePreValidation),
-		newParameter("structured_outputs", ParameterCategoryObject).
-			withStripRule(RequestFilterStagePreValidation).
-			withSanitizeRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: rejectStructuredOutputsRegex}),
-		newParameter("prompt_logprobs", ParameterCategoryIntRange).
-			withStripRule(RequestFilterStagePreValidation),
-		newParameter("use_beam_search", ParameterCategoryBool).
-			withStripRule(RequestFilterStagePreValidation),
-		newParameter("truncate_prompt_tokens", ParameterCategoryIntRange).
-			withStripRule(RequestFilterStagePreValidation),
-		newParameter("allowed_token_ids", ParameterCategoryIntList).
-			withStripRule(RequestFilterStagePreValidation),
-		newParameter("ignore_eos", ParameterCategoryBool).
-			withStripRule(RequestFilterStagePreValidation),
 		newParameter("min_tokens", ParameterCategoryIntRange).
 			withConditionalStripRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
 				Predicate: func(ctx *RequestFilterContext) bool {
@@ -449,16 +440,6 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			}),
 		newParameter("tools", ParameterCategoryObjectArray).
 			withSanitizeRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}),
-		newParameter("enforced_tokens", ParameterCategoryAny).
-			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("enforced_tokens")}),
-		newParameter("guided_regex", ParameterCategoryAny).
-			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_regex")}),
-		newParameter("guided_grammar", ParameterCategoryAny).
-			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_grammar")}),
-		newParameter("guided_json", ParameterCategoryAny).
-			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_json")}),
-		newParameter("guided_choice", ParameterCategoryAny).
-			withRejectRule(RequestFilterStagePreValidation, RejectParameterHandler{Message: unsupportedChatParameterMessage("guided_choice")}),
 		newParameter("logprobs", ParameterCategoryBool).
 			withForceRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
 		newParameter("top_logprobs", ParameterCategoryIntRange).
@@ -467,6 +448,11 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 }
 
 func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilterContext) error {
+	if stage == RequestFilterStagePreValidation {
+		if err := c.rejectUnknownParameters(ctx); err != nil {
+			return err
+		}
+	}
 	for _, parameter := range c.parameters {
 		for _, rule := range parameter.Rules {
 			if rule.Stage != stage || rule.Handler == nil {
@@ -476,6 +462,23 @@ func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilter
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (c VLLMParameterCatalog) rejectUnknownParameters(ctx *RequestFilterContext) error {
+	if ctx == nil || ctx.Document == nil {
+		return nil
+	}
+	known := make(map[string]struct{}, len(c.parameters))
+	for _, parameter := range c.parameters {
+		known[parameter.Name] = struct{}{}
+	}
+	for _, key := range ctx.Document.Keys() {
+		if _, ok := known[key]; ok {
+			continue
+		}
+		return badChatRequest("%s", unsupportedChatParameterMessage(key))
 	}
 	return nil
 }
@@ -514,17 +517,6 @@ func stripEmptyToolsAndToolChoice(ctx *RequestFilterContext, _ VLLMParameter) er
 	if ok && len(tools) == 0 {
 		ctx.Document.Delete("tools")
 		ctx.Document.Delete("tool_choice")
-	}
-	return nil
-}
-
-func rejectStructuredOutputsRegex(ctx *RequestFilterContext, _ VLLMParameter) error {
-	structuredOutputs, ok := ctx.Document.Object("structured_outputs")
-	if !ok {
-		return nil
-	}
-	if _, exists := structuredOutputs["regex"]; exists {
-		return badChatRequest("%s", unsupportedChatParameterMessage("structured_outputs.regex"))
 	}
 	return nil
 }
