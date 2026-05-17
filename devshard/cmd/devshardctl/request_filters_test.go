@@ -802,11 +802,6 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			want: "enforced_tokens",
 		},
 		{
-			name: "json object response format",
-			body: `{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "response_format",
-		},
-		{
 			name: "guided regex",
 			body: `{"guided_regex":"[a-z]+","messages":[{"role":"user","content":"hello"}]}`,
 			want: "guided_regex",
@@ -815,16 +810,6 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			name: "guided grammar",
 			body: `{"guided_grammar":"root ::= item","messages":[{"role":"user","content":"hello"}]}`,
 			want: "guided_grammar",
-		},
-		{
-			name: "json schema response format",
-			body: `{"response_format":{"type":"json_schema"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "response_format",
-		},
-		{
-			name: "nested json schema response format",
-			body: `{"response_format":{"json_schema":{"name":"r","schema":{"type":"object"}}},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "response_format",
 		},
 		{
 			name: "guided json",
@@ -891,6 +876,42 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
 		})
 	}
+}
+
+// Integration coverage that response_format is routed through the catalog rule and that pipeline
+// errors are translated into HTTP 400. Exhaustive validator behavior lives in
+// filters_parameters/response_format_test.go.
+func TestNormalizeChatRequestResponseFormatPipeline(t *testing.T) {
+	t.Run("accepts type text", func(t *testing.T) {
+		body, _, err := normalizeChatRequest([]byte(`{"response_format":{"type":"text"},"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"response_format"`)
+	})
+
+	t.Run("accepts json_schema with simple schema", func(t *testing.T) {
+		body, _, err := normalizeChatRequest([]byte(`{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":{"type":"object","properties":{"x":{"type":"string"}}}}},"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"response_format"`)
+	})
+
+	t.Run("rejects unknown type with HTTP 400", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"response_format":{"type":"banana"},"messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "response_format")
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+
+	t.Run("rejects pathological recursive schema with HTTP 400", func(t *testing.T) {
+		deepSchema := `{"type":"object"}`
+		for i := 0; i < 200; i++ {
+			deepSchema = `{"type":"object","properties":{"x":` + deepSchema + `}}`
+		}
+		body := `{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":` + deepSchema + `}},"messages":[{"role":"user","content":"hello"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "depth")
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
 }
 
 func TestNormalizeChatRequestRejectsMalformedMessages(t *testing.T) {

@@ -6,21 +6,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
-)
 
-type ParameterCategory int
-
-const (
-	ParameterCategoryAny ParameterCategory = iota
-	ParameterCategoryString
-	ParameterCategoryBool
-	ParameterCategoryStringList
-	ParameterCategoryIntList
-	ParameterCategoryFloatRange
-	ParameterCategoryIntRange
-	ParameterCategoryIntToFloat
-	ParameterCategoryObject
-	ParameterCategoryObjectArray
+	"devshard/cmd/devshardctl/paramvalidators"
 )
 
 type RequestFilterStage int
@@ -32,31 +19,15 @@ const (
 	RequestFilterStagePostLimits
 )
 
-type ParameterSupport int
-
-const (
-	ParameterSupportPassthrough ParameterSupport = iota
-	// Strip drops an unsupported field but keeps the request itself valid.
-	ParameterSupportStrip
-	// Reject fails the request because forwarding it would violate the upstream contract.
-	ParameterSupportReject
-	// Sanitize rewrites a field into an allowed shape or value range.
-	ParameterSupportSanitize
-	// Force overwrites the field with a gateway-owned value.
-	ParameterSupportForce
-)
-
 // ParameterRule describes one transformation for a field at a specific pipeline stage.
 type ParameterRule struct {
 	Stage   RequestFilterStage
-	Support ParameterSupport
 	Handler ParameterHandler
 }
 
 type VLLMParameter struct {
-	Name     string
-	Category ParameterCategory
-	Rules    []ParameterRule
+	Name  string
+	Rules []ParameterRule
 }
 
 type ParameterHandler interface {
@@ -271,6 +242,27 @@ func (h CustomParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMP
 	return h.ApplyFunc(ctx, parameter)
 }
 
+// DocumentValidator is the contract pure validators in paramvalidators expose.
+// Adapter wraps them so their errors become badChatRequest(400) responses without coupling
+// each validator to the gateway's pipeline types.
+type DocumentValidator interface {
+	Validate(map[string]any) error
+}
+
+type DocumentValidatorHandler struct {
+	Validator DocumentValidator
+}
+
+func (h DocumentValidatorHandler) Apply(ctx *RequestFilterContext, _ VLLMParameter) error {
+	if h.Validator == nil {
+		return nil
+	}
+	if err := h.Validator.Validate(ctx.Document.Raw()); err != nil {
+		return wrapBadChatRequest(err)
+	}
+	return nil
+}
+
 type ChatRequestDocument struct {
 	raw map[string]any
 }
@@ -283,7 +275,21 @@ func (d *ChatRequestDocument) Keys() []string {
 	return keys
 }
 
+// MaxRequestNestingDepth bounds JSON nesting before we hand the bytes to encoding/json.
+// encoding/json allocates O(input size) per recursion level, so a 7 KiB body nested 200
+// levels deep blows up to ~180 KiB of map[string]any wrappers. The whitelist rules then
+// reject in nanoseconds, but the decoder has already paid the cost. The pre-scan defuses
+// that amplification cheaply.
+//
+// 32 leaves at least 3x headroom over the deepest legitimate request shape we forward:
+// `tools[].function.parameters` or `response_format.json_schema.schema` nested under their
+// wrappers (~9-10 levels) plus a small allowance for client-side structuring.
+const MaxRequestNestingDepth = 32
+
 func decodeChatRequestDocument(body []byte) (*ChatRequestDocument, error) {
+	if err := ensureRequestNestingDepth(body, MaxRequestNestingDepth); err != nil {
+		return nil, err
+	}
 	var raw map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -291,6 +297,51 @@ func decodeChatRequestDocument(body []byte) (*ChatRequestDocument, error) {
 		return nil, badChatRequest("parse request: %v", err)
 	}
 	return &ChatRequestDocument{raw: raw}, nil
+}
+
+// ensureRequestNestingDepth performs a byte-level scan that bounds JSON nesting before any
+// allocation-heavy decode happens. It tracks quoted strings and escape sequences but
+// otherwise ignores semantic structure -- the goal is to bound the decoder, not to validate
+// JSON shape; malformed JSON still flows through to the regular parser and gets a normal
+// HTTP 400.
+func ensureRequestNestingDepth(body []byte, maxDepth int) error {
+	depth := 0
+	inString := false
+	escaped := false
+	for _, b := range body {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inString {
+			switch b {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch b {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			if depth > maxDepth {
+				return badChatRequest("request nesting depth exceeds limit %d", maxDepth)
+			}
+		case '}', ']':
+			depth--
+			if depth < 0 {
+				// More closers than openers. The decoder will reject the malformed body
+				// with a normal parse error later; rebase to 0 so subsequent valid blocks
+				// are still bounded by maxDepth instead of needing maxDepth+|imbalance|
+				// extra opens before tripping the cap.
+				depth = 0
+			}
+		}
+	}
+	return nil
 }
 
 func (d *ChatRequestDocument) Marshal() ([]byte, error) {
@@ -301,20 +352,16 @@ func (d *ChatRequestDocument) Marshal() ([]byte, error) {
 	return updatedBody, nil
 }
 
-func (d *ChatRequestDocument) DecodeInto(dst any) error {
-	body, err := d.Marshal()
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		return badChatRequest("parse request: %v", err)
-	}
-	return nil
-}
-
 func (d *ChatRequestDocument) Has(name string) bool {
 	_, ok := d.raw[name]
 	return ok
+}
+
+// Raw exposes the underlying decoded map for handlers (in this package or external) that
+// need direct access to inspect or mutate the top-level fields. The returned map is the live
+// document -- modifications are reflected in subsequent reads and the final marshal.
+func (d *ChatRequestDocument) Raw() map[string]any {
+	return d.raw
 }
 
 func (d *ChatRequestDocument) Get(name string) (any, bool) {
@@ -364,18 +411,37 @@ func newRequestFilterContext(body []byte, adminAuthenticated bool, limits output
 	}, nil
 }
 
+// DecodeRequest populates ctx.Request from ctx.Document via direct field reads. Previously
+// this was a json.Marshal + json.Unmarshal round-trip just to project the document into a
+// 5-field struct -- that doubled the allocation count on every request. Direct reads keep
+// the behavior (strict types, null-tolerant) but skip the round-trip.
 func (ctx *RequestFilterContext) DecodeRequest() error {
 	var req chatRequest
-	if err := ctx.Document.DecodeInto(&req); err != nil {
+	if err := readChatRequestFields(ctx.Document, &req); err != nil {
 		return err
 	}
 	ctx.Request = req
 	return nil
 }
 
+// SyncRequestView refreshes ctx.Request after PostLimits rules ran. Why we explicitly
+// preserve the token fields instead of re-reading them from the document:
+//
+//   - When the client sends only `max_completion_tokens` (no `max_tokens`),
+//     `applyOutputTokenLimits` sets `ctx.Request.MaxTokens` from the resolved
+//     `max_completion_tokens` (see request_filters.go:139) but does NOT write a
+//     corresponding `max_tokens` key into the document. Re-reading the document would
+//     therefore reset `req.MaxTokens` to 0.
+//   - In the other three branches of `applyOutputTokenLimits`, the document DOES carry
+//     the same value, so preserving from `ctx.Request` is a no-op. Net effect: this
+//     branch only matters for the max-completion-only path, locked in by
+//     TestNormalizeChatRequestDefaultsAndCapsOutputTokens.
+//
+// Other fields are re-read so caps applied by PostLimits rules (for example `n` via
+// CapUintParameterHandler) propagate into the projection.
 func (ctx *RequestFilterContext) SyncRequestView() error {
 	var req chatRequest
-	if err := ctx.Document.DecodeInto(&req); err != nil {
+	if err := readChatRequestFields(ctx.Document, &req); err != nil {
 		return err
 	}
 	req.MaxTokens = ctx.Request.MaxTokens
@@ -384,64 +450,121 @@ func (ctx *RequestFilterContext) SyncRequestView() error {
 	return nil
 }
 
+func readChatRequestFields(doc *ChatRequestDocument, req *chatRequest) error {
+	if raw, ok := doc.Get("model"); ok && raw != nil {
+		s, ok := raw.(string)
+		if !ok {
+			return badChatRequest("parse request: model must be a string")
+		}
+		req.Model = s
+	}
+	if raw, ok := doc.Get("stream"); ok && raw != nil {
+		b, ok := raw.(bool)
+		if !ok {
+			return badChatRequest("parse request: stream must be a boolean")
+		}
+		req.Stream = b
+	}
+	if err := readUint64Field(doc, "max_tokens", &req.MaxTokens); err != nil {
+		return err
+	}
+	if err := readUint64Field(doc, "max_completion_tokens", &req.MaxCompletionTokens); err != nil {
+		return err
+	}
+	if err := readUint64Field(doc, "n", &req.N); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readUint64Field(doc *ChatRequestDocument, name string, dst *uint64) error {
+	raw, ok := doc.Get(name)
+	if !ok || raw == nil {
+		return nil
+	}
+	n, ok := numericJSONValueAsUint64(raw)
+	if !ok {
+		return badChatRequest("parse request: %s must be a non-negative integer", name)
+	}
+	*dst = n
+	return nil
+}
+
 type VLLMParameterCatalog struct {
 	parameters []VLLMParameter
+	known      map[string]struct{}
 }
 
 var defaultParameterCatalog = defaultVLLMParameterCatalog()
 
 // The catalog is the single source of truth for how each supported OpenAI/vLLM field is treated.
 func defaultVLLMParameterCatalog() VLLMParameterCatalog {
-	return VLLMParameterCatalog{parameters: []VLLMParameter{
-		newParameter("model", ParameterCategoryString),
-		newParameter("stream", ParameterCategoryBool),
-		newParameter("messages", ParameterCategoryObjectArray),
-		newParameter("max_tokens", ParameterCategoryIntRange),
-		newParameter("max_completion_tokens", ParameterCategoryIntRange),
-		newParameter("n", ParameterCategoryIntRange).
-			withSanitizeRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}),
-		newParameter("temperature", ParameterCategoryFloatRange).
-			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
-		newParameter("top_p", ParameterCategoryFloatRange).
-			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newParameter("top_k", ParameterCategoryIntRange).
-			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newParameter("min_p", ParameterCategoryFloatRange).
-			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newParameter("repetition_penalty", ParameterCategoryFloatRange).
-			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
-		newParameter("logit_bias", ParameterCategoryIntToFloat).
-			withSanitizeRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true}),
-		newParameter("stop", ParameterCategoryStringList),
-		newParameter("stop_token_ids", ParameterCategoryIntList),
-		newParameter("seed", ParameterCategoryIntRange),
-		newParameter("skip_special_tokens", ParameterCategoryBool),
-		newParameter("detokenize", ParameterCategoryBool),
-		newParameter("thinking", ParameterCategoryObject),
-		newParameter("chat_template_kwargs", ParameterCategoryObject),
-		newParameter("tool_choice", ParameterCategoryString).
-			withRejectRule(RequestFilterStagePreValidation, RejectStringValueParameterHandler{Value: "required", Message: unsupportedChatParameterMessage("tool_choice=required")}),
-		newParameter("min_tokens", ParameterCategoryIntRange).
-			withConditionalStripRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
+	parameters := []VLLMParameter{
+		newParameter("model"),
+		newParameter("stream"),
+		newParameter("messages"),
+		newParameter("max_tokens"),
+		newParameter("max_completion_tokens"),
+		newParameter("n").
+			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}),
+		newParameter("temperature").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
+		newParameter("top_p").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
+		newParameter("top_k").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
+		newParameter("min_p").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
+		newParameter("repetition_penalty").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
+		newParameter("logit_bias").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true}),
+		newParameter("stop"),
+		newParameter("stop_token_ids"),
+		newParameter("seed"),
+		newParameter("skip_special_tokens"),
+		newParameter("detokenize"),
+		newParameter("thinking"),
+		newParameter("chat_template_kwargs"),
+		newParameter("tool_choice").
+			withRule(RequestFilterStagePreValidation, RejectStringValueParameterHandler{Value: "required", Message: unsupportedChatParameterMessage("tool_choice=required")}),
+		newParameter("min_tokens").
+			withRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
 				Predicate: func(ctx *RequestFilterContext) bool {
 					return ctx.Document.Has("stop_token_ids")
 				},
 			}).
-			withSanitizeRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
-		newParameter("bad_words", ParameterCategoryStringList).
-			withSanitizeRule(RequestFilterStagePreValidation, SanitizeStringListParameterHandler{
+			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
+		newParameter("bad_words").
+			withRule(RequestFilterStagePreValidation, SanitizeStringListParameterHandler{
 				Keep: func(value string) bool {
 					return strings.TrimSpace(value) != ""
 				},
 				DropFieldIfEmpty: true,
 			}),
-		newParameter("tools", ParameterCategoryObjectArray).
-			withSanitizeRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}),
-		newParameter("logprobs", ParameterCategoryBool).
-			withForceRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
-		newParameter("top_logprobs", ParameterCategoryIntRange).
-			withForceRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: 5}),
-	}}
+		newParameter("tools").
+			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}),
+		newParameter("logprobs").
+			withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
+		newParameter("top_logprobs").
+			withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: 5}),
+		newParameter("response_format").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ResponseFormatValidator{
+					MaxDepth:   5,
+					MaxSize:    16 * 1024,
+					MaxNodes:   128,
+					MaxBranch:  16,
+					MaxEnum:    256,
+					MaxNameLen: 64,
+				},
+			}),
+	}
+	known := make(map[string]struct{}, len(parameters))
+	for _, p := range parameters {
+		known[p.Name] = struct{}{}
+	}
+	return VLLMParameterCatalog{parameters: parameters, known: known}
 }
 
 func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilterContext) error {
@@ -467,12 +590,8 @@ func (c VLLMParameterCatalog) rejectUnknownParameters(ctx *RequestFilterContext)
 	if ctx == nil || ctx.Document == nil {
 		return nil
 	}
-	known := make(map[string]struct{}, len(c.parameters))
-	for _, parameter := range c.parameters {
-		known[parameter.Name] = struct{}{}
-	}
-	for _, key := range ctx.Document.Keys() {
-		if _, ok := known[key]; ok {
+	for key := range ctx.Document.raw {
+		if _, ok := c.known[key]; ok {
 			continue
 		}
 		return badChatRequest("%s", unsupportedChatParameterMessage(key))
@@ -480,33 +599,13 @@ func (c VLLMParameterCatalog) rejectUnknownParameters(ctx *RequestFilterContext)
 	return nil
 }
 
-func newParameter(name string, category ParameterCategory) VLLMParameter {
-	return VLLMParameter{Name: name, Category: category}
+func newParameter(name string) VLLMParameter {
+	return VLLMParameter{Name: name}
 }
 
-func (p VLLMParameter) appendRule(stage RequestFilterStage, support ParameterSupport, handler ParameterHandler) VLLMParameter {
-	p.Rules = append(p.Rules, ParameterRule{Stage: stage, Support: support, Handler: handler})
+func (p VLLMParameter) withRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
+	p.Rules = append(p.Rules, ParameterRule{Stage: stage, Handler: handler})
 	return p
-}
-
-func (p VLLMParameter) withStripRule(stage RequestFilterStage) VLLMParameter {
-	return p.appendRule(stage, ParameterSupportStrip, StripParameterHandler{})
-}
-
-func (p VLLMParameter) withConditionalStripRule(stage RequestFilterStage, handler ConditionalStripParameterHandler) VLLMParameter {
-	return p.appendRule(stage, ParameterSupportStrip, handler)
-}
-
-func (p VLLMParameter) withRejectRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
-	return p.appendRule(stage, ParameterSupportReject, handler)
-}
-
-func (p VLLMParameter) withSanitizeRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
-	return p.appendRule(stage, ParameterSupportSanitize, handler)
-}
-
-func (p VLLMParameter) withForceRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
-	return p.appendRule(stage, ParameterSupportForce, handler)
 }
 
 func stripEmptyToolsAndToolChoice(ctx *RequestFilterContext, _ VLLMParameter) error {
