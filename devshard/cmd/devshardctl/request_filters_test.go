@@ -804,7 +804,7 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 		{
 			name: "json object response format",
 			body: `{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "json_object",
+			want: "response_format",
 		},
 		{
 			name: "guided regex",
@@ -819,7 +819,12 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 		{
 			name: "json schema response format",
 			body: `{"response_format":{"type":"json_schema"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "json_schema",
+			want: "response_format",
+		},
+		{
+			name: "nested json schema response format",
+			body: `{"response_format":{"json_schema":{"name":"r","schema":{"type":"object"}}},"messages":[{"role":"user","content":"hello"}]}`,
+			want: "response_format",
 		},
 		{
 			name: "guided json",
@@ -886,18 +891,6 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
 		})
 	}
-}
-
-func TestNormalizeChatRequestKeepsTextResponseFormat(t *testing.T) {
-	body, _, err := normalizeChatRequest([]byte(`{
-		"response_format": {"type": "text"},
-		"messages": [{"role": "user", "content": "hello"}]
-	}`))
-	require.NoError(t, err)
-
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(body, &raw))
-	require.Equal(t, map[string]any{"type": "text"}, raw["response_format"])
 }
 
 func TestNormalizeChatRequestRejectsMalformedMessages(t *testing.T) {

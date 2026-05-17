@@ -421,9 +421,6 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("chat_template_kwargs", ParameterCategoryObject),
 		newParameter("tool_choice", ParameterCategoryString).
 			withRejectRule(RequestFilterStagePreValidation, RejectStringValueParameterHandler{Value: "required", Message: unsupportedChatParameterMessage("tool_choice=required")}),
-		newParameter("response_format", ParameterCategoryObject).
-			withRejectRule(RequestFilterStagePreValidation, RejectNestedStringValueParameterHandler{Parent: "response_format", Field: "type", Value: "json_object", Message: unsupportedChatParameterMessage("response_format.type=json_object")}).
-			withRejectRule(RequestFilterStagePreValidation, RejectNestedStringValueParameterHandler{Parent: "response_format", Field: "type", Value: "json_schema", Message: unsupportedChatParameterMessage("response_format.type=json_schema")}),
 		newParameter("min_tokens", ParameterCategoryIntRange).
 			withConditionalStripRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
 				Predicate: func(ctx *RequestFilterContext) bool {
