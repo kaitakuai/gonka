@@ -24,11 +24,12 @@ var (
 // elsewhere). Tools whose `function.parameters` field is absent or non-object are
 // skipped -- they are nominally allowed by the OpenAI spec (parameter-less tools).
 type ToolsValidator struct {
-	MaxDepth  int
-	MaxSize   int
-	MaxNodes  int
-	MaxBranch int
-	MaxEnum   int
+	MaxDepth      int
+	MaxSize       int
+	MaxNodes      int
+	MaxBranch     int
+	MaxEnum       int
+	MaxPatternLen int
 }
 
 func (v ToolsValidator) Validate(document map[string]any) error {
@@ -41,11 +42,12 @@ func (v ToolsValidator) Validate(document map[string]any) error {
 		return fmt.Errorf("%w: must be an array", ErrToolsShape)
 	}
 	bounds := SchemaBounds{
-		MaxDepth:  v.MaxDepth,
-		MaxSize:   v.MaxSize,
-		MaxNodes:  v.MaxNodes,
-		MaxBranch: v.MaxBranch,
-		MaxEnum:   v.MaxEnum,
+		MaxDepth:      v.MaxDepth,
+		MaxSize:       v.MaxSize,
+		MaxNodes:      v.MaxNodes,
+		MaxBranch:     v.MaxBranch,
+		MaxEnum:       v.MaxEnum,
+		MaxPatternLen: v.MaxPatternLen,
 	}
 	for i, item := range arr {
 		tool, ok := item.(map[string]any)

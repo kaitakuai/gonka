@@ -957,6 +957,66 @@ func TestNormalizeChatRequestEnforcesListCaps(t *testing.T) {
 	}
 }
 
+func TestNormalizeChatRequestEnforcesMessagesCountCap(t *testing.T) {
+	// Build a body with 2049 minimal valid user messages -- one over the cap.
+	var b strings.Builder
+	b.WriteString(`{"messages":[`)
+	for i := 0; i < 2049; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"role":"user","content":"hi"}`)
+	}
+	b.WriteString(`]}`)
+
+	_, _, err := normalizeChatRequest([]byte(b.String()))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "messages")
+	require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+}
+
+func TestNormalizeChatRequestAcceptsMessagesAtCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"messages":[`)
+	for i := 0; i < 2048; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"role":"user","content":"hi"}`)
+	}
+	b.WriteString(`]}`)
+
+	_, _, err := normalizeChatRequest([]byte(b.String()))
+	require.NoError(t, err)
+}
+
+func TestNormalizeChatRequestValidatesSeed(t *testing.T) {
+	t.Run("accepts non-negative integer", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":42,"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+	})
+	t.Run("accepts absent seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+	})
+	t.Run("rejects negative seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":-5,"messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "seed")
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+	t.Run("rejects float seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":3.14,"messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "seed")
+	})
+	t.Run("rejects string seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":"42","messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "seed")
+	})
+}
+
 func TestNormalizeChatRequestEnforcesLogitBiasMapCap(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(`{"logit_bias":{`)

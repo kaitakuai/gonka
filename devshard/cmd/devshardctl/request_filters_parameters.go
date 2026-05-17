@@ -235,6 +235,24 @@ func (h ClampUintToFieldParameterHandler) Apply(ctx *RequestFilterContext, param
 	return nil
 }
 
+// ValidateUintParameterHandler rejects the request if the field is present but its value
+// cannot be parsed as a non-negative integer that fits in uint64. Pass-through when the
+// field is absent. Used for fields like `seed` where vLLM expects a uint64 and we want to
+// catch garbage types at the gateway boundary rather than relying on the upstream's error
+// path.
+type ValidateUintParameterHandler struct{}
+
+func (h ValidateUintParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
+	raw, exists := ctx.Document.Get(parameter.Name)
+	if !exists || raw == nil {
+		return nil
+	}
+	if _, ok := numericJSONValueAsUint64(raw); !ok {
+		return badChatRequest("%s: must be a non-negative integer", parameter.Name)
+	}
+	return nil
+}
+
 // LengthCapListParameterHandler bounds the number of entries in a JSON array, and
 // optionally the byte length of each string entry. Used for fields like `stop`,
 // `stop_token_ids`, and `bad_words` -- vLLM scans every entry against every generated
@@ -538,10 +556,12 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 	parameters := []VLLMParameter{
 		newParameter("model"),
 		newParameter("stream"),
-		newParameter("messages"),
+		newParameter("messages").
+			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 2048}),
 		newParameter("max_tokens"),
 		newParameter("max_completion_tokens"),
-		newParameter("seed"),
+		newParameter("seed").
+			withRule(RequestFilterStagePreValidation, ValidateUintParameterHandler{}),
 		newParameter("skip_special_tokens"),
 		newParameter("detokenize"),
 		newParameter("n").
@@ -595,11 +615,12 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}).
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ToolsValidator{
-					MaxDepth:  5,
-					MaxSize:   16 * 1024,
-					MaxNodes:  128,
-					MaxBranch: 16,
-					MaxEnum:   256,
+					MaxDepth:      5,
+					MaxSize:       16 * 1024,
+					MaxNodes:      128,
+					MaxBranch:     16,
+					MaxEnum:       256,
+					MaxPatternLen: 512,
 				},
 			}),
 		newParameter("logprobs").
@@ -609,12 +630,13 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("response_format").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ResponseFormatValidator{
-					MaxDepth:   5,
-					MaxSize:    16 * 1024,
-					MaxNodes:   128,
-					MaxBranch:  16,
-					MaxEnum:    256,
-					MaxNameLen: 64,
+					MaxDepth:      5,
+					MaxSize:       16 * 1024,
+					MaxNodes:      128,
+					MaxBranch:     16,
+					MaxEnum:       256,
+					MaxNameLen:    64,
+					MaxPatternLen: 512,
 				},
 			}),
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 )
 
 // Schema-bounds sentinels. Returned by SchemaBounds.Walk / SchemaBounds.CheckSize and by
@@ -12,13 +13,27 @@ import (
 // "chat_template_kwargs") so the user-facing message points at the offending field while
 // errors.Is keeps working for the rejection category.
 var (
-	ErrSchemaDepth  = errors.New("nesting depth exceeded")
-	ErrSchemaNodes  = errors.New("node count exceeded")
-	ErrSchemaSize   = errors.New("serialized size exceeded")
-	ErrSchemaRef    = errors.New("schema reference keyword is forbidden")
-	ErrSchemaEnum   = errors.New("enum size exceeded")
-	ErrSchemaBranch = errors.New("schema branch arms exceeded")
+	ErrSchemaDepth   = errors.New("nesting depth exceeded")
+	ErrSchemaNodes   = errors.New("node count exceeded")
+	ErrSchemaSize    = errors.New("serialized size exceeded")
+	ErrSchemaRef     = errors.New("schema reference keyword is forbidden")
+	ErrSchemaEnum    = errors.New("enum size exceeded")
+	ErrSchemaBranch  = errors.New("schema branch arms exceeded")
+	ErrSchemaType    = errors.New("schema type is not a valid JSON-Schema primitive")
+	ErrSchemaPattern = errors.New("schema pattern is not a valid regular expression")
 )
+
+// validSchemaTypes lists the JSON Schema primitive type names. Anything else (e.g.
+// "something") crashes xgrammar's C++ grammar compiler -- see CVE-2025-48944.
+var validSchemaTypes = map[string]struct{}{
+	"string":  {},
+	"number":  {},
+	"integer": {},
+	"object":  {},
+	"boolean": {},
+	"array":   {},
+	"null":    {},
+}
 
 // SchemaBounds enforces the structural bounds that keep a JSON-Schema payload from
 // exploding vLLM's grammar compiler. It is the JSON-Schema-aware walker reused by both
@@ -30,6 +45,11 @@ type SchemaBounds struct {
 	MaxNodes  int
 	MaxBranch int // anyOf / oneOf / allOf array arms
 	MaxEnum   int // enum entries
+	// MaxPatternLen caps the byte length of any `pattern` regex string before we try to
+	// compile it. 0 disables both the length check AND the compile-check. Set to a small
+	// positive value (e.g. 512) to defuse CVE-2025-48944-class crashes where an unclosed
+	// regex (`{`, `(`) kills vLLM's regex engine.
+	MaxPatternLen int
 }
 
 // Walk recursively traverses the schema, enforcing depth/nodes/branch/enum bounds and the
@@ -77,6 +97,12 @@ func (b SchemaBounds) walk(schema any, depth int, nodes *int) error {
 	}
 	if enum, ok := obj["enum"].([]any); ok && len(enum) > b.MaxEnum {
 		return fmt.Errorf("%w: limit %d", ErrSchemaEnum, b.MaxEnum)
+	}
+	if err := validateSchemaTypeField(obj); err != nil {
+		return err
+	}
+	if err := b.validateSchemaPatternField(obj); err != nil {
+		return err
 	}
 	for _, branchKey := range branchSchemaKeys {
 		if arr, ok := obj[branchKey].([]any); ok && len(arr) > b.MaxBranch {
@@ -164,6 +190,65 @@ func (b ObjectBounds) walk(value any, depth int, nodes *int) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validateSchemaTypeField rejects schema nodes whose `type` is not a JSON-Schema primitive
+// (`string`, `number`, `integer`, `object`, `boolean`, `array`, `null`) or an array of
+// primitives. Anything else (e.g. `type: "something"`) crashes xgrammar's C++ grammar
+// compiler -- see CVE-2025-48944. Schemas that omit `type` entirely are fine; this only
+// rejects an explicitly bad value.
+func validateSchemaTypeField(obj map[string]any) error {
+	raw, present := obj["type"]
+	if !present {
+		return nil
+	}
+	switch typed := raw.(type) {
+	case string:
+		if _, ok := validSchemaTypes[typed]; !ok {
+			return fmt.Errorf("%w: %q", ErrSchemaType, typed)
+		}
+	case []any:
+		for _, v := range typed {
+			s, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("%w: array elements must be strings", ErrSchemaType)
+			}
+			if _, ok := validSchemaTypes[s]; !ok {
+				return fmt.Errorf("%w: %q", ErrSchemaType, s)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: must be a string or array of strings", ErrSchemaType)
+	}
+	return nil
+}
+
+// validateSchemaPatternField rejects schema nodes whose `pattern` exceeds MaxPatternLen
+// or fails to compile as a Go regular expression. The compile step catches the
+// CVE-2025-48944 case where `pattern: "{"` (unclosed group) crashes vLLM's regex engine
+// at grammar-compile time. Go's RE2 is more permissive than xgrammar's engine, so a Go
+// compile success does not *guarantee* xgrammar success -- but a Go failure DOES guarantee
+// xgrammar failure for the same syntactic shape, which is what defuses the documented CVE.
+// Skipped entirely when MaxPatternLen == 0.
+func (b SchemaBounds) validateSchemaPatternField(obj map[string]any) error {
+	if b.MaxPatternLen <= 0 {
+		return nil
+	}
+	raw, present := obj["pattern"]
+	if !present {
+		return nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return fmt.Errorf("%w: must be a string", ErrSchemaPattern)
+	}
+	if len(s) > b.MaxPatternLen {
+		return fmt.Errorf("%w: length %d exceeds limit %d", ErrSchemaPattern, len(s), b.MaxPatternLen)
+	}
+	if _, err := regexp.Compile(s); err != nil {
+		return fmt.Errorf("%w: %v", ErrSchemaPattern, err)
 	}
 	return nil
 }

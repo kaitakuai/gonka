@@ -26,6 +26,7 @@ func TestChatTemplateKwargsValidatorAccepts(t *testing.T) {
 		{name: "empty object", body: `{"chat_template_kwargs":{}}`},
 		{name: "kimi thinking shape", body: `{"chat_template_kwargs":{"thinking":true}}`},
 		{name: "qwen enable_thinking + preserve", body: `{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":false}}`},
+		{name: "add_generation_prompt is allowed", body: `{"chat_template_kwargs":{"add_generation_prompt":true}}`},
 		{name: "nested at depth limit", body: `{"chat_template_kwargs":` + nestedObjectChain(5) + `}`},
 		{name: "array of strings", body: `{"chat_template_kwargs":{"tags":["a","b","c"]}}`},
 	}
@@ -50,6 +51,17 @@ func TestChatTemplateKwargsValidatorRejects(t *testing.T) {
 		{name: "deep recursion attack", body: `{"chat_template_kwargs":` + nestedObjectChain(200) + `}`, wantErr: ErrSchemaDepth},
 		{name: "node count exceeds limit", body: `{"chat_template_kwargs":` + flatPropertiesObject(200) + `}`, wantErr: ErrSchemaNodes},
 		{name: "size exceeds limit", body: `{"chat_template_kwargs":{"x":"` + strings.Repeat("a", 17*1024) + `"}}`, wantErr: ErrSchemaSize},
+		// CVE-2025-61620: Jinja template smuggling via chat_template key
+		{name: "forbidden chat_template key", body: `{"chat_template_kwargs":{"chat_template":"{% for x in range(99999) %}{% endfor %}"}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		// CVE-2025-62426: synchronous tokenization stalls handler
+		{name: "forbidden tokenize key", body: `{"chat_template_kwargs":{"tokenize":true}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		// Other positional-arg overrides
+		{name: "forbidden tools key", body: `{"chat_template_kwargs":{"tools":[]}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		{name: "forbidden documents key", body: `{"chat_template_kwargs":{"documents":[]}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		{name: "forbidden conversation key", body: `{"chat_template_kwargs":{"conversation":[]}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		{name: "forbidden continue_final_message", body: `{"chat_template_kwargs":{"continue_final_message":true}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		{name: "forbidden max_length", body: `{"chat_template_kwargs":{"max_length":1024}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
+		{name: "forbidden alongside legit", body: `{"chat_template_kwargs":{"thinking":true,"chat_template":"bomb"}}`, wantErr: ErrChatTemplateKwargsForbiddenKey},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

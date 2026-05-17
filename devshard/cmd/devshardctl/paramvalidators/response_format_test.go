@@ -11,12 +11,13 @@ import (
 
 func defaultResponseFormatValidator() ResponseFormatValidator {
 	return ResponseFormatValidator{
-		MaxDepth:   5,
-		MaxSize:    16 * 1024,
-		MaxNodes:   128,
-		MaxBranch:  16,
-		MaxEnum:    256,
-		MaxNameLen: 64,
+		MaxDepth:      5,
+		MaxSize:       16 * 1024,
+		MaxNodes:      128,
+		MaxBranch:     16,
+		MaxEnum:       256,
+		MaxNameLen:    64,
+		MaxPatternLen: 512,
 	}
 }
 
@@ -45,6 +46,10 @@ func TestResponseFormatValidatorAccepts(t *testing.T) {
 		{name: "json_schema with anyOf at branch limit", body: jsonSchemaResponseFormatBody(`{"anyOf":[` + strings.Repeat(`{"type":"string"},`, 15) + `{"type":"string"}]}`)},
 		{name: "json_schema with enum at limit", body: jsonSchemaResponseFormatBody(bigEnumSchema(256))},
 		{name: "json_schema name with dots dashes underscores", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"abc_DEF-1.2","schema":{"type":"object"}}}}`},
+		// type can be an array of primitives (JSON Schema draft 6+); accept that shape.
+		{name: "schema type as array of primitives", body: jsonSchemaResponseFormatBody(`{"type":["string","null"]}`)},
+		// A reasonable regex pattern under the length cap compiles and is accepted.
+		{name: "schema with valid pattern", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":"^[a-zA-Z0-9_-]+$"}`)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,6 +103,17 @@ func TestResponseFormatValidatorRejects(t *testing.T) {
 		{name: "ref hidden under not", body: jsonSchemaResponseFormatBody(`{"not":{"$ref":"#/x"}}`), wantErr: ErrResponseFormatRef},
 		{name: "ref hidden under dependentSchemas", body: jsonSchemaResponseFormatBody(`{"dependentSchemas":{"x":{"$ref":"#/y"}}}`), wantErr: ErrResponseFormatRef},
 		{name: "defs hidden under then", body: jsonSchemaResponseFormatBody(`{"then":{"$defs":{"x":{}}}}`), wantErr: ErrResponseFormatRef},
+		// CVE-2025-48944: bad `type` value crashes xgrammar's C++ grammar compiler.
+		{name: "bad schema type string", body: jsonSchemaResponseFormatBody(`{"type":"something"}`), wantErr: ErrSchemaType},
+		{name: "bad schema type array entry", body: jsonSchemaResponseFormatBody(`{"type":["string","weird"]}`), wantErr: ErrSchemaType},
+		{name: "bad schema type bool", body: jsonSchemaResponseFormatBody(`{"type":true}`), wantErr: ErrSchemaType},
+		{name: "bad schema type nested", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"x":{"type":"not_a_type"}}}`), wantErr: ErrSchemaType},
+		// CVE-2025-48944: unclosed regex crashes the regex compiler before vLLM rejects.
+		{name: "bad pattern unclosed group", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":"("}`), wantErr: ErrSchemaPattern},
+		{name: "bad pattern unclosed char class", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":"["}`), wantErr: ErrSchemaPattern},
+		{name: "bad pattern not string", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":42}`), wantErr: ErrSchemaPattern},
+		{name: "bad pattern too long", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":"` + strings.Repeat("a", 513) + `"}`), wantErr: ErrSchemaPattern},
+		{name: "bad pattern nested", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"x":{"type":"string","pattern":"["}}}`), wantErr: ErrSchemaPattern},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -9,11 +9,12 @@ import (
 
 func defaultToolsValidator() ToolsValidator {
 	return ToolsValidator{
-		MaxDepth:  5,
-		MaxSize:   16 * 1024,
-		MaxNodes:  128,
-		MaxBranch: 16,
-		MaxEnum:   256,
+		MaxDepth:      5,
+		MaxSize:       16 * 1024,
+		MaxNodes:      128,
+		MaxBranch:     16,
+		MaxEnum:       256,
+		MaxPatternLen: 512,
 	}
 }
 
@@ -62,6 +63,8 @@ func TestToolsValidatorRejects(t *testing.T) {
 		{name: "enum exceeds in tool", body: `{"tools":[` + toolWithParams(bigEnumSchema(257)) + `]}`, wantErr: ErrSchemaEnum},
 		// Second tool is the bad one -- verifies we walk every element, not just the first.
 		{name: "rejects bad schema in second tool", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"$ref":"#/x"}`) + `]}`, wantErr: ErrSchemaRef},
+		// CVE-2025-48944: same xgrammar / regex crash class on the tools schema path.
+		{name: "bad type in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"something"}`) + `]}`, wantErr: ErrSchemaType},		{name: "bad pattern in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"string","pattern":"("}`) + `]}`, wantErr: ErrSchemaPattern},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

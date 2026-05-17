@@ -39,12 +39,13 @@ var (
 // breadth, schema $refs) can crash the upstream grammar compiler, so any violation must
 // reject the request before it leaves the gateway.
 type ResponseFormatValidator struct {
-	MaxDepth   int
-	MaxSize    int
-	MaxNodes   int
-	MaxBranch  int
-	MaxEnum    int
-	MaxNameLen int
+	MaxDepth      int
+	MaxSize       int
+	MaxNodes      int
+	MaxBranch     int
+	MaxEnum       int
+	MaxNameLen    int
+	MaxPatternLen int
 }
 
 var responseFormatNameRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
@@ -123,11 +124,12 @@ func (v ResponseFormatValidator) validateJSONSchemaWrapper(rf map[string]any) er
 		return fmt.Errorf("%w: must be an object", ErrResponseFormatSchemaShape)
 	}
 	bounds := SchemaBounds{
-		MaxDepth:  v.MaxDepth,
-		MaxSize:   v.MaxSize,
-		MaxNodes:  v.MaxNodes,
-		MaxBranch: v.MaxBranch,
-		MaxEnum:   v.MaxEnum,
+		MaxDepth:      v.MaxDepth,
+		MaxSize:       v.MaxSize,
+		MaxNodes:      v.MaxNodes,
+		MaxBranch:     v.MaxBranch,
+		MaxEnum:       v.MaxEnum,
+		MaxPatternLen: v.MaxPatternLen,
 	}
 	// Walk first so depth/nodes/breadth attacks bail out without ever paying for json.Marshal
 	// inside CheckSize. json.Marshal is O(input size) and would otherwise serialize an
