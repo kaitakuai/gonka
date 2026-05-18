@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -744,6 +745,12 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			want: "custom_param",
 		},
 		{
+			// JSON accepts "" as a key; the whitelist rejects it with a dedicated message
+			name: "empty string key",
+			body: `{"":"slip","messages":[{"role":"user","content":"hello"}]}`,
+			want: "field with an empty name",
+		},
+		{
 			name: "enforced tokens",
 			body: `{"enforced_tokens":["x"],"messages":[{"role":"user","content":"hello"}]}`,
 			want: "enforced_tokens",
@@ -1238,6 +1245,48 @@ func TestNormalizeChatRequestRejectsBodyAtNestingLimit(t *testing.T) {
 	_, _, err := normalizeChatRequest([]byte(body))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "request nesting depth exceeds limit")
+}
+
+// Regression guard for the document mutex: without proper locking this trips
+// Go's fatal "concurrent map writes" or the race detector.
+func TestChatRequestDocumentConcurrentAccess(t *testing.T) {
+	doc, err := decodeChatRequestDocument([]byte(`{"a":1,"b":2,"c":3}`))
+	require.NoError(t, err)
+
+	const workers = 32
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(id int) {
+			defer wg.Done()
+			key := "k" + strconv.Itoa(id)
+			for i := 0; i < iterations; i++ {
+				doc.Set(key, i)
+				_, _ = doc.Get(key)
+				_ = doc.Has("a")
+				_, _ = doc.String("missing")
+				switch i % 4 {
+				case 0:
+					_ = doc.Keys()
+				case 1:
+					_, _ = doc.Marshal()
+				case 2:
+					doc.RLockedScope(func(raw map[string]any) {
+						for range raw {
+						}
+					})
+				case 3:
+					doc.LockedScope(func(raw map[string]any) {
+						raw["shared"] = i
+					})
+				}
+			}
+			doc.Delete(key)
+		}(w)
+	}
+	wg.Wait()
 }
 
 // End-to-end coverage that the four OpenAI Chat Completions observability fields survive

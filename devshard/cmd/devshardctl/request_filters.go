@@ -92,7 +92,7 @@ func (p ChatRequestPipeline) Normalize(body []byte, adminAuthenticated bool, lim
 	if err := p.parameters.Apply(RequestFilterStagePreValidation, ctx); err != nil {
 		return nil, chatRequest{}, err
 	}
-	if err := p.messages.ValidateDocument(ctx.Document); err != nil {
+	if err := p.messages.ValidateDocument(&ctx.Document); err != nil {
 		return nil, chatRequest{}, err
 	}
 	if err := ctx.DecodeRequest(); err != nil {
@@ -120,7 +120,7 @@ func (p ChatRequestPipeline) ApplyModelOverrides(body []byte, req chatRequest, m
 	if err != nil {
 		return nil, chatRequest{}, err
 	}
-	translateKimiThinkingForVLLM(ctx.Document.raw)
+	ctx.Document.LockedScope(translateKimiThinkingForVLLM)
 	updatedBody, err := ctx.Document.Marshal()
 	if err != nil {
 		return nil, chatRequest{}, err

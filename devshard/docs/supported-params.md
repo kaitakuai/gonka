@@ -274,19 +274,19 @@ Calibrate the thresholds (depth, size, nodes) by running the validators against 
 
 ## Performance characteristics
 
-End-to-end `normalizeChatRequest` (Apple M2 Pro, `-benchtime=2s`):
+End-to-end `normalizeChatRequest` (Apple M2 Pro, `-benchtime=2s`, `-count=3`):
 
 | Body | ns/op | B/op | allocs/op |
 | --- | --- | --- | --- |
-| Minimal (47 B) | 2,958 | 2,450 | 43 |
-| Typical (132 B) | 4,488 | 2,947 | 67 |
-| Heavy (~620 B) | 20,087 | 13,090 | 242 |
-| WithResponseFormat (279 B) | 10,746 | 6,776 | 139 |
-| RejectedUnknown (72 B) | 1,916 | 2,170 | 36 |
-| **RejectedDeepBody (7.5 KiB body-depth attack)** | **1,066** | **96** | **2** |
-| RejectedRecursiveSchema (walker reject) | 8,178 | 7,944 | 102 |
+| Minimal (47 B) | 3,140 | 2,428 | 41 |
+| Typical (132 B) | 4,963 | 2,926 | 65 |
+| Heavy (~620 B) | 21,054 | 12,951 | 240 |
+| WithResponseFormat (279 B) | 10,372 | 6,663 | 137 |
+| RejectedUnknown (72 B) | 1,948 | 2,148 | 34 |
+| **RejectedDeepBody (7.5 KiB body-depth attack)** | **1,093** | **96** | **2** |
+| RejectedRecursiveSchema (walker reject) | 8,147 | 7,928 | 100 |
 
-`Heavy` now also carries `chat_template_kwargs` so `ChatTemplateKwargsValidator` is exercised end-to-end. `RejectedDeepBody` measures the body-level pre-scan rejection (depth > 32, never reaches the walker); `RejectedRecursiveSchema` measures the walker rejection on bodies that pass the pre-scan but trip `MaxDepth=5` — that path is ~8× more expensive because it pays for `json.Unmarshal` first.
+`Heavy` carries `chat_template_kwargs` so `ChatTemplateKwargsValidator` runs. `RejectedDeepBody` trips the body-level pre-scan (depth > 32) before any validator. `RejectedRecursiveSchema` reaches the walker (body depth under cap, schema depth over `MaxDepth=5`) and pays for `json.Unmarshal` — ~8× more expensive than pre-scan reject.
 
 `response_format` validator in isolation (`paramvalidators/response_format_bench_test.go`):
 
@@ -294,12 +294,12 @@ End-to-end `normalizeChatRequest` (Apple M2 Pro, `-benchtime=2s`):
 | --- | --- | --- | --- |
 | Absent | 8.7 | 0 | 0 |
 | `type=text` / `json_object` | ~18 | 0 | 0 |
-| Simple schema | 1,763 | 640 | 19 |
-| At limits (~121 nodes) | 55,895 | 24,701 | 724 |
-| Rejects recursion attack | 1,259 | 176 | 4 |
-| Rejects oversized schema | 19,889 | 19,023 | 17 |
+| Simple schema | 1,763 | 536 | 19 |
+| At limits (~121 nodes) | 56,734 | 21,252 | 724 |
+| Rejects recursion attack | 1,215 | 176 | 4 |
+| Rejects oversized schema | 17,402 | 514 | 17 |
 
-The walker `Rejects recursion attack` cost grew from ~560 ns to ~1.3 µs after CVE-2025-48944 type/pattern checks were added on every visited node. Still well under any latency budget.
+`CheckSize` switched from `json.Marshal(schema)` to `json.NewEncoder` over a counting `io.Writer`: same byte total, no marshaled buffer allocation. Saves -14% B/op on `At limits` and -97% on `Rejects oversized` (the 17 KiB schema no longer materializes).
 
 Bench files: `request_filters_bench_test.go` (pipeline-level) and `paramvalidators/response_format_bench_test.go` (validator-level).
 
