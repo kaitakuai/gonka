@@ -593,6 +593,32 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					MaxPatternLen: 512,
 				},
 			}),
+		// OpenAI Chat Completions standard observability fields. No inference-side
+		// semantics on the vLLM upstream; clients send them for end-user tracking,
+		// distributed tracing, agent control, and streaming token accounting.
+		// `user`: type-checked and byte-capped at the gateway boundary so a non-string
+		// payload (number, object, …) and an over-long string are caught early instead
+		// of being forwarded as a no-op carrier under the 10 MiB body cap.
+		newParameter("user").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.UserValidator{},
+			}),
+		newParameter("parallel_tool_calls"),
+		// metadata: OpenAI bounds it to 16 keys × 64-char keys × 512-char string values;
+		// we enforce the same bounds at the gateway boundary as a free defensive cap.
+		newParameter("metadata").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.MetadataValidator{},
+			}),
+		// stream_options: sub-field whitelist. Only `include_usage` survives;
+		// `continuous_usage_stats` is stripped to neutralize vLLM-project/vllm#9028
+		// (per-chunk usage counter is wrong under chunked prefill), and any other /
+		// future sub-field is default-stripped. If nothing remains the field is dropped
+		// so the upstream does not receive an empty `{}` object.
+		newParameter("stream_options").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.StreamOptionsValidator{},
+			}),
 		newParameter("logprobs").
 			withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
 		newParameter("top_logprobs").
