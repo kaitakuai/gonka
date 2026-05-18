@@ -32,10 +32,19 @@ type outputTokenLimits struct {
 type chatRequestFilterError struct {
 	status  int
 	message string
+	wrapped error
 }
 
 func (e *chatRequestFilterError) Error() string {
 	return e.message
+}
+
+// Unwrap exposes the underlying error so callers can use errors.Is/errors.As to identify
+// the rejection class even though the outer error carries an HTTP status. This lets pure
+// validators in subpackages (filters_parameters/...) define sentinel errors and have them
+// remain detectable after passing through the badChatRequest wrapper.
+func (e *chatRequestFilterError) Unwrap() error {
+	return e.wrapped
 }
 
 func chatRequestErrorStatus(err error, fallback int) int {
@@ -50,6 +59,16 @@ func badChatRequest(format string, args ...any) error {
 	return &chatRequestFilterError{
 		status:  http.StatusBadRequest,
 		message: fmt.Sprintf(format, args...),
+	}
+}
+
+// wrapBadChatRequest preserves the error chain (so errors.Is/As works) while attaching the
+// HTTP 400 status that the gateway uses for rejection.
+func wrapBadChatRequest(err error) error {
+	return &chatRequestFilterError{
+		status:  http.StatusBadRequest,
+		message: err.Error(),
+		wrapped: err,
 	}
 }
 

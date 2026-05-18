@@ -1,0 +1,88 @@
+package paramvalidators
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func defaultToolsValidator() ToolsValidator {
+	return ToolsValidator{
+		MaxDepth:      5,
+		MaxSize:       16 * 1024,
+		MaxNodes:      128,
+		MaxBranch:     16,
+		MaxEnum:       256,
+		MaxPatternLen: 512,
+	}
+}
+
+func toolWithParams(schema string) string {
+	return `{"type":"function","function":{"name":"x","description":"x","parameters":` + schema + `}}`
+}
+
+func TestToolsValidatorAccepts(t *testing.T) {
+	v := defaultToolsValidator()
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "absent", body: `{"messages":[]}`},
+		{name: "empty array", body: `{"tools":[]}`},
+		{name: "parameter-less tool with name", body: `{"tools":[{"type":"function","function":{"name":"x"}}]}`},
+		{name: "simple parameters", body: `{"tools":[` + toolWithParams(`{"type":"object","properties":{"city":{"type":"string"}}}`) + `]}`},
+		{name: "two tools both valid", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"type":"object","properties":{"x":{"type":"number"}}}`) + `]}`},
+		{name: "parameters at depth limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(5)) + `]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := parseDocument(t, tt.body)
+			require.NoError(t, v.Validate(doc))
+		})
+	}
+}
+
+func TestToolsValidatorRejects(t *testing.T) {
+	v := defaultToolsValidator()
+	tests := []struct {
+		name    string
+		body    string
+		wantErr error
+	}{
+		{name: "tools is object", body: `{"tools":{"x":1}}`, wantErr: ErrToolsShape},
+		{name: "tools element is not object", body: `{"tools":["x"]}`, wantErr: ErrToolShape},
+		// OpenAI tool contract: type must declare "function".
+		{name: "type missing", body: `{"tools":[{"function":{"name":"x"}}]}`, wantErr: ErrToolFunctionType},
+		{name: "type not a string", body: `{"tools":[{"type":1,"function":{"name":"x"}}]}`, wantErr: ErrToolFunctionType},
+		{name: "type unknown value", body: `{"tools":[{"type":"plugin","function":{"name":"x"}}]}`, wantErr: ErrToolFunctionType},
+		// function payload required.
+		{name: "function missing", body: `{"tools":[{"type":"function"}]}`, wantErr: ErrToolFunctionShape},
+		{name: "function not an object", body: `{"tools":[{"type":"function","function":"x"}]}`, wantErr: ErrToolFunctionShape},
+		// function.name required.
+		{name: "function name missing", body: `{"tools":[{"type":"function","function":{}}]}`, wantErr: ErrToolFunctionName},
+		{name: "function name empty", body: `{"tools":[{"type":"function","function":{"name":""}}]}`, wantErr: ErrToolFunctionName},
+		{name: "function name not a string", body: `{"tools":[{"type":"function","function":{"name":42}}]}`, wantErr: ErrToolFunctionName},
+		{name: "depth exceeds limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(6)) + `]}`, wantErr: ErrSchemaDepth},
+		{name: "deep recursion attack hidden in tool", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(200)) + `]}`, wantErr: ErrSchemaDepth},
+		{name: "ref hidden in tool parameters", body: `{"tools":[` + toolWithParams(`{"$ref":"#/foo"}`) + `]}`, wantErr: ErrSchemaRef},
+		{name: "ref hidden under if in tool", body: `{"tools":[` + toolWithParams(`{"if":{"$ref":"#/x"}}`) + `]}`, wantErr: ErrSchemaRef},
+		{name: "node count exceeds in tool", body: `{"tools":[` + toolWithParams(manyPropertiesSchema(200)) + `]}`, wantErr: ErrSchemaNodes},
+		{name: "size exceeds in tool", body: `{"tools":[` + toolWithParams(`{"type":"object","properties":{"`+strings.Repeat("a", 17*1024)+`":{"type":"string"}}}`) + `]}`, wantErr: ErrSchemaSize},
+		{name: "anyOf exceeds in tool", body: `{"tools":[` + toolWithParams(`{"anyOf":[`+strings.Repeat(`{"type":"string"},`, 16)+`{"type":"string"}]}`) + `]}`, wantErr: ErrSchemaBranch},
+		{name: "enum exceeds in tool", body: `{"tools":[` + toolWithParams(bigEnumSchema(257)) + `]}`, wantErr: ErrSchemaEnum},
+		// Second tool is the bad one -- verifies we walk every element, not just the first.
+		{name: "rejects bad schema in second tool", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"$ref":"#/x"}`) + `]}`, wantErr: ErrSchemaRef},
+		// CVE-2025-48944: same xgrammar / regex crash class on the tools schema path.
+		{name: "bad type in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"something"}`) + `]}`, wantErr: ErrSchemaType},
+		{name: "bad pattern in tool parameters", body: `{"tools":[` + toolWithParams(`{"type":"string","pattern":"("}`) + `]}`, wantErr: ErrSchemaPattern},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := parseDocument(t, tt.body)
+			err := v.Validate(doc)
+			require.Error(t, err)
+			require.ErrorIs(t, err, tt.wantErr)
+		})
+	}
+}

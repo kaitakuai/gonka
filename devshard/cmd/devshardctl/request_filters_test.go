@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -356,42 +357,6 @@ func TestNormalizeChatRequestKeepsToolChoiceAutoWithTools(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &raw))
 	require.Equal(t, "auto", raw["tool_choice"])
 	require.Contains(t, raw, "tools")
-}
-
-func TestNormalizeChatRequestRejectsUnsupportedVLLMParameters(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{name: "beam search", body: `{"use_beam_search":true,"messages":[{"role":"user","content":"hello"}]}`, want: "use_beam_search"},
-		{name: "truncate prompt tokens", body: `{"truncate_prompt_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, want: "truncate_prompt_tokens"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := normalizeChatRequest([]byte(tt.body))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.want)
-		})
-	}
-}
-
-func TestNormalizeChatRequestRejectsContractViolatingVLLMParameters(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{name: "allowed token ids", body: `{"allowed_token_ids":[1,2,3],"messages":[{"role":"user","content":"hello"}]}`, want: "allowed_token_ids"},
-		{name: "ignore eos", body: `{"ignore_eos":true,"messages":[{"role":"user","content":"hello"}]}`, want: "ignore_eos"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := normalizeChatRequest([]byte(tt.body))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.want)
-		})
-	}
 }
 
 func TestNormalizeChatRequestStripsEmptyBadWords(t *testing.T) {
@@ -767,24 +732,6 @@ func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T
 	}
 }
 
-func TestNormalizeChatRequestRejectsUnsupportedPenaltyFields(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want string
-	}{
-		{name: "presence penalty", body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`, want: "presence_penalty"},
-		{name: "frequency penalty", body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`, want: "frequency_penalty"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := normalizeChatRequest([]byte(tt.body))
-			require.Error(t, err)
-			require.Contains(t, err.Error(), tt.want)
-		})
-	}
-}
-
 func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 	tests := []struct {
 		name string
@@ -802,11 +749,6 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			want: "enforced_tokens",
 		},
 		{
-			name: "json object response format",
-			body: `{"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "response_format",
-		},
-		{
 			name: "guided regex",
 			body: `{"guided_regex":"[a-z]+","messages":[{"role":"user","content":"hello"}]}`,
 			want: "guided_regex",
@@ -815,16 +757,6 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			name: "guided grammar",
 			body: `{"guided_grammar":"root ::= item","messages":[{"role":"user","content":"hello"}]}`,
 			want: "guided_grammar",
-		},
-		{
-			name: "json schema response format",
-			body: `{"response_format":{"type":"json_schema"},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "response_format",
-		},
-		{
-			name: "nested json schema response format",
-			body: `{"response_format":{"json_schema":{"name":"r","schema":{"type":"object"}}},"messages":[{"role":"user","content":"hello"}]}`,
-			want: "response_format",
 		},
 		{
 			name: "guided json",
@@ -891,6 +823,176 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
 		})
 	}
+}
+
+// Integration coverage that response_format is routed through the catalog rule and that pipeline
+// errors are translated into HTTP 400. Exhaustive validator behavior lives in
+// filters_parameters/response_format_test.go.
+func TestNormalizeChatRequestResponseFormatPipeline(t *testing.T) {
+	t.Run("accepts type text", func(t *testing.T) {
+		body, _, err := normalizeChatRequest([]byte(`{"response_format":{"type":"text"},"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"response_format"`)
+	})
+
+	t.Run("accepts json_schema with simple schema", func(t *testing.T) {
+		body, _, err := normalizeChatRequest([]byte(`{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":{"type":"object","properties":{"x":{"type":"string"}}}}},"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+		require.Contains(t, string(body), `"response_format"`)
+	})
+
+	t.Run("rejects unknown type with HTTP 400", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"response_format":{"type":"banana"},"messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "response_format")
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+
+	t.Run("rejects pathological recursive schema with HTTP 400", func(t *testing.T) {
+		deepSchema := `{"type":"object"}`
+		for i := 0; i < 200; i++ {
+			deepSchema = `{"type":"object","properties":{"x":` + deepSchema + `}}`
+		}
+		body := `{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":` + deepSchema + `}},"messages":[{"role":"user","content":"hello"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "depth")
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+}
+
+func TestNormalizeChatRequestEnforcesListCaps(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "stop too many entries",
+			body: `{"stop":[` + strings.Repeat(`"a",`, 16) + `"b"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "stop",
+		},
+		{
+			name: "stop entry too long",
+			body: `{"stop":["` + strings.Repeat("a", 257) + `"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "stop[0]",
+		},
+		{
+			name: "stop_token_ids too many entries",
+			body: `{"stop_token_ids":[` + strings.Repeat(`1,`, 64) + `2],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "stop_token_ids",
+		},
+		{
+			name: "bad_words too many entries",
+			body: `{"bad_words":[` + strings.Repeat(`"a",`, 64) + `"b"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "bad_words",
+		},
+		{
+			name: "bad_words entry too long",
+			body: `{"bad_words":["` + strings.Repeat("a", 129) + `"],"messages":[{"role":"user","content":"hello"}]}`,
+			want: "bad_words[0]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tt.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.want)
+			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+		})
+	}
+}
+
+func TestNormalizeChatRequestEnforcesMessagesCountCap(t *testing.T) {
+	// Build a body with 2049 minimal valid user messages -- one over the cap.
+	var b strings.Builder
+	b.WriteString(`{"messages":[`)
+	for i := 0; i < 2049; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"role":"user","content":"hi"}`)
+	}
+	b.WriteString(`]}`)
+
+	_, _, err := normalizeChatRequest([]byte(b.String()))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "messages")
+	require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+}
+
+func TestNormalizeChatRequestAcceptsMessagesAtCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"messages":[`)
+	for i := 0; i < 2048; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"role":"user","content":"hi"}`)
+	}
+	b.WriteString(`]}`)
+
+	_, _, err := normalizeChatRequest([]byte(b.String()))
+	require.NoError(t, err)
+}
+
+func TestNormalizeChatRequestValidatesSeed(t *testing.T) {
+	t.Run("accepts non-negative integer", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":42,"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+	})
+	t.Run("accepts absent seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"messages":[{"role":"user","content":"hello"}]}`))
+		require.NoError(t, err)
+	})
+	t.Run("rejects negative seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":-5,"messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "seed")
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+	t.Run("rejects float seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":3.14,"messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "seed")
+	})
+	t.Run("rejects string seed", func(t *testing.T) {
+		_, _, err := normalizeChatRequest([]byte(`{"seed":"42","messages":[{"role":"user","content":"hello"}]}`))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "seed")
+	})
+}
+
+func TestNormalizeChatRequestEnforcesLogitBiasMapCap(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"logit_bias":{`)
+	for i := 0; i < 1025; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"`)
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(`":1`)
+	}
+	b.WriteString(`},"messages":[{"role":"user","content":"hello"}]}`)
+
+	_, _, err := normalizeChatRequest([]byte(b.String()))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "logit_bias")
+	require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+}
+
+func TestNormalizeChatRequestAcceptsListCapsAtLimit(t *testing.T) {
+	t.Run("stop at exact entry limit", func(t *testing.T) {
+		body := `{"stop":[` + strings.TrimSuffix(strings.Repeat(`"a",`, 16), ",") + `],"messages":[{"role":"user","content":"hello"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.NoError(t, err)
+	})
+	t.Run("stop_token_ids at exact entry limit", func(t *testing.T) {
+		body := `{"stop_token_ids":[` + strings.TrimSuffix(strings.Repeat(`1,`, 64), ",") + `],"messages":[{"role":"user","content":"hello"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.NoError(t, err)
+	})
 }
 
 func TestNormalizeChatRequestRejectsMalformedMessages(t *testing.T) {
@@ -1081,4 +1183,59 @@ func TestPrepareChatRequestBodyAcceptsTenMiBBody(t *testing.T) {
 
 	_, _, err := prepareChatRequestBody(req)
 	require.NoError(t, err)
+}
+
+func TestEnsureRequestNestingDepth(t *testing.T) {
+	// nestedObjects produces `{"a":{"a":...}}` of the given object-nesting depth.
+	nestedObjects := func(depth int) []byte {
+		return []byte(strings.Repeat(`{"a":`, depth) + `1` + strings.Repeat(`}`, depth))
+	}
+
+	t.Run("at limit accepted", func(t *testing.T) {
+		require.NoError(t, ensureRequestNestingDepth(nestedObjects(MaxRequestNestingDepth), MaxRequestNestingDepth))
+	})
+
+	t.Run("one over limit rejected", func(t *testing.T) {
+		err := ensureRequestNestingDepth(nestedObjects(MaxRequestNestingDepth+1), MaxRequestNestingDepth)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "request nesting depth exceeds limit")
+	})
+
+	t.Run("array nesting counts equally", func(t *testing.T) {
+		body := []byte(strings.Repeat(`[`, MaxRequestNestingDepth+1) + `1` + strings.Repeat(`]`, MaxRequestNestingDepth+1))
+		err := ensureRequestNestingDepth(body, MaxRequestNestingDepth)
+		require.Error(t, err)
+	})
+
+	t.Run("braces inside strings do not count", func(t *testing.T) {
+		// Without string-awareness, this body would appear to nest 100 deep.
+		body := []byte(`{"k":"` + strings.Repeat(`{`, 100) + `"}`)
+		require.NoError(t, ensureRequestNestingDepth(body, MaxRequestNestingDepth))
+	})
+
+	t.Run("escaped quote inside string", func(t *testing.T) {
+		// The escaped quote must not exit string mode; the trailing braces inside the
+		// string still must not be counted.
+		body := []byte(`{"k":"x\"` + strings.Repeat(`{`, 100) + `"}`)
+		require.NoError(t, ensureRequestNestingDepth(body, MaxRequestNestingDepth))
+	})
+
+	t.Run("imbalanced closers rebase to zero", func(t *testing.T) {
+		// Excess closers must not let a later valid block bypass the limit by going negative.
+		body := []byte(strings.Repeat(`}`, 50) + strings.Repeat(`{`, MaxRequestNestingDepth+1))
+		err := ensureRequestNestingDepth(body, MaxRequestNestingDepth)
+		require.Error(t, err)
+	})
+}
+
+func TestNormalizeChatRequestRejectsBodyAtNestingLimit(t *testing.T) {
+	// Pipeline-level proof that the pre-scan participates in normalizeChatRequest.
+	deep := `"x"`
+	for i := 0; i < MaxRequestNestingDepth+1; i++ {
+		deep = `{"a":` + deep + `}`
+	}
+	body := `{"messages":[{"role":"user","content":` + deep + `}]}`
+	_, _, err := normalizeChatRequest([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "request nesting depth exceeds limit")
 }
