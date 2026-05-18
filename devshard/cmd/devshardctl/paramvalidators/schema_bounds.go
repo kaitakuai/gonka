@@ -61,18 +61,18 @@ func (b SchemaBounds) Walk(schema map[string]any) error {
 	return b.walk(schema, 1, &nodes)
 }
 
-// CheckSize marshals the schema and rejects when the serialized size exceeds MaxSize. Run
-// AFTER Walk so depth/breadth attacks rejected by the walker never pay for the marshal.
+// CheckSize rejects when the serialized size exceeds MaxSize. Run AFTER Walk so
+// depth/breadth attacks rejected by the walker never pay for serialization.
 // MaxSize=0 disables the check.
 func (b SchemaBounds) CheckSize(schema map[string]any) error {
 	if b.MaxSize <= 0 {
 		return nil
 	}
-	serialized, err := json.Marshal(schema)
+	size, err := jsonMarshaledSize(schema)
 	if err != nil {
 		return fmt.Errorf("cannot be serialized: %v", err)
 	}
-	if len(serialized) > b.MaxSize {
+	if size > b.MaxSize {
 		return fmt.Errorf("%w: limit %d bytes", ErrSchemaSize, b.MaxSize)
 	}
 	return nil
@@ -159,14 +159,31 @@ func (b ObjectBounds) CheckSize(obj map[string]any) error {
 	if b.MaxSize <= 0 {
 		return nil
 	}
-	serialized, err := json.Marshal(obj)
+	size, err := jsonMarshaledSize(obj)
 	if err != nil {
 		return fmt.Errorf("cannot be serialized: %v", err)
 	}
-	if len(serialized) > b.MaxSize {
+	if size > b.MaxSize {
 		return fmt.Errorf("%w: limit %d bytes", ErrSchemaSize, b.MaxSize)
 	}
 	return nil
+}
+
+type countingWriter struct{ n int }
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.n += len(p)
+	return len(p), nil
+}
+
+// jsonMarshaledSize returns len(json.Marshal(v)) without allocating the output
+// slice. Encoder.Encode trails a newline that Marshal omits, so subtract one.
+func jsonMarshaledSize(v any) (int, error) {
+	var cw countingWriter
+	if err := json.NewEncoder(&cw).Encode(v); err != nil {
+		return 0, err
+	}
+	return cw.n - 1, nil
 }
 
 func (b ObjectBounds) walk(value any, depth int, nodes *int) error {

@@ -6,9 +6,14 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 
 	"devshard/cmd/devshardctl/paramvalidators"
 )
+
+var bytesReaderPool = sync.Pool{
+	New: func() any { return new(bytes.Reader) },
+}
 
 type RequestFilterStage int
 
@@ -176,7 +181,7 @@ type CapUintParameterHandler struct {
 }
 
 func (h CapUintParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	value, ok := numericJSONValueAsUint64FromDocument(ctx.Document, parameter.Name)
+	value, ok := numericJSONValueAsUint64FromDocument(&ctx.Document, parameter.Name)
 	if !ok {
 		return nil
 	}
@@ -191,11 +196,11 @@ type ClampUintToFieldParameterHandler struct {
 }
 
 func (h ClampUintToFieldParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	value, ok := numericJSONValueAsUint64FromDocument(ctx.Document, parameter.Name)
+	value, ok := numericJSONValueAsUint64FromDocument(&ctx.Document, parameter.Name)
 	if !ok {
 		return nil
 	}
-	maxValue, ok := numericJSONValueAsUint64FromDocument(ctx.Document, h.MaxField)
+	maxValue, ok := numericJSONValueAsUint64FromDocument(&ctx.Document, h.MaxField)
 	if !ok || maxValue == 0 {
 		return nil
 	}
@@ -281,22 +286,43 @@ func (h DocumentValidatorHandler) Apply(ctx *RequestFilterContext, _ VLLMParamet
 	if h.Validator == nil {
 		return nil
 	}
-	if err := h.Validator.Validate(ctx.Document.Raw()); err != nil {
-		return wrapBadChatRequest(err)
+	var validateErr error
+	ctx.Document.RLockedScope(func(raw map[string]any) {
+		validateErr = h.Validator.Validate(raw)
+	})
+	if validateErr != nil {
+		return wrapBadChatRequest(validateErr)
 	}
 	return nil
 }
 
+// ChatRequestDocument is not safe to share across goroutines without the mutex;
+// use LockedScope / RLockedScope for multi-key access.
 type ChatRequestDocument struct {
+	mu  sync.RWMutex
 	raw map[string]any
 }
 
 func (d *ChatRequestDocument) Keys() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	keys := make([]string, 0, len(d.raw))
 	for key := range d.raw {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+func (d *ChatRequestDocument) LockedScope(fn func(map[string]any)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	fn(d.raw)
+}
+
+func (d *ChatRequestDocument) RLockedScope(fn func(map[string]any)) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	fn(d.raw)
 }
 
 // MaxRequestNestingDepth bounds JSON nesting before we hand the bytes to encoding/json.
@@ -311,16 +337,31 @@ func (d *ChatRequestDocument) Keys() []string {
 const MaxRequestNestingDepth = 32
 
 func decodeChatRequestDocument(body []byte) (*ChatRequestDocument, error) {
+	raw, err := decodeChatRequestRaw(body)
+	if err != nil {
+		return nil, err
+	}
+	return &ChatRequestDocument{raw: raw}, nil
+}
+
+func decodeChatRequestRaw(body []byte) (map[string]any, error) {
 	if err := ensureRequestNestingDepth(body, MaxRequestNestingDepth); err != nil {
 		return nil, err
 	}
+	reader := bytesReaderPool.Get().(*bytes.Reader)
+	reader.Reset(body)
+	defer func() {
+		// Drop body reference so the pool doesn't pin 10 MiB slices.
+		reader.Reset(nil)
+		bytesReaderPool.Put(reader)
+	}()
 	var raw map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder := json.NewDecoder(reader)
 	decoder.UseNumber()
 	if err := decoder.Decode(&raw); err != nil {
 		return nil, badChatRequest("parse request: %v", err)
 	}
-	return &ChatRequestDocument{raw: raw}, nil
+	return raw, nil
 }
 
 // ensureRequestNestingDepth performs a byte-level scan that bounds JSON nesting before any
@@ -369,6 +410,8 @@ func ensureRequestNestingDepth(body []byte, maxDepth int) error {
 }
 
 func (d *ChatRequestDocument) Marshal() ([]byte, error) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	updatedBody, err := json.Marshal(d.raw)
 	if err != nil {
 		return nil, badChatRequest("marshal request: %v", err)
@@ -377,59 +420,68 @@ func (d *ChatRequestDocument) Marshal() ([]byte, error) {
 }
 
 func (d *ChatRequestDocument) Has(name string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	_, ok := d.raw[name]
 	return ok
 }
 
-// Raw exposes the underlying decoded map for handlers (in this package or external) that
-// need direct access to inspect or mutate the top-level fields. The returned map is the live
-// document -- modifications are reflected in subsequent reads and the final marshal.
-func (d *ChatRequestDocument) Raw() map[string]any {
-	return d.raw
-}
-
 func (d *ChatRequestDocument) Get(name string) (any, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	value, ok := d.raw[name]
 	return value, ok
 }
 
 func (d *ChatRequestDocument) Set(name string, value any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.raw[name] = value
 }
 
 func (d *ChatRequestDocument) Delete(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	delete(d.raw, name)
 }
 
 func (d *ChatRequestDocument) String(name string) (string, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	value, ok := d.raw[name].(string)
 	return value, ok
 }
 
+// Object and Array return references into the document; do not retain them past
+// the immediate use or mutate them concurrently with other writers.
 func (d *ChatRequestDocument) Object(name string) (map[string]any, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	value, ok := d.raw[name].(map[string]any)
 	return value, ok
 }
 
 func (d *ChatRequestDocument) Array(name string) ([]any, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	value, ok := d.raw[name].([]any)
 	return value, ok
 }
 
 type RequestFilterContext struct {
-	Document           *ChatRequestDocument
+	Document           ChatRequestDocument
 	OutputLimits       outputTokenLimits
 	AdminAuthenticated bool
 	Request            chatRequest
 }
 
 func newRequestFilterContext(body []byte, adminAuthenticated bool, limits outputTokenLimits) (*RequestFilterContext, error) {
-	document, err := decodeChatRequestDocument(body)
+	raw, err := decodeChatRequestRaw(body)
 	if err != nil {
 		return nil, err
 	}
 	return &RequestFilterContext{
-		Document:           document,
+		Document:           ChatRequestDocument{raw: raw},
 		OutputLimits:       normalizedOutputTokenLimits(limits),
 		AdminAuthenticated: adminAuthenticated,
 	}, nil
@@ -441,7 +493,7 @@ func newRequestFilterContext(body []byte, adminAuthenticated bool, limits output
 // the behavior (strict types, null-tolerant) but skip the round-trip.
 func (ctx *RequestFilterContext) DecodeRequest() error {
 	var req chatRequest
-	if err := readChatRequestFields(ctx.Document, &req); err != nil {
+	if err := readChatRequestFields(&ctx.Document, &req); err != nil {
 		return err
 	}
 	ctx.Request = req
@@ -465,7 +517,7 @@ func (ctx *RequestFilterContext) DecodeRequest() error {
 // CapUintParameterHandler) propagate into the projection.
 func (ctx *RequestFilterContext) SyncRequestView() error {
 	var req chatRequest
-	if err := readChatRequestFields(ctx.Document, &req); err != nil {
+	if err := readChatRequestFields(&ctx.Document, &req); err != nil {
 		return err
 	}
 	req.MaxTokens = ctx.Request.MaxTokens
@@ -637,16 +689,24 @@ func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilter
 }
 
 func (c VLLMParameterCatalog) rejectUnknownParameters(ctx *RequestFilterContext) error {
-	if ctx == nil || ctx.Document == nil {
+	if ctx == nil {
 		return nil
 	}
-	for key := range ctx.Document.raw {
-		if _, ok := c.known[key]; ok {
-			continue
+	var rejectErr error
+	ctx.Document.RLockedScope(func(raw map[string]any) {
+		for key := range raw {
+			if _, ok := c.known[key]; ok {
+				continue
+			}
+			if key == "" {
+				rejectErr = badChatRequest("request body contains a field with an empty name")
+				return
+			}
+			rejectErr = badChatRequest("%s", unsupportedChatParameterMessage(key))
+			return
 		}
-		return badChatRequest("%s", unsupportedChatParameterMessage(key))
-	}
-	return nil
+	})
+	return rejectErr
 }
 
 func newParameter(name string) VLLMParameter {
