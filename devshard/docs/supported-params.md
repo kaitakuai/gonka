@@ -27,20 +27,28 @@ Anything not on this whitelist does not reach the model. That is the contract.
 - `chat_template_kwargs` — `paramvalidators.ChatTemplateKwargsValidator` (plain object, no JSON-Schema semantics; additionally rejects keys that override `apply_hf_chat_template()` positional args: `chat_template`, `tokenize`, `tools`, `documents`, `conversation`, `continue_final_message`, `padding`, `truncation`, `max_length`, `return_tensors`, `return_dict` — defuses CVE-2025-61620 + CVE-2025-62426)
 
 **Shape validators**:
-- `thinking` — `paramvalidators.ThinkingValidator`
+- `thinking` — `paramvalidators.ThinkingValidator` (additionally mirrors the resolved boolean into `chat_template_kwargs.thinking` for `moonshotai/Kimi-K2.6`)
 - `stream_options` — `paramvalidators.StreamOptionsValidator` (whitelist `include_usage`; strip `continuous_usage_stats` for vLLM-project/vllm#9028 + any other sub-field; drop the field if it empties out)
 - `metadata` — `paramvalidators.MetadataValidator` (OpenAI bounds: ≤16 keys × 64-char keys × 512-char string values)
 - `user` — `paramvalidators.UserValidator` (must be a string, byte-length ≤ 512)
+- `tool_choice` — `paramvalidators.ToolChoiceValidator` (shape-only: `"auto"` / `"none"` / function-object with ≤64 B name)
 
 **Length / size caps**:
 - `messages` (≤2048) · `stop` (≤16/256B) · `stop_token_ids` (≤64) · `bad_words` (≤64/128B) · `logit_bias` map (≤1024 entries)
 
 **Numeric range sanitizers**:
-- `temperature` (≤2.0) · `top_p` · `top_k` · `min_p` · `repetition_penalty` (≤2.0) · `n` (≤5) · `logit_bias` values (`[-100, 100]`)
+- `temperature` (≤2.0) · `top_p` · `top_k` · `min_p` · `repetition_penalty` (≤2.0) · `n` (≤5) · `logit_bias` values (`[-100, 100]`) · `frequency_penalty` (`[-2, 2]`) · `presence_penalty` (`[-2, 2]`)
 
 **Type validators**:
 - `seed` — non-negative uint64
-- `tool_choice` — rejects `"required"`
+- `tool_choice` — `paramvalidators.ToolChoiceValidator` (shape-only after upstream coerce). Accepts `"auto"`, `"none"`, or `{"type":"function","function":{"name":"..."}}` (name ≤ 64 B). `"required"` is silently coerced to the per-model default by `ToolsValidator` (temporarily disabled — see Coercions). Anything else gets a 400 with the shape error.
+- `thinking` — `paramvalidators.ThinkingValidator`. Accepts `{"type":"enabled"|"disabled"}`. For `moonshotai/Kimi-K2.6` the validator additionally mirrors the resolved boolean into `chat_template_kwargs.thinking`; existing `chat_template_kwargs.thinking` wins.
+
+**Coercions (no error, silent rewrite)**:
+- `tool_choice` defaults to the per-model value when `tools` is non-empty and the field is omitted: `"auto"` for most models (matches OpenAI spec), `"none"` for `moonshotai/Kimi-K2.6` because that backend ships without `--enable-auto-tool-choice` (vLLM 400s on `"auto"`). When Kimi gets the flag added in a future chain upgrade, drop the override.
+- `tool_choice == "required"` is silently coerced to the same per-model default ("required" is temporarily disabled by network policy — re-enable by removing the coerce in `ToolsValidator.Validate`).
+- `n` is coerced to `1` when `temperature == 0` — greedy sampling produces identical completions; vLLM rejects `n > 1` here, so we round it down silently instead of 400-ing
+- **Kimi K2.6 only**: `frequency_penalty` and `presence_penalty` are force-rewritten to `0.0` via a `ModelScopedParameterHandler` catalog rule — Moonshot's K2.6 wire accepts the fields but rejects any non-zero value (model-side constraint, not security). Rewriting silently keeps OpenAI-clients that always emit these working. Other models (e.g. Qwen3-235B) get the catalog-level `[-2, 2]` clamp only.
 
 **Pipeline / forced**:
 - `max_tokens` / `max_completion_tokens` — defaults + caps via `applyOutputTokenLimits`
@@ -56,7 +64,6 @@ Anything not on this whitelist does not reach the model. That is the contract.
 
 Field-level additions that Kimi K2/K2.6 actually accepts on the wire (per Moonshot's [chat reference](https://platform.kimi.ai/docs/api/chat) and [K2.6 quickstart](https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart)):
 
-- **`frequency_penalty`, `presence_penalty`** — Kimi accepts these but **for K2.6 only `0.0`** is valid (any other value is rejected upstream; that's a model-side constraint, not a security one). Easy add via `SanitizeFloatParameterHandler` with range `[-2, 2]`. Smallest concrete next step.
 - **`prompt_cache_key`** — string. Kimi's first-class context-cache tag (cheaper re-prompts). Add with a string-length cap (e.g. ≤256 B).
 - **`safety_identifier`** — Kimi's analogue to OpenAI's `user`. String pass-through; add over `user` (which Kimi does not document).
 - **`messages[].reasoning_content`** — *required* on assistant turns during multi-step tool-calling when thinking is enabled. The message validator already does NOT reject unknown assistant-message fields (only `tool_call_id` is disallowed on assistant), so this already passes through. Just document the contract; no code change needed.
@@ -65,6 +72,7 @@ Structural additions:
 
 - **Per-message content byte size cap** — currently bounded only by the 10 MiB body cap; no per-message structural limit. Token-limit logic downstream catches the most pathological cases.
 - **Catalog → spec generator** — this doc is hand-written. `go generate` could derive the Supported table from `defaultVLLMParameterCatalog()` so it cannot drift.
+- **Special-token literal sanitizer for `messages[].content`** (CVE-2026-44222) — literal strings like `<|vision_start|>` / `<|image_pad|>` / `<|vision_end|>` in user text crash multimodal models with an `IndexError` in `_vl_get_input_positions_tensor`. Required for `Kimi-K2.6` (multimodal) and any future VL routing. Implement as a content-text pass that strips or rejects the known special-token literals. ([advisory](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f))
 
 Verification / operational:
 
@@ -83,8 +91,9 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
   - Speculative decoding with `extract_hidden_states` must be off (see vLLM version note above) — otherwise `repetition_penalty` (currently allowed by the gateway) becomes a one-shot kill (CVE-2026-44223).
   - Reasoning parser `qwen3` and hermes tool parser are known to surface 500s on certain Qwen3 output patterns (multiple JSON blobs, `<tool_call>` inside `<think>`). These are server-side parsing bugs the gateway can't prevent — they degrade availability, not security. Track upstream issues (see References).
 
-- **`moonshotai/Kimi-K2.6`** (text-only)
-  - No model-specific operational constraints beyond the engine-version and `pythonic` parser notes above. The model is text-only, so CVE-2026-44222 (VL special-token IndexError) does not apply.
+- **`moonshotai/Kimi-K2.6`** (multimodal model — text + image + video; gateway policy serves it as text-only)
+  - Per [Moonshot K2.6 quickstart](https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart) the model natively accepts `{"type":"image_url"}` and `{"type":"video_url"}` content parts. The gateway message validator rejects non-text content parts (see "Messages contract" below), so image/video inputs never reach vLLM through this path.
+  - **CVE-2026-44222 applies if vLLM is started with the multimodal pathway enabled** (which is the default for a VL/multimodal model). A user can still slip the literal string `<|vision_start|>` through text content, and the gateway does not sanitize it today. See `❌ Open / not yet implemented` above — a content sanitizer is required before we knowingly expose this attack surface.
 
 ### 🚫 Won't add (out of scope or by design)
 
@@ -92,7 +101,6 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
 - **`extra_body` / `extra_headers`** — open-ended escape hatches; breaks the strict-whitelist contract.
 - **Provider-specific fields without vLLM semantics**: `service_tier`, `store`, `reasoning_effort`, `reasoning`, `thinking_config`, `enable_thinking`, etc. See "Unsupported parameters" below for the full categorized list. (Note: `user`, `metadata`, `parallel_tool_calls`, and `stream_options` are now in the Supported table above — they are OpenAI Chat Completions standard observability fields with no inference-side semantics and no DoS vector; rejecting them broke every OpenAI-built client without security gain. `prompt_cache_key`, `safety_identifier`, `messages[].reasoning_content` remain in "❌ Open" — Kimi K2.6 actually supports them, pending validator work.)
 - **vLLM-native structured-output bypass** (`guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `enforced_tokens`) — would need their own validators; `response_format` covers the same intent with bounds.
-- **Special-token literal stripping in `messages[].content`** (CVE-2026-44222) — text like `<|vision_start|>` crashes vision-language models with an `IndexError`. Kimi-K2.6 is text-only so we are not exposed today. If we route to a VL model in the future, add a content sanitizer at this layer. ([advisory](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f))
 
 ## Supported parameters
 
@@ -103,21 +111,23 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
 | `messages` | object array | message validator + PreValidation length cap (`LengthCapListParameterHandler`) | Required, non-empty. `len(messages) ≤ 2048` (way above any realistic conversation; defense against JSON-parse memory amplification, independent of token count). Strict OpenAI-compatible message contract — see "Messages" section below. |
 | `max_tokens` | int range | PostLimits (token-limit pipeline) | If absent → set to `DefaultRequestMaxTokens`. Capped at `RequestMaxTokensCap` unless the request carries admin auth. When both `max_tokens` and `max_completion_tokens` are set, the smaller wins and both are aligned. |
 | `max_completion_tokens` | int range | PostLimits (token-limit pipeline) | Same rules as `max_tokens`. |
-| `n` | int range | PostLimits sanitize (`CapUintParameterHandler`) | Capped at `MaxChatRequestChoices` (5). |
+| `n` | int range | PostLimits sanitize (`CapUintParameterHandler`) + greedy coerce | Capped at `MaxChatRequestChoices` (5). Coerced to `1` when `temperature == 0` (vLLM rejects `n > 1` under greedy sampling). |
 | `temperature` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. Capped at `MaxTemperature` (2.0). String-encoded numbers accepted. |
 | `top_p` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. No upper cap (forwarded raw). |
 | `top_k` | int range | PostLimits sanitize | Strips `NaN`/`±Inf`. vLLM-specific. |
 | `min_p` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. vLLM-specific. |
 | `repetition_penalty` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. Capped at `MaxRepetitionPenalty` (2.0). |
+| `frequency_penalty` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. Clamped to `[-2.0, 2.0]`. **Kimi K2.6**: force-rewritten to `0.0` via a `ModelScopedParameterHandler` catalog rule (model accepts only `0.0` on the wire). |
+| `presence_penalty` | float range | PostLimits sanitize | Strips `NaN`/`±Inf`. Clamped to `[-2.0, 2.0]`. **Kimi K2.6**: force-rewritten to `0.0` via a `ModelScopedParameterHandler` catalog rule (model accepts only `0.0` on the wire). |
 | `logit_bias` | int→float map | PostLimits sanitize (`SanitizeFloatMapParameterHandler`) | Keeps numeric entries in `[-100, 100]`. Drops the field if the map is empty after sanitization. Map size capped at 1024 entries (rejected with HTTP 400 over the cap). |
 | `stop` | string list | PreValidation length cap (`LengthCapListParameterHandler`) | Pass-through within bounds. Rejected if `len(stop) > 16` or any entry's string length > 256 bytes. |
 | `stop_token_ids` | int list | PreValidation length cap (`LengthCapListParameterHandler`) | Pass-through within bounds. Rejected if `len(stop_token_ids) > 64`. |
 | `seed` | int range | PreValidation type-check (`ValidateUintParameterHandler`) | Must parse as a non-negative integer that fits in uint64. Otherwise rejected with HTTP 400 at the gateway boundary instead of relying on the upstream's error path. |
 | `skip_special_tokens` | bool | — | Pass-through. vLLM-specific. |
 | `detokenize` | bool | — | Pass-through. vLLM-specific. |
-| `thinking` | object | PreValidation validate (`paramvalidators.ThinkingValidator`) | Must be `{"type": "enabled" \| "disabled"}`. Any other shape rejected. For `moonshotai/Kimi-K2.6` it is mirrored into `chat_template_kwargs.thinking` via `applyKimiRequestOverrides`. |
+| `thinking` | object | PreValidation validate (`paramvalidators.ThinkingValidator`) | Must be `{"type": "enabled" \| "disabled"}`. Any other shape rejected. For `moonshotai/Kimi-K2.6` the validator itself mirrors the resolved boolean into `chat_template_kwargs.thinking` (existing value wins). |
 | `chat_template_kwargs` | object | PreValidation validate (`paramvalidators.ChatTemplateKwargsValidator`) | Pass-through within plain-object bounds: depth ≤ 5, nodes ≤ 128, serialized size ≤ 16 KiB. Top-level keys that override `apply_hf_chat_template()` positional arguments are rejected (`chat_template`, `tokenize`, `tools`, `documents`, `conversation`, `continue_final_message`, `padding`, `truncation`, `max_length`, `return_tensors`, `return_dict` — defuses CVE-2025-61620 + CVE-2025-62426). `add_generation_prompt` is explicitly *allowed* as a legitimate template knob. |
-| `tool_choice` | string | PreValidation reject | Pass-through except `"required"` — rejected because the upstream contract does not honor it on the vLLM path. Stripped together with `tools` if `tools` arrives empty. |
+| `tool_choice` | string \| object | PreValidation validate | Accepted values: `"auto"`, `"none"`, or `{"type":"function","function":{"name":"..."}}` (name ≤ 64 B). `"required"` is silently coerced to the per-model default by `ToolsValidator` (temporarily disabled). Other shapes (number, array, unknown string, malformed object) get a 400. Stripped together with `tools` if `tools` arrives empty. If `tools` is non-empty and `tool_choice` is omitted, gateway writes per-model default: `"auto"` for most models, `"none"` for `moonshotai/Kimi-K2.6`. |
 | `min_tokens` | int range | PreValidation conditional strip + PostLimits clamp | Dropped if `stop_token_ids` is also set (vLLM rejects the combination). Otherwise clamped to ≤ `max_tokens`. |
 | `bad_words` | string list | PreValidation sanitize + length cap | Empty/whitespace strings are removed. Field is dropped if the resulting list is empty. Then `len(bad_words) ≤ 64`, per-entry length ≤ 128 bytes. |
 | `tools` | object array | PreValidation sanitize + shape + schema validate (`paramvalidators.ToolsValidator`) | Empty arrays drop both `tools` and `tool_choice`. Each tool must declare `type: "function"` and a `function` object with a non-empty string `name` — the OpenAI tool contract — otherwise rejected before vLLM ever sees the request. If `function.parameters` is present, it is walked as a JSON Schema with bounds depth ≤ 16, nodes ≤ 256, branch arms ≤ 16, enum ≤ 256, size ≤ 16 KiB; `$ref`/`$defs`/`definitions` forbidden; `type` must be a JSON-Schema primitive; `pattern` must compile as a regex within 512 B — CVE-2025-48944. Parameter-less tools are valid. Both depth and node-count limits are wider than `response_format` (16/256 vs 5/128) because production agent tool schemas with nested presentation structures routinely sit at 5–13 levels with up to ~170 nodes; the wider tools bounds give headroom over observed max, while MaxSize=16 KiB, MaxBranch=16, and the `$ref`/`$defs` ban provide the actual schema-bomb defense. |
@@ -148,9 +158,8 @@ Grouped by why the field is off:
 
 | Group | Examples we reject today | Origin | Why off |
 | --- | --- | --- | --- |
-| Sampling penalties | `frequency_penalty`, `presence_penalty` | Kilo, OpenClaw, OpenAI canonical | vLLM supports them. Trivially safe to add via `SanitizeFloatParameterHandler` with range `[-2, 2]`. Pending only because we have not validated end-to-end on the vLLM build we run. |
 | Structured-output (non-`response_format`) | `guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `enforced_tokens`, `structured_outputs` | vLLM-native | Bypasses the response_format safety bounds. Same grammar-compiler attack surface; would need its own validator. |
-| Tool-calling extensions | `tool_choice="required"` | OpenClaw, OpenAI | `required` is rejected by upstream contract on the vLLM path (cost-amplifier + engine-wedge on Kimi-K2). `parallel_tool_calls` is now passthrough — see Supported table. |
+| Tool-calling extensions | (none — `parallel_tool_calls` is now passthrough; `tool_choice="required"` is silently coerced to the per-model default by `ToolsValidator`, see Supported table) | OpenClaw, OpenAI | "required" is temporarily disabled by network policy (cost-amplifier + engine-wedge on Kimi-K2). |
 | Routing / metadata | `service_tier`, `extra_body`, `extra_headers`, `provider`, `plugins`, `tags`, `seed_override` | Hermes, OpenClaw, Kilo | Vendor-specific. `extra_body` / `extra_headers` are open-ended escape hatches and break the whitelist contract. (`user` and `metadata` were moved to Supported — they are OpenAI Chat Completions standard observability fields, not vendor-specific.) |
 | Caching | `store`, `prompt_cache_key` | OpenAI / OpenClaw | OpenAI-specific server-side state hints. No vLLM semantics. (`stream_options` was moved to Supported with a sub-field whitelist validator — it is required for OpenAI-compatible streaming-with-usage and the only known-bad sub-field, `continuous_usage_stats`, is stripped at the gateway.) |
 | Reasoning (non-vLLM-native) | `reasoning_effort`, `reasoning` (object), `thinking_config`, `enable_thinking` | Hermes (multi-provider), OpenClaw (Qwen/Kimi), Gemini | Use `thinking` + `chat_template_kwargs` instead. Provider-specific reasoning fields are wrapper concerns, not what vLLM speaks. |
@@ -205,6 +214,10 @@ All five knobs are sanitized at `PostLimits`: non-finite numbers and out-of-rang
 ```
 
 If `tools` is `[]`, the gateway strips both `tools` and `tool_choice` (the vLLM build we run rejects empty tools).
+
+If `tools` is non-empty but `tool_choice` is omitted, the gateway writes `tool_choice: "auto"` before the request reaches vLLM. This matches OpenAI's documented default and avoids a class of 400s seen in production when clients drop the field and the backend wasn't started with `--enable-auto-tool-choice`.
+
+If `temperature == 0` and `n > 1`, the gateway rewrites `n` to `1` (greedy sampling produces identical completions, and vLLM otherwise rejects the request). Clients receive the response without a 400 and without retries.
 
 ### With Kimi-K2.6 thinking
 
@@ -323,7 +336,7 @@ Re-check these periodically for status changes (fixed-in versions, new variants,
 | [CVE-2025-9141 / GHSA-79j6-g2m3-jgfw](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw) | RCE via `eval()` in `qwen3_coder` tool-call parser | Per-model ops constraint: keep `hermes` parser on Qwen3-235B-Instruct. |
 | [CVE-2025-48887 / GHSA-w6q7-j642-7c25](https://github.com/vllm-project/vllm/security/advisories/GHSA-w6q7-j642-7c25) | ReDoS in `pythonic` tool-call parser | Engine must not run with `--tool-call-parser pythonic`. |
 | [CVE-2026-44223 / GHSA-83vm-p52w-f9pw](https://github.com/vllm-project/vllm/security/advisories/GHSA-83vm-p52w-f9pw) | Penalty fields crash EngineCore with `extract_hidden_states` spec decode | Pin vLLM ≥ 0.20.0 or keep that spec-decode method disabled. |
-| [CVE-2026-44222 / GHSA-hpv8-x276-m59f](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f) | Special-token literals (`<\|vision_start\|>`, etc.) crash VL models | N/A for Kimi-K2.6 (text-only). For Qwen3-VL or future multimodal routing, add a content sanitizer. |
+| [CVE-2026-44222 / GHSA-hpv8-x276-m59f](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f) | Special-token literals (`<\|vision_start\|>`, etc.) crash VL models | **Open** — Kimi-K2.6 is multimodal; vLLM with the multimodal pathway enabled is exposed via text content. A content sanitizer is needed (tracked in `❌ Open / not yet implemented` above). |
 
 ### Qwen3 upstream issues to monitor
 

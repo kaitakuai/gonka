@@ -24,7 +24,7 @@ func TestUserValidatorAccepts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.NoError(t, v.Validate(parseDocument(t, tt.body)))
+			require.NoError(t, v.Validate(ValidatorContext{Document: parseDocument(t, tt.body)}))
 		})
 	}
 }
@@ -45,7 +45,7 @@ func TestUserValidatorRejects(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := v.Validate(parseDocument(t, tt.body))
+			err := v.Validate(ValidatorContext{Document: parseDocument(t, tt.body)})
 			require.Error(t, err)
 			require.ErrorIs(t, err, tt.wantErr)
 		})
@@ -54,7 +54,7 @@ func TestUserValidatorRejects(t *testing.T) {
 
 func TestUserValidatorRespectsCustomLimit(t *testing.T) {
 	v := UserValidator{MaxLen: 8}
-	require.NoError(t, v.Validate(parseDocument(t, `{"user":"abcdefgh"}`)))
-	err := v.Validate(parseDocument(t, `{"user":"abcdefghi"}`))
+	require.NoError(t, v.Validate(ValidatorContext{Document: parseDocument(t, `{"user":"abcdefgh"}`)}))
+	err := v.Validate(ValidatorContext{Document: parseDocument(t, `{"user":"abcdefghi"}`)})
 	require.ErrorIs(t, err, ErrUserLength)
 }

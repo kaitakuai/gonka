@@ -10,7 +10,7 @@ import (
 // in sync with the catalog entry in cmd/devshardctl/request_filters_parameters.go.
 func benchValidator() ResponseFormatValidator {
 	return ResponseFormatValidator{
-		MaxDepth:      5,
+		MaxDepth:      16,
 		MaxSize:       16 * 1024,
 		MaxNodes:      128,
 		MaxBranch:     16,
@@ -26,7 +26,7 @@ func BenchmarkResponseFormatValidator_Absent(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err != nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -38,7 +38,7 @@ func BenchmarkResponseFormatValidator_TypeText(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err != nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -50,7 +50,7 @@ func BenchmarkResponseFormatValidator_TypeJSONObject(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err != nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -62,24 +62,24 @@ func BenchmarkResponseFormatValidator_SimpleSchema(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err != nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkResponseFormatValidator_AtLimits exercises the worst-case ACCEPTED schema: max depth, near max-nodes.
-// A schema 5 levels deep with a few siblings at each level still fits under the 128-node cap.
+// BenchmarkResponseFormatValidator_AtLimits exercises the worst-case ACCEPTED schema:
+// hits MaxDepth=16 and MaxNodes=128 simultaneously via a 15-level property chain with 113
+// leaf siblings at the deepest level (15 + 113 = 128 nodes, leaves at depth 16).
 func BenchmarkResponseFormatValidator_AtLimits(b *testing.B) {
 	v := benchValidator()
-	// 5 levels deep, 3 siblings per level: roughly 1 + 3 + 9 + 27 + 81 = 121 nodes <= 128.
 	schema := buildLimitsSchema()
 	body := `{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":` + schema + `}},"messages":[{"role":"user","content":"hello"}]}`
 	doc := parseDocument(b, body)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err != nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -98,7 +98,7 @@ func BenchmarkResponseFormatValidator_RejectsRecursion(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err == nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err == nil {
 			b.Fatal("expected reject")
 		}
 	}
@@ -113,21 +113,15 @@ func BenchmarkResponseFormatValidator_RejectsOversized(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := v.Validate(doc); err == nil {
+		if err := v.Validate(ValidatorContext{Document: doc}); err == nil {
 			b.Fatal("expected reject")
 		}
 	}
 }
 
 func buildLimitsSchema() string {
-	// Recursively build a schema with 3 child properties at each level, 5 levels deep.
-	var build func(depth int) string
-	build = func(depth int) string {
-		if depth <= 0 {
-			return `{"type":"string"}`
-		}
-		child := build(depth - 1)
-		return `{"type":"object","properties":{"a":` + child + `,"b":` + child + `,"c":` + child + `}}`
-	}
-	return build(4) // root + 4 nested = depth 5
+	// 15-level property chain + 113 leaf siblings at the bottom: hits MaxDepth=16 and
+	// MaxNodes=128 simultaneously. Shape shared with the unit-test "depth and nodes both at
+	// limit" case so bench and test exercise the same boundary.
+	return coBoundarySchema(15, 113)
 }

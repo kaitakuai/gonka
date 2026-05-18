@@ -10,7 +10,7 @@ import (
 
 func defaultChatTemplateKwargsValidator() ChatTemplateKwargsValidator {
 	return ChatTemplateKwargsValidator{
-		MaxDepth: 5,
+		MaxDepth: 16,
 		MaxSize:  16 * 1024,
 		MaxNodes: 128,
 	}
@@ -27,13 +27,13 @@ func TestChatTemplateKwargsValidatorAccepts(t *testing.T) {
 		{name: "kimi thinking shape", body: `{"chat_template_kwargs":{"thinking":true}}`},
 		{name: "qwen enable_thinking + preserve", body: `{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":false}}`},
 		{name: "add_generation_prompt is allowed", body: `{"chat_template_kwargs":{"add_generation_prompt":true}}`},
-		{name: "nested at depth limit", body: `{"chat_template_kwargs":` + nestedObjectChain(5) + `}`},
+		{name: "nested at depth limit", body: `{"chat_template_kwargs":` + nestedObjectChain(16) + `}`},
 		{name: "array of strings", body: `{"chat_template_kwargs":{"tags":["a","b","c"]}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := parseDocument(t, tt.body)
-			require.NoError(t, v.Validate(doc))
+			require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 		})
 	}
 }
@@ -47,7 +47,7 @@ func TestChatTemplateKwargsValidatorRejects(t *testing.T) {
 	}{
 		{name: "wrapper not object", body: `{"chat_template_kwargs":"hi"}`, wantErr: ErrChatTemplateKwargsShape},
 		{name: "wrapper is array", body: `{"chat_template_kwargs":[1,2]}`, wantErr: ErrChatTemplateKwargsShape},
-		{name: "depth exceeds limit", body: `{"chat_template_kwargs":` + nestedObjectChain(6) + `}`, wantErr: ErrSchemaDepth},
+		{name: "depth exceeds limit", body: `{"chat_template_kwargs":` + nestedObjectChain(17) + `}`, wantErr: ErrSchemaDepth},
 		{name: "deep recursion attack", body: `{"chat_template_kwargs":` + nestedObjectChain(200) + `}`, wantErr: ErrSchemaDepth},
 		{name: "node count exceeds limit", body: `{"chat_template_kwargs":` + flatPropertiesObject(200) + `}`, wantErr: ErrSchemaNodes},
 		{name: "size exceeds limit", body: `{"chat_template_kwargs":{"x":"` + strings.Repeat("a", 17*1024) + `"}}`, wantErr: ErrSchemaSize},
@@ -66,7 +66,7 @@ func TestChatTemplateKwargsValidatorRejects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := parseDocument(t, tt.body)
-			err := v.Validate(doc)
+			err := v.Validate(ValidatorContext{Document: doc})
 			require.Error(t, err)
 			require.ErrorIs(t, err, tt.wantErr)
 		})

@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+
+	"devshard/cmd/devshardctl/paramvalidators"
 
 	"github.com/stretchr/testify/require"
 )
@@ -63,12 +66,12 @@ func TestNormalizeChatRequestDefaultsAndCapsOutputTokens(t *testing.T) {
 func TestNormalizeChatRequestUsesProvidedOutputTokenLimits(t *testing.T) {
 	limits := outputTokenLimits{DefaultMaxTokens: 2_048, MaxTokensCap: 3_584}
 
-	body, req, err := normalizeChatRequestForAuthAndLimits([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), false, limits)
+	body, req, err := normalizeChatRequestForAuthAndLimits([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), false, limits, "")
 	require.NoError(t, err)
 	require.EqualValues(t, 2_048, req.MaxTokens)
 	require.Contains(t, string(body), `"max_tokens":2048`)
 
-	body, req, err = normalizeChatRequestForAuthAndLimits([]byte(`{"max_tokens":4096,"messages":[{"role":"user","content":"hello"}]}`), false, limits)
+	body, req, err = normalizeChatRequestForAuthAndLimits([]byte(`{"max_tokens":4096,"messages":[{"role":"user","content":"hello"}]}`), false, limits, "")
 	require.NoError(t, err)
 	require.EqualValues(t, 3_584, req.MaxTokens)
 	require.Contains(t, string(body), `"max_tokens":3584`)
@@ -143,6 +146,43 @@ func TestPrepareChatRequestBodyPreservesLargeIntegerFields(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "9007199254740993", seed.String())
 	require.Contains(t, string(body), `"seed":9007199254740993`)
+}
+
+func TestNormalizeChatRequestForcesSingleChoiceWithGreedySampling(t *testing.T) {
+	// vLLM rejects `n > 1` when `temperature == 0` (greedy sampling produces identical
+	// completions). Coerce silently to n=1 so 3000+ wasted retries don't reach the engine.
+	coerceCases := []string{
+		`{"n":2,"temperature":0,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"n":5,"temperature":0,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"n":5,"temperature":0.0,"messages":[{"role":"user","content":"hi"}]}`,
+	}
+	for _, body := range coerceCases {
+		t.Run("coerce_"+body, func(t *testing.T) {
+			out, req, err := normalizeChatRequest([]byte(body))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, req.N)
+			require.Contains(t, string(out), `"n":1`)
+		})
+	}
+
+	passThroughCases := []struct {
+		body    string
+		wantN   uint64
+		wantStr string
+	}{
+		{body: `{"n":1,"temperature":0,"messages":[{"role":"user","content":"hi"}]}`, wantN: 1, wantStr: `"n":1`},
+		{body: `{"n":5,"temperature":0.7,"messages":[{"role":"user","content":"hi"}]}`, wantN: 5, wantStr: `"n":5`},
+		{body: `{"n":5,"messages":[{"role":"user","content":"hi"}]}`, wantN: 5, wantStr: `"n":5`},
+		{body: `{"n":5,"temperature":0.0001,"messages":[{"role":"user","content":"hi"}]}`, wantN: 5, wantStr: `"n":5`},
+	}
+	for _, tc := range passThroughCases {
+		t.Run("keep_"+tc.body, func(t *testing.T) {
+			out, req, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			require.EqualValues(t, tc.wantN, req.N)
+			require.Contains(t, string(out), tc.wantStr)
+		})
+	}
 }
 
 func TestNormalizeChatRequestCapsChoices(t *testing.T) {
@@ -232,6 +272,107 @@ func TestNormalizeChatRequestKeepsTemperatureWithinMax(t *testing.T) {
 	var raw map[string]any
 	require.NoError(t, json.Unmarshal(body, &raw))
 	require.EqualValues(t, 1.5, raw["temperature"])
+}
+
+func TestNormalizeChatRequestClampsFrequencyAndPresencePenalty(t *testing.T) {
+	// OpenAI/vLLM accept [-2.0, 2.0] for both. Catalog clamps; out-of-range is rewritten,
+	// not rejected. Per-Kimi force-zero is exercised separately under ApplyKimiRequestOverrides.
+	tests := []struct {
+		name  string
+		body  string
+		field string
+		want  float64
+	}{
+		{name: "freq above max", body: `{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":5}`, field: "frequency_penalty", want: 2.0},
+		{name: "freq below min", body: `{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":-5}`, field: "frequency_penalty", want: -2.0},
+		{name: "freq within range", body: `{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":0.5}`, field: "frequency_penalty", want: 0.5},
+		{name: "pres above max", body: `{"messages":[{"role":"user","content":"hi"}],"presence_penalty":3.5}`, field: "presence_penalty", want: 2.0},
+		{name: "pres below min", body: `{"messages":[{"role":"user","content":"hi"}],"presence_penalty":-3.5}`, field: "presence_penalty", want: -2.0},
+		{name: "pres zero", body: `{"messages":[{"role":"user","content":"hi"}],"presence_penalty":0}`, field: "presence_penalty", want: 0.0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, err := normalizeChatRequest([]byte(tt.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			require.EqualValues(t, tt.want, raw[tt.field])
+		})
+	}
+}
+
+func TestNormalizeChatRequestStripsNonFiniteFrequencyAndPresencePenalty(t *testing.T) {
+	tests := []string{
+		`{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":"infinity"}`,
+		`{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":"nan"}`,
+		`{"messages":[{"role":"user","content":"hi"}],"frequency_penalty":"not-a-number"}`,
+		`{"messages":[{"role":"user","content":"hi"}],"presence_penalty":"infinity"}`,
+	}
+	for _, body := range tests {
+		t.Run(body, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, "frequency_penalty")
+			require.NotContains(t, raw, "presence_penalty")
+		})
+	}
+}
+
+func TestNormalizeForKimiForceZerosPenalties(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "freq nonzero", body: `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"frequency_penalty":0.5}`},
+		{name: "pres nonzero", body: `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"presence_penalty":-1.5}`},
+		{name: "both nonzero", body: `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"frequency_penalty":2,"presence_penalty":-2}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, _, err := normalizeChatRequestForModel([]byte(tt.body), kimiK26ModelID)
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(body, &raw))
+			if _, has := raw["frequency_penalty"]; has {
+				require.EqualValues(t, 0.0, raw["frequency_penalty"])
+			}
+			if _, has := raw["presence_penalty"]; has {
+				require.EqualValues(t, 0.0, raw["presence_penalty"])
+			}
+		})
+	}
+}
+
+func TestNormalizeForKimiLeavesPenaltiesAlreadyZero(t *testing.T) {
+	body := `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"frequency_penalty":0,"presence_penalty":0}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.EqualValues(t, 0.0, raw["frequency_penalty"])
+	require.EqualValues(t, 0.0, raw["presence_penalty"])
+}
+
+func TestNormalizeDoesNotForceZeroPenaltiesForOtherModels(t *testing.T) {
+	body := `{"model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","messages":[{"role":"user","content":"hi"}],"frequency_penalty":0.5,"presence_penalty":-0.5}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8")
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.EqualValues(t, 0.5, raw["frequency_penalty"])
+	require.EqualValues(t, -0.5, raw["presence_penalty"])
+}
+
+func TestNormalizeForKimiDoesNotAddPenaltiesWhenAbsent(t *testing.T) {
+	body := `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}]}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "frequency_penalty")
+	require.NotContains(t, raw, "presence_penalty")
 }
 
 func TestNormalizeChatRequestForcesValidationLogprobs(t *testing.T) {
@@ -358,6 +499,116 @@ func TestNormalizeChatRequestKeepsToolChoiceAutoWithTools(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &raw))
 	require.Equal(t, "auto", raw["tool_choice"])
 	require.Contains(t, raw, "tools")
+}
+
+func TestNormalizeChatRequestDefaultsToolChoiceToAutoWhenToolsProvided(t *testing.T) {
+	// When the client passes `tools` without `tool_choice`, the gateway substitutes the
+	// OpenAI-spec default ("auto") so downstream vLLM never sees an absent value -- vLLM's
+	// own default routes through code that requires --enable-auto-tool-choice, and 66
+	// captured failures showed clients consistently dropping the field.
+	body := `{
+		"tools": [{"type": "function", "function": {"name": "x", "parameters": {"type": "object"}}}],
+		"messages": [{"role": "user", "content": "hi"}]
+	}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.Equal(t, "auto", raw["tool_choice"])
+}
+
+func TestNormalizeChatRequestCoercesRequiredToAuto(t *testing.T) {
+	body := `{
+		"tool_choice": "required",
+		"tools": [{"type":"function","function":{"name":"x","parameters":{"type":"object"}}}],
+		"messages": [{"role":"user","content":"hi"}]
+	}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.Equal(t, "auto", raw["tool_choice"])
+}
+
+func TestNormalizeChatRequestCoercesRequiredToNoneForKimi(t *testing.T) {
+	body := `{
+		"model": "moonshotai/Kimi-K2.6",
+		"tool_choice": "required",
+		"tools": [{"type":"function","function":{"name":"x","parameters":{"type":"object"}}}],
+		"messages": [{"role":"user","content":"hi"}]
+	}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.Equal(t, "none", raw["tool_choice"])
+}
+
+func TestNormalizeChatRequestDefaultsToolChoiceToNoneForKimi(t *testing.T) {
+	body := `{
+		"model": "moonshotai/Kimi-K2.6",
+		"tools": [{"type":"function","function":{"name":"x","parameters":{"type":"object"}}}],
+		"messages": [{"role":"user","content":"hi"}]
+	}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.Equal(t, "none", raw["tool_choice"])
+}
+
+func TestNormalizeChatRequestRejectsMalformedToolChoice(t *testing.T) {
+	tests := []string{
+		`{"tool_choice":"force","messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":42,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":true,"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":["auto"],"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":{"type":"plugin","function":{"name":"x"}},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":{"type":"function"},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":{"type":"function","function":{}},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"tool_choice":{"type":"function","function":{"name":""}},"messages":[{"role":"user","content":"hi"}]}`,
+	}
+	for _, body := range tests {
+		t.Run(body, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(body))
+			require.Error(t, err)
+			require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+			require.Contains(t, err.Error(), "tool_choice")
+		})
+	}
+}
+
+func TestNormalizeChatRequestKeepsExplicitToolChoiceValues(t *testing.T) {
+	choices := []string{`"auto"`, `"none"`}
+	for _, tc := range choices {
+		t.Run(tc, func(t *testing.T) {
+			body := `{
+				"tool_choice": ` + tc + `,
+				"tools": [{"type": "function", "function": {"name": "x", "parameters": {"type": "object"}}}],
+				"messages": [{"role": "user", "content": "hi"}]
+			}`
+			out, _, err := normalizeChatRequest([]byte(body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.Equal(t, strings.Trim(tc, `"`), raw["tool_choice"])
+		})
+	}
+
+	t.Run("function object", func(t *testing.T) {
+		body := `{
+			"tool_choice": {"type":"function","function":{"name":"x"}},
+			"tools": [{"type": "function", "function": {"name": "x", "parameters": {"type": "object"}}}],
+			"messages": [{"role": "user", "content": "hi"}]
+		}`
+		out, _, err := normalizeChatRequest([]byte(body))
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		choice, ok := raw["tool_choice"].(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, "function", choice["type"])
+	})
 }
 
 func TestNormalizeChatRequestStripsEmptyBadWords(t *testing.T) {
@@ -562,108 +813,13 @@ func TestNormalizeChatRequestStripsOutOfRangeLogitBias(t *testing.T) {
 	require.NotContains(t, raw, "logit_bias")
 }
 
-func TestApplyKimiRequestOverrides(t *testing.T) {
-	tests := []struct {
-		name           string
-		body           string
-		req            chatRequest
-		model          string
-		wantStream     bool
-		wantToolChoice any
-		wantStructured bool
-	}{
-		{
-			name:           "explicit false",
-			body:           `{"model":"moonshotai/Kimi-K2.6","stream":false,"messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
-			model:          kimiK26ModelID,
-			wantStream:     false,
-			wantToolChoice: nil,
-		},
-		{
-			name:           "missing stream",
-			body:           `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
-			model:          kimiK26ModelID,
-			wantStream:     false,
-			wantToolChoice: nil,
-		},
-		{
-			name:           "default kimi model",
-			body:           `{"messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Stream: false},
-			model:          kimiK26ModelID,
-			wantStream:     false,
-			wantToolChoice: nil,
-		},
-		{
-			name:           "already streaming",
-			body:           `{"model":"moonshotai/Kimi-K2.6","stream":true,"messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Model: kimiK26ModelID, Stream: true},
-			model:          kimiK26ModelID,
-			wantStream:     true,
-			wantToolChoice: nil,
-		},
-		{
-			name:           "tool auto preserved",
-			body:           `{"model":"moonshotai/Kimi-K2.6","stream":true,"tool_choice":"auto","tools":[{"type":"function","function":{"name":"x","description":"x","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Model: kimiK26ModelID, Stream: true},
-			model:          kimiK26ModelID,
-			wantStream:     true,
-			wantToolChoice: "auto",
-		},
-		{
-			name:           "structured outputs unchanged",
-			body:           `{"model":"moonshotai/Kimi-K2.6","stream":false,"structured_outputs":{"schema":{"type":"object"}},"messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Model: kimiK26ModelID, Stream: false},
-			model:          kimiK26ModelID,
-			wantStream:     false,
-			wantToolChoice: nil,
-			wantStructured: true,
-		},
-		{
-			name:           "non kimi unchanged",
-			body:           `{"model":"Qwen/Test","stream":false,"structured_outputs":{"schema":{"type":"object"}},"messages":[{"role":"user","content":"hello"}]}`,
-			req:            chatRequest{Model: "Qwen/Test", Stream: false},
-			model:          "Qwen/Test",
-			wantStream:     false,
-			wantToolChoice: nil,
-			wantStructured: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			body, req, err := applyKimiRequestOverrides([]byte(tt.body), tt.req, tt.model)
-			require.NoError(t, err)
-			require.Equal(t, tt.wantStream, req.Stream)
-
-			var raw map[string]any
-			require.NoError(t, json.Unmarshal(body, &raw))
-			if _, hasStream := raw["stream"]; hasStream {
-				require.Equal(t, tt.wantStream, raw["stream"])
-			}
-			if tt.wantToolChoice == nil {
-				require.NotContains(t, raw, "tool_choice")
-			} else {
-				require.Equal(t, tt.wantToolChoice, raw["tool_choice"])
-			}
-			if tt.wantStructured {
-				require.Contains(t, raw, "structured_outputs")
-			} else {
-				require.NotContains(t, raw, "structured_outputs")
-			}
-		})
-	}
-}
-
 func TestNormalizeContentRejectsInvalidJSON(t *testing.T) {
 	_, err := normalizeContent([]byte(`{"messages":[`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "parse request")
 }
 
-func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T) {
+func TestNormalizeForKimiMirrorsThinkingToTemplateKwargs(t *testing.T) {
 	boolPtr := func(v bool) *bool {
 		return &v
 	}
@@ -701,11 +857,6 @@ func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T
 			wantThinking: boolPtr(false),
 		},
 		{
-			name:  "invalid moonshot type is ignored",
-			body:  `{"model":"moonshotai/Kimi-K2.6","thinking":{"type":"brief"},"messages":[{"role":"user","content":"hello"}]}`,
-			model: kimiK26ModelID,
-		},
-		{
 			name:  "non kimi unchanged",
 			body:  `{"model":"Qwen/Test","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hello"}]}`,
 			model: "Qwen/Test",
@@ -714,7 +865,7 @@ func TestApplyKimiRequestOverridesTranslatesMoonshotThinkingForVLLM(t *testing.T
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body, _, err := applyKimiRequestOverrides([]byte(tt.body), chatRequest{Model: tt.model}, tt.model)
+			body, _, err := normalizeChatRequestForModel([]byte(tt.body), tt.model)
 			require.NoError(t, err)
 
 			var raw map[string]any
@@ -776,24 +927,9 @@ func TestNormalizeChatRequestRejectsUnsupportedFields(t *testing.T) {
 			want: "guided_choice",
 		},
 		{
-			name: "tool choice required",
-			body: `{"tool_choice":"required","tools":[{"type":"function","function":{"name":"x","description":"x","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hello"}]}`,
-			want: "tool_choice=required",
-		},
-		{
 			name: "structured outputs",
 			body: `{"structured_outputs":{"regex":"[a-z]+"},"messages":[{"role":"user","content":"hello"}]}`,
 			want: "structured_outputs",
-		},
-		{
-			name: "presence penalty",
-			body: `{"presence_penalty":1.2,"messages":[{"role":"user","content":"hello"}]}`,
-			want: "presence_penalty",
-		},
-		{
-			name: "frequency penalty",
-			body: `{"frequency_penalty":0.8,"messages":[{"role":"user","content":"hello"}]}`,
-			want: "frequency_penalty",
 		},
 		{
 			name: "prompt logprobs",
@@ -865,6 +1001,71 @@ func TestNormalizeChatRequestResponseFormatPipeline(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "depth")
 		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+}
+
+func TestNormalizeChatRequestChatTemplateKwargsDepthBoundary(t *testing.T) {
+	nestedChain := func(n int) string {
+		s := `{}`
+		for i := 1; i < n; i++ {
+			s = `{"x":` + s + `}`
+		}
+		return s
+	}
+
+	t.Run("accepts chat_template_kwargs at depth limit", func(t *testing.T) {
+		body := `{"chat_template_kwargs":` + nestedChain(16) + `,"messages":[{"role":"user","content":"hi"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects chat_template_kwargs one level past limit with HTTP 400", func(t *testing.T) {
+		body := `{"chat_template_kwargs":` + nestedChain(17) + `,"messages":[{"role":"user","content":"hi"}]}`
+		_, _, err := normalizeChatRequest([]byte(body))
+		require.Error(t, err)
+		require.True(t, errors.Is(err, paramvalidators.ErrSchemaDepth),
+			"expected ErrSchemaDepth (validator-layer reject), got: %v", err)
+		require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+	})
+}
+
+func TestDefaultCatalogSchemaDepthLimits(t *testing.T) {
+	const expected = 16
+
+	findValidator := func(t *testing.T, name string) DocumentValidator {
+		t.Helper()
+		for _, p := range defaultParameterCatalog.parameters {
+			if p.Name != name {
+				continue
+			}
+			for _, rule := range p.Rules {
+				h, ok := rule.Handler.(DocumentValidatorHandler)
+				if !ok {
+					continue
+				}
+				return h.Validator
+			}
+		}
+		t.Fatalf("no DocumentValidator wired for parameter %q in defaultParameterCatalog", name)
+		return nil
+	}
+
+	t.Run("response_format", func(t *testing.T) {
+		v, ok := findValidator(t, "response_format").(paramvalidators.ResponseFormatValidator)
+		require.True(t, ok, "response_format validator is not ResponseFormatValidator")
+		require.Equal(t, expected, v.MaxDepth)
+	})
+
+	t.Run("tools", func(t *testing.T) {
+		v, ok := findValidator(t, "tools").(paramvalidators.ToolsValidator)
+		require.True(t, ok, "tools validator is not ToolsValidator")
+		require.Equal(t, expected, v.MaxDepth)
+	})
+
+	t.Run("chat_template_kwargs", func(t *testing.T) {
+		v, ok := findValidator(t, "chat_template_kwargs").(paramvalidators.ChatTemplateKwargsValidator)
+		require.True(t, ok, "chat_template_kwargs validator is not ChatTemplateKwargsValidator")
+		require.Equal(t, expected, v.MaxDepth)
 	})
 }
 

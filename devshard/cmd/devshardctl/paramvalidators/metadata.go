@@ -37,8 +37,8 @@ const (
 	defaultMetadataMaxValueLen = 512
 )
 
-func (v MetadataValidator) Validate(document map[string]any) error {
-	raw, exists := document["metadata"]
+func (v MetadataValidator) Validate(vctx ValidatorContext) error {
+	raw, exists := vctx.Document["metadata"]
 	if !exists {
 		return nil
 	}

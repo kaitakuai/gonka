@@ -69,8 +69,8 @@ var responseFormatChildMapKeys = map[string]struct{}{
 // Validate inspects the "response_format" entry of the given document. Returns nil if
 // response_format is absent, has type text/json_object, or has a json_schema payload that
 // fits within all configured bounds.
-func (v ResponseFormatValidator) Validate(document map[string]any) error {
-	raw, exists := document["response_format"]
+func (v ResponseFormatValidator) Validate(vctx ValidatorContext) error {
+	raw, exists := vctx.Document["response_format"]
 	if !exists {
 		return nil
 	}

@@ -12,15 +12,12 @@ var (
 	ErrThinkingType  = errors.New("thinking.type: must be \"enabled\" or \"disabled\"")
 )
 
-// ThinkingValidator enforces the Kimi-K2 thinking contract: an object with a single `type`
-// field whose value is either "enabled" or "disabled". Any other shape was previously
-// pass-through, which means a malformed payload could leak into the Jinja template via
-// applyKimiRequestOverrides (which mirrors thinking.type into chat_template_kwargs.thinking
-// for Kimi-K2.6). Reject early at the gateway boundary instead.
-type ThinkingValidator struct{}
+type ThinkingValidator struct {
+	MirrorToTemplateKwargsForModels []string
+}
 
-func (v ThinkingValidator) Validate(document map[string]any) error {
-	raw, exists := document["thinking"]
+func (v ThinkingValidator) Validate(vctx ValidatorContext) error {
+	raw, exists := vctx.Document["thinking"]
 	if !exists {
 		return nil
 	}
@@ -39,5 +36,29 @@ func (v ThinkingValidator) Validate(document map[string]any) error {
 	if typeStr != "enabled" && typeStr != "disabled" {
 		return fmt.Errorf("%w: got %q", ErrThinkingType, typeStr)
 	}
+	if v.shouldMirror(vctx.RoutedModel) {
+		mirrorThinkingToTemplateKwargs(vctx.Document, typeStr == "enabled")
+	}
 	return nil
+}
+
+func (v ThinkingValidator) shouldMirror(routedModel string) bool {
+	for _, m := range v.MirrorToTemplateKwargsForModels {
+		if m == routedModel {
+			return true
+		}
+	}
+	return false
+}
+
+func mirrorThinkingToTemplateKwargs(document map[string]any, enabled bool) {
+	chatTemplateKwargs, _ := document["chat_template_kwargs"].(map[string]any)
+	if chatTemplateKwargs == nil {
+		chatTemplateKwargs = map[string]any{}
+		document["chat_template_kwargs"] = chatTemplateKwargs
+	}
+	if _, exists := chatTemplateKwargs["thinking"]; exists {
+		return
+	}
+	chatTemplateKwargs["thinking"] = enabled
 }

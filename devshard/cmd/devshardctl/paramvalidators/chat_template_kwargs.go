@@ -49,8 +49,8 @@ type ChatTemplateKwargsValidator struct {
 	MaxNodes int
 }
 
-func (v ChatTemplateKwargsValidator) Validate(document map[string]any) error {
-	raw, exists := document["chat_template_kwargs"]
+func (v ChatTemplateKwargsValidator) Validate(vctx ValidatorContext) error {
+	raw, exists := vctx.Document["chat_template_kwargs"]
 	if !exists {
 		return nil
 	}

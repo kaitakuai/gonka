@@ -29,8 +29,8 @@ type UserValidator struct {
 	MaxLen int
 }
 
-func (v UserValidator) Validate(document map[string]any) error {
-	raw, exists := document["user"]
+func (v UserValidator) Validate(vctx ValidatorContext) error {
+	raw, exists := vctx.Document["user"]
 	if !exists {
 		return nil
 	}

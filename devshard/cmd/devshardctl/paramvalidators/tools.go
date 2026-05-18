@@ -16,11 +16,12 @@ var (
 	ErrToolFunctionName  = errors.New("tools[i].function.name: must be a non-empty string")
 )
 
-// ToolsValidator enforces the OpenAI tool object contract -- every tool must declare
-// `type: "function"` and a `function` object with a non-empty `name` -- and then bounds
-// `function.parameters` via SchemaBounds (same grammar-compiler attack surface as
-// response_format). Parameter-less tools are allowed by the OpenAI spec, so an absent
-// `parameters` field is a no-op rather than a failure.
+// ToolsValidator: OpenAI tool contract + cross-field tool_choice cleanup. Each tool must
+// declare `type: "function"` and `function.name`; `function.parameters` is bounded via
+// SchemaBounds. Also handles tool_choice defaulting: drops both fields when tools=[],
+// writes DefaultToolChoiceByModel[RoutedModel] (or DefaultToolChoice) when tool_choice is
+// absent. tool_choice == "required" is coerced to the same default (network policy:
+// "required" is temporarily disabled -- restore here when re-enabling).
 type ToolsValidator struct {
 	MaxDepth      int
 	MaxSize       int
@@ -28,16 +29,34 @@ type ToolsValidator struct {
 	MaxBranch     int
 	MaxEnum       int
 	MaxPatternLen int
+
+	DefaultToolChoice        string
+	DefaultToolChoiceByModel map[string]string
 }
 
-func (v ToolsValidator) Validate(document map[string]any) error {
-	raw, exists := document["tools"]
+func (v ToolsValidator) Validate(vctx ValidatorContext) error {
+	// "required" temporarily disabled: collapse to the model default so the downstream
+	// behavior matches the no-tool_choice case rather than 400-ing the client.
+	if vctx.Document["tool_choice"] == "required" {
+		vctx.Document["tool_choice"] = v.defaultToolChoice(vctx.RoutedModel)
+	}
+	raw, exists := vctx.Document["tools"]
 	if !exists {
 		return nil
 	}
 	arr, ok := raw.([]any)
 	if !ok {
 		return fmt.Errorf("%w: must be an array", ErrToolsShape)
+	}
+	if len(arr) == 0 {
+		delete(vctx.Document, "tools")
+		delete(vctx.Document, "tool_choice")
+		return nil
+	}
+	if _, hasChoice := vctx.Document["tool_choice"]; !hasChoice {
+		if def := v.defaultToolChoice(vctx.RoutedModel); def != "" {
+			vctx.Document["tool_choice"] = def
+		}
 	}
 	bounds := SchemaBounds{
 		MaxDepth:      v.MaxDepth,
@@ -76,4 +95,11 @@ func (v ToolsValidator) Validate(document map[string]any) error {
 		}
 	}
 	return nil
+}
+
+func (v ToolsValidator) defaultToolChoice(routedModel string) string {
+	if def, ok := v.DefaultToolChoiceByModel[routedModel]; ok {
+		return def
+	}
+	return v.DefaultToolChoice
 }

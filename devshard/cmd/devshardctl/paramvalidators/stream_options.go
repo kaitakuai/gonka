@@ -25,15 +25,14 @@ var streamOptionsWhitelist = map[string]struct{}{
 }
 
 // StreamOptionsValidator enforces a strict sub-field whitelist on the OpenAI
-// `stream_options` object. The Validator interface allows in-place mutation of the document
-// (Raw() returns the live map), so this validator both rejects malformed wrappers and
-// rewrites the object to contain only whitelisted keys. If the rewrite leaves the object
-// empty, the field is dropped from the document entirely so it does not reach the upstream
-// as `{}`.
+// `stream_options` object. The validator mutates ValidatorContext.Document in place, both
+// rejecting malformed wrappers and rewriting the object to contain only whitelisted keys.
+// If the rewrite leaves the object empty, the field is dropped from the document entirely
+// so it does not reach the upstream as `{}`.
 type StreamOptionsValidator struct{}
 
-func (v StreamOptionsValidator) Validate(document map[string]any) error {
-	raw, exists := document["stream_options"]
+func (v StreamOptionsValidator) Validate(vctx ValidatorContext) error {
+	raw, exists := vctx.Document["stream_options"]
 	if !exists {
 		return nil
 	}
@@ -47,7 +46,7 @@ func (v StreamOptionsValidator) Validate(document map[string]any) error {
 		}
 	}
 	if len(obj) == 0 {
-		delete(document, "stream_options")
+		delete(vctx.Document, "stream_options")
 	}
 	return nil
 }

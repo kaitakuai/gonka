@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 )
 
 const MaxChatRequestBodySize = 10 * 1024 * 1024
@@ -84,11 +83,14 @@ func defaultChatRequestPipeline() ChatRequestPipeline {
 	}
 }
 
-func (p ChatRequestPipeline) Normalize(body []byte, adminAuthenticated bool, limits outputTokenLimits) ([]byte, chatRequest, error) {
+// Normalize runs the catalog (generic + per-model rules) and emits the rewritten body.
+// routedModel is the proxy's fallback used when body.model is missing.
+func (p ChatRequestPipeline) Normalize(body []byte, adminAuthenticated bool, limits outputTokenLimits, routedModel string) ([]byte, chatRequest, error) {
 	ctx, err := newRequestFilterContext(body, adminAuthenticated, limits)
 	if err != nil {
 		return nil, chatRequest{}, err
 	}
+	ctx.ResolveRoutedModel(routedModel)
 	if err := p.parameters.Apply(RequestFilterStagePreValidation, ctx); err != nil {
 		return nil, chatRequest{}, err
 	}
@@ -110,22 +112,6 @@ func (p ChatRequestPipeline) Normalize(body []byte, adminAuthenticated bool, lim
 		return nil, chatRequest{}, err
 	}
 	return updatedBody, ctx.Request, nil
-}
-
-func (p ChatRequestPipeline) ApplyModelOverrides(body []byte, req chatRequest, model string) ([]byte, chatRequest, error) {
-	if model != kimiK26ModelID {
-		return body, req, nil
-	}
-	ctx, err := newRequestFilterContext(body, false, defaultOutputTokenLimits())
-	if err != nil {
-		return nil, chatRequest{}, err
-	}
-	ctx.Document.LockedScope(translateKimiThinkingForVLLM)
-	updatedBody, err := ctx.Document.Marshal()
-	if err != nil {
-		return nil, chatRequest{}, err
-	}
-	return updatedBody, req, nil
 }
 
 func (p ChatRequestPipeline) applyOutputTokenLimits(ctx *RequestFilterContext) {
@@ -181,10 +167,10 @@ func readLimitedChatRequestBody(r *http.Request) ([]byte, error) {
 }
 
 func prepareChatRequestBody(r *http.Request) ([]byte, chatRequest, error) {
-	return prepareChatRequestBodyWithTokenLimits(r, defaultOutputTokenLimits())
+	return prepareChatRequestBodyWithTokenLimits(r, defaultOutputTokenLimits(), "")
 }
 
-func prepareChatRequestBodyWithTokenLimits(r *http.Request, limits outputTokenLimits) ([]byte, chatRequest, error) {
+func prepareChatRequestBodyWithTokenLimits(r *http.Request, limits outputTokenLimits, routedModel string) ([]byte, chatRequest, error) {
 	body, err := readLimitedChatRequestBody(r)
 	if err != nil {
 		return nil, chatRequest{}, err
@@ -193,58 +179,19 @@ func prepareChatRequestBodyWithTokenLimits(r *http.Request, limits outputTokenLi
 	if err != nil {
 		return nil, chatRequest{}, err
 	}
-	return normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits)
+	return normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits, routedModel)
 }
 
 func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
-	return normalizeChatRequestForAuth(body, false)
+	return normalizeChatRequestForAuthAndLimits(body, false, defaultOutputTokenLimits(), "")
 }
 
-func normalizeChatRequestForAuth(body []byte, adminAuthenticated bool) ([]byte, chatRequest, error) {
-	return normalizeChatRequestForAuthAndLimits(body, adminAuthenticated, defaultOutputTokenLimits())
+func normalizeChatRequestForModel(body []byte, routedModel string) ([]byte, chatRequest, error) {
+	return normalizeChatRequestForAuthAndLimits(body, false, defaultOutputTokenLimits(), routedModel)
 }
 
-func normalizeChatRequestForAuthAndLimits(body []byte, adminAuthenticated bool, limits outputTokenLimits) ([]byte, chatRequest, error) {
-	return defaultChatRequestPipeline().Normalize(body, adminAuthenticated, limits)
-}
-
-func applyKimiRequestOverrides(body []byte, req chatRequest, model string) ([]byte, chatRequest, error) {
-	return defaultChatRequestPipeline().ApplyModelOverrides(body, req, model)
-}
-
-func translateKimiThinkingForVLLM(request map[string]any) {
-	enabled, ok := moonshotThinkingEnabled(request["thinking"])
-	if !ok {
-		return
-	}
-	chatTemplateKwargs, _ := request["chat_template_kwargs"].(map[string]any)
-	if chatTemplateKwargs == nil {
-		chatTemplateKwargs = map[string]any{}
-		request["chat_template_kwargs"] = chatTemplateKwargs
-	}
-	if _, exists := chatTemplateKwargs["thinking"]; exists {
-		return
-	}
-	chatTemplateKwargs["thinking"] = enabled
-}
-
-func moonshotThinkingEnabled(value any) (bool, bool) {
-	thinking, ok := value.(map[string]any)
-	if !ok {
-		return false, false
-	}
-	typ, ok := thinking["type"].(string)
-	if !ok {
-		return false, false
-	}
-	switch strings.ToLower(typ) {
-	case "enabled":
-		return true, true
-	case "disabled":
-		return false, true
-	default:
-		return false, false
-	}
+func normalizeChatRequestForAuthAndLimits(body []byte, adminAuthenticated bool, limits outputTokenLimits, routedModel string) ([]byte, chatRequest, error) {
+	return defaultChatRequestPipeline().Normalize(body, adminAuthenticated, limits, routedModel)
 }
 
 func defaultOutputTokenLimits() outputTokenLimits {
