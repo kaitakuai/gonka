@@ -28,6 +28,9 @@ Anything not on this whitelist does not reach the model. That is the contract.
 
 **Shape validators**:
 - `thinking` — `paramvalidators.ThinkingValidator`
+- `stream_options` — `paramvalidators.StreamOptionsValidator` (whitelist `include_usage`; strip `continuous_usage_stats` for vLLM-project/vllm#9028 + any other sub-field; drop the field if it empties out)
+- `metadata` — `paramvalidators.MetadataValidator` (OpenAI bounds: ≤16 keys × 64-char keys × 512-char string values)
+- `user` — `paramvalidators.UserValidator` (must be a string, byte-length ≤ 512)
 
 **Length / size caps**:
 - `messages` (≤2048) · `stop` (≤16/256B) · `stop_token_ids` (≤64) · `bad_words` (≤64/128B) · `logit_bias` map (≤1024 entries)
@@ -47,14 +50,13 @@ Anything not on this whitelist does not reach the model. That is the contract.
 - Body-level: `MaxRequestNestingDepth=32`, `MaxChatRequestBodySize=10 MiB`
 
 **Pass-through (safe by type contract)**:
-- `model` · `stream` · `skip_special_tokens` · `detokenize`
+- `model` · `stream` · `skip_special_tokens` · `detokenize` · `parallel_tool_calls`
 
 ### ❌ Open / not yet implemented
 
 Field-level additions that Kimi K2/K2.6 actually accepts on the wire (per Moonshot's [chat reference](https://platform.kimi.ai/docs/api/chat) and [K2.6 quickstart](https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart)):
 
 - **`frequency_penalty`, `presence_penalty`** — Kimi accepts these but **for K2.6 only `0.0`** is valid (any other value is rejected upstream; that's a model-side constraint, not a security one). Easy add via `SanitizeFloatParameterHandler` with range `[-2, 2]`. Smallest concrete next step.
-- **`stream_options`** — Kimi accepts `{"include_usage": bool}`. Note: Kimi emits `usage` in *each choice's end-block*, not only in the trailing chunk (divergence from OpenAI). Add as a shape validator.
 - **`prompt_cache_key`** — string. Kimi's first-class context-cache tag (cheaper re-prompts). Add with a string-length cap (e.g. ≤256 B).
 - **`safety_identifier`** — Kimi's analogue to OpenAI's `user`. String pass-through; add over `user` (which Kimi does not document).
 - **`messages[].reasoning_content`** — *required* on assistant turns during multi-step tool-calling when thinking is enabled. The message validator already does NOT reject unknown assistant-message fields (only `tool_call_id` is disallowed on assistant), so this already passes through. Just document the contract; no code change needed.
@@ -88,7 +90,7 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
 
 - **`model` length cap** — redundant with 10 MiB body cap; minimal benefit on a routing-lookup field.
 - **`extra_body` / `extra_headers`** — open-ended escape hatches; breaks the strict-whitelist contract.
-- **Provider-specific fields without vLLM semantics**: `metadata`, `service_tier`, `store`, `parallel_tool_calls`, `reasoning_effort`, `reasoning`, `thinking_config`, `enable_thinking`, `user`, etc. See "Unsupported parameters" below for the full categorized list. (Note: `prompt_cache_key`, `stream_options`, `safety_identifier`, `messages[].reasoning_content` were moved to "❌ Open" above — Kimi K2.6 actually supports them.)
+- **Provider-specific fields without vLLM semantics**: `service_tier`, `store`, `reasoning_effort`, `reasoning`, `thinking_config`, `enable_thinking`, etc. See "Unsupported parameters" below for the full categorized list. (Note: `user`, `metadata`, `parallel_tool_calls`, and `stream_options` are now in the Supported table above — they are OpenAI Chat Completions standard observability fields with no inference-side semantics and no DoS vector; rejecting them broke every OpenAI-built client without security gain. `prompt_cache_key`, `safety_identifier`, `messages[].reasoning_content` remain in "❌ Open" — Kimi K2.6 actually supports them, pending validator work.)
 - **vLLM-native structured-output bypass** (`guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `enforced_tokens`) — would need their own validators; `response_format` covers the same intent with bounds.
 - **Special-token literal stripping in `messages[].content`** (CVE-2026-44222) — text like `<|vision_start|>` crashes vision-language models with an `IndexError`. Kimi-K2.6 is text-only so we are not exposed today. If we route to a VL model in the future, add a content sanitizer at this layer. ([advisory](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f))
 
@@ -122,6 +124,10 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
 | `logprobs` | bool | PostLimits force | Forced to `true` for the gateway's observability pipeline regardless of what the client sent. |
 | `top_logprobs` | int range | PostLimits force | Forced to `5` for the same reason. |
 | `response_format` | object | PreValidation validate (`paramvalidators.ResponseFormatValidator`) | Accepted with bounds. `type` must be one of `text` / `json_object` / `json_schema`. For `json_schema`, the schema is walked once and rejected if depth > 5, nodes > 128, branch arms (anyOf/oneOf/allOf) > 16, enum > 256, serialized size > 16 KiB, or contains `$ref` / `$defs` / `definitions`. Every schema node's `type` must be a JSON-Schema primitive (`string`/`number`/`integer`/`object`/`boolean`/`array`/`null` or an array of those); `pattern` is byte-capped at 512 B and must compile as a regex (defuses CVE-2025-48944). |
+| `user` | string | PreValidation validate (`paramvalidators.UserValidator`) | OpenAI-standard end-user identifier for abuse tracking; no inference-side semantics on the vLLM upstream, ignored on the wire. Must be a string; byte-length ≤ 512 (covers production identifiers — `user_<random>`, UUIDs, hashed ids, email-shaped, framework session ids — while preventing the field from being used as a 10 MiB body-size carrier). |
+| `metadata` | object | PreValidation validate (`paramvalidators.MetadataValidator`) | OpenAI-standard tracking object (LangSmith, distributed tracing, A/B tagging). Bounded to ≤16 keys × 64-char keys × 512-char string values — the same limits the OpenAI API itself enforces. Values must be strings; any other type rejected. |
+| `parallel_tool_calls` | bool | — | Pass-through. OpenAI-standard tool-calling control. Some vLLM versions honor it, some ignore it — the client opted in to that behavioral divergence; no DoS surface. |
+| `stream_options` | object | PreValidation validate (`paramvalidators.StreamOptionsValidator`) | Sub-field whitelist. Only `include_usage` survives — the OpenAI-documented opt-in for a final-chunk `usage` object, required by any streaming client that needs token accounting. `continuous_usage_stats` is stripped (triggers vLLM-project/vllm#9028: per-chunk usage counter is wrong under chunked prefill). Any other / future sub-field is also stripped. If the object empties out, the field is dropped entirely so it never reaches the upstream as `{}`. |
 
 ### Messages contract (recap)
 
@@ -144,9 +150,9 @@ Grouped by why the field is off:
 | --- | --- | --- | --- |
 | Sampling penalties | `frequency_penalty`, `presence_penalty` | Kilo, OpenClaw, OpenAI canonical | vLLM supports them. Trivially safe to add via `SanitizeFloatParameterHandler` with range `[-2, 2]`. Pending only because we have not validated end-to-end on the vLLM build we run. |
 | Structured-output (non-`response_format`) | `guided_json`, `guided_regex`, `guided_grammar`, `guided_choice`, `enforced_tokens`, `structured_outputs` | vLLM-native | Bypasses the response_format safety bounds. Same grammar-compiler attack surface; would need its own validator. |
-| Tool-calling extensions | `parallel_tool_calls`, `tool_choice="required"` | OpenClaw, OpenAI | Provider compatibility differs and `required` is rejected by upstream contract on the vLLM path. |
-| Routing / metadata | `metadata`, `service_tier`, `user`, `extra_body`, `extra_headers`, `provider`, `plugins`, `tags`, `seed_override` | Hermes, OpenClaw, Kilo | Vendor-specific; no inference-side meaning for vLLM. `extra_body` / `extra_headers` are open-ended escape hatches and break the whitelist contract. |
-| Caching / observability | `store`, `prompt_cache_key`, `stream_options` | OpenAI / OpenClaw / Hermes | OpenAI-specific (`store`, `prompt_cache_key`) or streaming-format hint (`stream_options`). Could be safely stripped before forwarding, but currently rejected to avoid silent semantic drift in usage accounting. |
+| Tool-calling extensions | `tool_choice="required"` | OpenClaw, OpenAI | `required` is rejected by upstream contract on the vLLM path (cost-amplifier + engine-wedge on Kimi-K2). `parallel_tool_calls` is now passthrough — see Supported table. |
+| Routing / metadata | `service_tier`, `extra_body`, `extra_headers`, `provider`, `plugins`, `tags`, `seed_override` | Hermes, OpenClaw, Kilo | Vendor-specific. `extra_body` / `extra_headers` are open-ended escape hatches and break the whitelist contract. (`user` and `metadata` were moved to Supported — they are OpenAI Chat Completions standard observability fields, not vendor-specific.) |
+| Caching | `store`, `prompt_cache_key` | OpenAI / OpenClaw | OpenAI-specific server-side state hints. No vLLM semantics. (`stream_options` was moved to Supported with a sub-field whitelist validator — it is required for OpenAI-compatible streaming-with-usage and the only known-bad sub-field, `continuous_usage_stats`, is stripped at the gateway.) |
 | Reasoning (non-vLLM-native) | `reasoning_effort`, `reasoning` (object), `thinking_config`, `enable_thinking` | Hermes (multi-provider), OpenClaw (Qwen/Kimi), Gemini | Use `thinking` + `chat_template_kwargs` instead. Provider-specific reasoning fields are wrapper concerns, not what vLLM speaks. |
 | Provider-specific extras | `extra_body.vl_high_resolution_images` (Qwen), `extra_body.provider` (OpenRouter), `extra_body.tags` (Nous), `extra_body.thinking_config` (Gemini), `extra_body.plugins` (OpenRouter), `messages[].reasoning_content` (Kimi multi-turn replay), `tools[].function.strict` (OpenAI strict schema), `chat_template_kwargs.preserve_thinking` (Qwen wrapper) | Hermes, OpenClaw | Single-vendor attribution / wrapping fields. No vLLM equivalent. |
 

@@ -1288,3 +1288,72 @@ func TestChatRequestDocumentConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// End-to-end coverage that the four OpenAI Chat Completions observability fields survive
+// the catalog's unknown-key gate, with `metadata` bounded and `stream_options` sanitized.
+// Without these catalog entries the gate would 400 every legitimate OpenAI-built client
+// (official SDK with `user=...`, LangChain with `metadata={...}`, any streaming client
+// asking for final-chunk usage).
+func TestNormalizeChatRequestAcceptsOpenAIObservabilityFields(t *testing.T) {
+	body := []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"user":"alice",
+		"metadata":{"trace_id":"abc","span_id":"def"},
+		"parallel_tool_calls":false,
+		"stream_options":{"include_usage":true}
+	}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.Equal(t, "alice", raw["user"])
+	require.Equal(t, map[string]any{"trace_id": "abc", "span_id": "def"}, raw["metadata"])
+	require.Equal(t, false, raw["parallel_tool_calls"])
+	so, ok := raw["stream_options"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, true, so["include_usage"])
+}
+
+// Pipeline-level coverage of StreamOptionsValidator: `continuous_usage_stats` drops out
+// (vLLM-project/vllm#9028), `include_usage` survives.
+func TestNormalizeChatRequestStripsContinuousUsageStats(t *testing.T) {
+	body := []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"stream_options":{"include_usage":true,"continuous_usage_stats":true}
+	}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	so := raw["stream_options"].(map[string]any)
+	require.Equal(t, true, so["include_usage"])
+	require.NotContains(t, so, "continuous_usage_stats")
+}
+
+// Pipeline-level coverage: stream_options that empties out after sanitize is dropped.
+func TestNormalizeChatRequestDropsEmptiedStreamOptions(t *testing.T) {
+	body := []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"stream_options":{"continuous_usage_stats":true}
+	}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "stream_options")
+}
+
+// Pipeline-level coverage of MetadataValidator: too many keys / oversize values are
+// rejected.
+func TestNormalizeChatRequestRejectsOversizedMetadata(t *testing.T) {
+	body := []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"metadata":{"k":"` + strings.Repeat("v", 513) + `"}
+	}`)
+	_, _, err := normalizeChatRequest(body)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "metadata")
+}
