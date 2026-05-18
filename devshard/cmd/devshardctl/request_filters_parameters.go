@@ -598,7 +598,10 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("model"),
 		newParameter("stream"),
 		newParameter("messages").
-			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 2048}),
+			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 2048}).
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.MessageContentSanitizerValidator{},
+			}),
 		newParameter("max_tokens"),
 		newParameter("max_completion_tokens"),
 		newParameter("seed").
@@ -663,6 +666,9 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					MaxPatternLen:     512,
 					DefaultToolChoice: "auto",
 				},
+			}).
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ToolContentSanitizerValidator{},
 			}),
 		newParameter("tool_choice").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{

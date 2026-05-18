@@ -33,6 +33,10 @@ Anything not on this whitelist does not reach the model. That is the contract.
 - `user` — `paramvalidators.UserValidator` (must be a string, byte-length ≤ 512)
 - `tool_choice` — `paramvalidators.ToolChoiceValidator` (shape-only: `"auto"` / `"none"` / function-object with ≤64 B name)
 
+**Content sanitizers (special-token literal injection)**:
+- `messages[].content` — `paramvalidators.MessageContentSanitizerValidator` rejects any string content or text content part carrying a tokenizer special-token literal (`<\|name\|>` form or `[BOS]`/`[EOS]`/`[EOT]`/`[PAD]`/`[UNK]`/`[SEP]`/`[CLS]`/`[MASK]`).
+- `tools[].function.{name,description,parameters.*}` — `paramvalidators.ToolContentSanitizerValidator` applies the same pattern recursively across tool name, description, every parameters property name, and every nested string leaf (descriptions, enum values, format hints). Both validators defuse the class of attack where an attacker injects a literal special-token string that the upstream tokenizer might encode as a single special token ID, breaking out of the chat-template structure (premature `<\|im_end\|>`, forged `<\|im_assistant\|>` turn, spliced `<\|im_system\|>` prompt).
+
 **Length / size caps**:
 - `messages` (≤2048) · `stop` (≤16/256B) · `stop_token_ids` (≤64) · `bad_words` (≤64/128B) · `logit_bias` map (≤1024 entries)
 
@@ -93,7 +97,7 @@ These constraints are enforced by the vLLM engine configuration, not the gateway
 
 - **`moonshotai/Kimi-K2.6`** (multimodal model — text + image + video; gateway policy serves it as text-only)
   - Per [Moonshot K2.6 quickstart](https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart) the model natively accepts `{"type":"image_url"}` and `{"type":"video_url"}` content parts. The gateway message validator rejects non-text content parts (see "Messages contract" below), so image/video inputs never reach vLLM through this path.
-  - **CVE-2026-44222 applies if vLLM is started with the multimodal pathway enabled** (which is the default for a VL/multimodal model). A user can still slip the literal string `<|vision_start|>` through text content, and the gateway does not sanitize it today. See `❌ Open / not yet implemented` above — a content sanitizer is required before we knowingly expose this attack surface.
+  - **CVE-2026-44222**: even with vLLM started on the multimodal pathway, the literal `<\|vision_start\|>` (or any other special-token literal Kimi's tokenizer recognises — Chat-ML role tokens `<\|im_end\|>`, `<\|im_user\|>`, `<\|im_assistant\|>`, `<\|im_system\|>`, `<\|im_middle\|>`, `<\|start_header_id\|>`, `<\|end_header_id\|>`, plus the `[BOS]`/`[EOS]`/`[EOT]` family) is now rejected at the gateway by `MessageContentSanitizerValidator` (on `messages[].content`) and `ToolContentSanitizerValidator` (on `tools[].function.{name,description,parameters.*}`).
 
 ### 🚫 Won't add (out of scope or by design)
 
@@ -336,7 +340,7 @@ Re-check these periodically for status changes (fixed-in versions, new variants,
 | [CVE-2025-9141 / GHSA-79j6-g2m3-jgfw](https://github.com/vllm-project/vllm/security/advisories/GHSA-79j6-g2m3-jgfw) | RCE via `eval()` in `qwen3_coder` tool-call parser | Per-model ops constraint: keep `hermes` parser on Qwen3-235B-Instruct. |
 | [CVE-2025-48887 / GHSA-w6q7-j642-7c25](https://github.com/vllm-project/vllm/security/advisories/GHSA-w6q7-j642-7c25) | ReDoS in `pythonic` tool-call parser | Engine must not run with `--tool-call-parser pythonic`. |
 | [CVE-2026-44223 / GHSA-83vm-p52w-f9pw](https://github.com/vllm-project/vllm/security/advisories/GHSA-83vm-p52w-f9pw) | Penalty fields crash EngineCore with `extract_hidden_states` spec decode | Pin vLLM ≥ 0.20.0 or keep that spec-decode method disabled. |
-| [CVE-2026-44222 / GHSA-hpv8-x276-m59f](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f) | Special-token literals (`<\|vision_start\|>`, etc.) crash VL models | **Open** — Kimi-K2.6 is multimodal; vLLM with the multimodal pathway enabled is exposed via text content. A content sanitizer is needed (tracked in `❌ Open / not yet implemented` above). |
+| [CVE-2026-44222 / GHSA-hpv8-x276-m59f](https://github.com/vllm-project/vllm/security/advisories/GHSA-hpv8-x276-m59f) | Special-token literals injected as text (e.g. `<\|vision_start\|>` in tool descriptions or user content) reach the chat-template renderer; if the tokenizer's special-token table matches, they encode as single special token IDs and break out of the prompt structure (premature `<\|im_end\|>`, forged `<\|im_assistant\|>` turn, spliced `<\|im_system\|>`). Crashes VL models with `IndexError` as a side-effect. | `paramvalidators.MessageContentSanitizerValidator` + `paramvalidators.ToolContentSanitizerValidator` reject the literal forms across messages content and tool name/description/parameters before they reach the chat template. |
 
 ### Qwen3 upstream issues to monitor
 
