@@ -34,10 +34,7 @@ func TestToolsValidatorAccepts(t *testing.T) {
 		{name: "simple parameters", body: `{"tools":[` + toolWithParams(`{"type":"object","properties":{"city":{"type":"string"}}}`) + `]}`},
 		{name: "two tools both valid", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"type":"object","properties":{"x":{"type":"number"}}}`) + `]}`},
 		{name: "parameters at depth limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(16)) + `]}`},
-		// Real-world fixture: OpenClaw `message` tool schema with
-		// presentation.blocks[].buttons[].label reaches depth 12 in production.
-		// Rejected pre-bump (MaxDepth=5); must pass now.
-		{name: "parameters at real-world depth 12", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(12)) + `]}`},
+		{name: "parameters at depth 12", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(12)) + `]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
