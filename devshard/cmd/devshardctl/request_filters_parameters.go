@@ -637,7 +637,18 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}).
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ToolsValidator{
-					MaxDepth:      5,
+					// MaxDepth: 16 — calibrated against captured production payloads.
+					// OpenAI's structured-outputs docs name 5 but their API accepts deeper
+					// schemas in practice (community-confirmed). Real agent tools observed
+					// in our captured-requests reach depth 12 (OpenClaw `message` tool with
+					// `presentation.blocks[].buttons[].label`); Cursor/Claude Code/Kilo/MCP
+					// servers commonly sit at 5–8. 16 gives ~33% headroom over the deepest
+					// legitimate schema we've seen, stays 64× below industry JSON-parser
+					// defaults (Jackson 1000, PHP 512), and does not weaken schema-bomb
+					// defense — that is provided by the composition of MaxNodes=128,
+					// MaxSize=16 KiB, MaxBranch=16, plus the `$ref`/`$defs` ban (a real
+					// bomb is wide, not deep within 16 levels).
+					MaxDepth:      16,
 					MaxSize:       16 * 1024,
 					MaxNodes:      128,
 					MaxBranch:     16,
