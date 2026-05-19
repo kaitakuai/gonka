@@ -35,7 +35,7 @@ func TestToolsValidatorAccepts(t *testing.T) {
 		{name: "two tools both valid", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"type":"object","properties":{"x":{"type":"number"}}}`) + `]}`},
 		{name: "parameters at depth limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(16)) + `]}`},
 		{name: "parameters at depth 12", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(12)) + `]}`},
-		{name: "many properties under node limit", body: `{"tools":[` + toolWithParams(manyPropertiesSchema(200)) + `]}`},
+		{name: "many properties at 200", body: `{"tools":[` + toolWithParams(manyPropertiesSchema(200)) + `]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -69,7 +69,8 @@ func TestToolsValidatorRejects(t *testing.T) {
 		{name: "deep recursion attack hidden in tool", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(200)) + `]}`, wantErr: ErrSchemaDepth},
 		{name: "ref hidden in tool parameters", body: `{"tools":[` + toolWithParams(`{"$ref":"#/foo"}`) + `]}`, wantErr: ErrSchemaRef},
 		{name: "ref hidden under if in tool", body: `{"tools":[` + toolWithParams(`{"if":{"$ref":"#/x"}}`) + `]}`, wantErr: ErrSchemaRef},
-		{name: "node count exceeds in tool", body: `{"tools":[` + toolWithParams(manyPropertiesSchema(300)) + `]}`, wantErr: ErrSchemaNodes},
+		// manyPropertiesSchema(256) = 1 root + 256 children = 257 nodes, one over.
+		{name: "node count one over limit", body: `{"tools":[` + toolWithParams(manyPropertiesSchema(256)) + `]}`, wantErr: ErrSchemaNodes},
 		{name: "size exceeds in tool", body: `{"tools":[` + toolWithParams(`{"type":"object","properties":{"`+strings.Repeat("a", 17*1024)+`":{"type":"string"}}}`) + `]}`, wantErr: ErrSchemaSize},
 		{name: "anyOf exceeds in tool", body: `{"tools":[` + toolWithParams(`{"anyOf":[`+strings.Repeat(`{"type":"string"},`, 16)+`{"type":"string"}]}`) + `]}`, wantErr: ErrSchemaBranch},
 		{name: "enum exceeds in tool", body: `{"tools":[` + toolWithParams(bigEnumSchema(257)) + `]}`, wantErr: ErrSchemaEnum},
