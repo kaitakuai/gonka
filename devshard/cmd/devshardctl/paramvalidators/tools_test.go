@@ -9,14 +9,13 @@ import (
 
 func defaultToolsValidator() ToolsValidator {
 	return ToolsValidator{
-		MaxDepth:                 16,
-		MaxSize:                  16 * 1024,
-		MaxNodes:                 256,
-		MaxBranch:                16,
-		MaxEnum:                  256,
-		MaxPatternLen:            512,
-		DefaultToolChoice:        "auto",
-		DefaultToolChoiceByModel: map[string]string{"none-default-model": "none"},
+		MaxDepth:          16,
+		MaxSize:           16 * 1024,
+		MaxNodes:          256,
+		MaxBranch:         16,
+		MaxEnum:           256,
+		MaxPatternLen:     512,
+		DefaultToolChoice: "auto",
 	}
 }
 
@@ -115,23 +114,11 @@ func TestToolsValidatorDefaultsToolChoiceToAutoWhenAbsent(t *testing.T) {
 	require.Equal(t, "auto", doc["tool_choice"])
 }
 
-func TestToolsValidatorDefaultsToolChoicePerModel(t *testing.T) {
+func TestToolsValidatorCoercesRequiredToDefault(t *testing.T) {
 	v := defaultToolsValidator()
-	doc := parseDocument(t, `{"tools":[{"type":"function","function":{"name":"x"}}]}`)
-	require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "none-default-model"}))
-	require.Equal(t, "none", doc["tool_choice"])
-}
-
-func TestToolsValidatorCoercesRequiredToPerModelDefault(t *testing.T) {
-	v := defaultToolsValidator()
-	// fallback model -> auto
 	doc := parseDocument(t, `{"tools":[{"type":"function","function":{"name":"x"}}],"tool_choice":"required"}`)
 	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 	require.Equal(t, "auto", doc["tool_choice"])
-	// scoped model -> none
-	doc = parseDocument(t, `{"tools":[{"type":"function","function":{"name":"x"}}],"tool_choice":"required"}`)
-	require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "none-default-model"}))
-	require.Equal(t, "none", doc["tool_choice"])
 }
 
 func TestToolsValidatorCoercesRequiredEvenWithoutTools(t *testing.T) {

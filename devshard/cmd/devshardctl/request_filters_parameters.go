@@ -655,17 +655,13 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("tools").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ToolsValidator{
-					MaxDepth:      16,
-					MaxSize:       16 * 1024,
-					MaxNodes:      256,
-					MaxBranch:     16,
-					MaxEnum:       256,
-					MaxPatternLen: 512,
-					// Kimi K2.6 backend is not started with --enable-auto-tool-choice, so
-					// "auto" 400s upstream. Until the chain upgrade v0.2.13 adds the flag, fall back
-					// to "none" for Kimi.
-					DefaultToolChoice:        "auto",
-					DefaultToolChoiceByModel: map[string]string{kimiK26ModelID: "none"},
+					MaxDepth:          16,
+					MaxSize:           16 * 1024,
+					MaxNodes:          256,
+					MaxBranch:         16,
+					MaxEnum:           256,
+					MaxPatternLen:     512,
+					DefaultToolChoice: "auto",
 				},
 			}),
 		newParameter("tool_choice").

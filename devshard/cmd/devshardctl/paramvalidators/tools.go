@@ -19,9 +19,10 @@ var (
 // ToolsValidator: OpenAI tool contract + cross-field tool_choice cleanup. Each tool must
 // declare `type: "function"` and `function.name`; `function.parameters` is bounded via
 // SchemaBounds. Also handles tool_choice defaulting: drops both fields when tools=[],
-// writes DefaultToolChoiceByModel[RoutedModel] (or DefaultToolChoice) when tool_choice is
-// absent. tool_choice == "required" is coerced to the same default (network policy:
-// "required" is temporarily disabled -- restore here when re-enabling).
+// writes DefaultToolChoice when tool_choice is absent. tool_choice == "required" is coerced
+// to DefaultToolChoice (network policy: "required" is temporarily disabled -- restore here
+// when re-enabling). Per-model overrides (e.g. Kimi K2.6 → "none") are wired in the catalog
+// via ModelScopedParameterHandler, not here, so this validator stays model-agnostic.
 type ToolsValidator struct {
 	MaxDepth      int
 	MaxSize       int
@@ -30,15 +31,14 @@ type ToolsValidator struct {
 	MaxEnum       int
 	MaxPatternLen int
 
-	DefaultToolChoice        string
-	DefaultToolChoiceByModel map[string]string
+	DefaultToolChoice string
 }
 
 func (v ToolsValidator) Validate(vctx ValidatorContext) error {
-	// "required" temporarily disabled: collapse to the model default so the downstream
-	// behavior matches the no-tool_choice case rather than 400-ing the client.
+	// "required" temporarily disabled: collapse to the default so the downstream behavior
+	// matches the no-tool_choice case rather than 400-ing the client.
 	if vctx.Document["tool_choice"] == "required" {
-		vctx.Document["tool_choice"] = v.defaultToolChoice(vctx.RoutedModel)
+		vctx.Document["tool_choice"] = v.DefaultToolChoice
 	}
 	raw, exists := vctx.Document["tools"]
 	if !exists {
@@ -54,8 +54,8 @@ func (v ToolsValidator) Validate(vctx ValidatorContext) error {
 		return nil
 	}
 	if _, hasChoice := vctx.Document["tool_choice"]; !hasChoice {
-		if def := v.defaultToolChoice(vctx.RoutedModel); def != "" {
-			vctx.Document["tool_choice"] = def
+		if v.DefaultToolChoice != "" {
+			vctx.Document["tool_choice"] = v.DefaultToolChoice
 		}
 	}
 	bounds := SchemaBounds{
@@ -95,11 +95,4 @@ func (v ToolsValidator) Validate(vctx ValidatorContext) error {
 		}
 	}
 	return nil
-}
-
-func (v ToolsValidator) defaultToolChoice(routedModel string) string {
-	if def, ok := v.DefaultToolChoiceByModel[routedModel]; ok {
-		return def
-	}
-	return v.DefaultToolChoice
 }

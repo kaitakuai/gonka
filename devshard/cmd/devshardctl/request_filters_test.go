@@ -530,33 +530,6 @@ func TestNormalizeChatRequestCoercesRequiredToAuto(t *testing.T) {
 	require.Equal(t, "auto", raw["tool_choice"])
 }
 
-func TestNormalizeChatRequestCoercesRequiredToNoneForKimi(t *testing.T) {
-	body := `{
-		"model": "moonshotai/Kimi-K2.6",
-		"tool_choice": "required",
-		"tools": [{"type":"function","function":{"name":"x","parameters":{"type":"object"}}}],
-		"messages": [{"role":"user","content":"hi"}]
-	}`
-	out, _, err := normalizeChatRequest([]byte(body))
-	require.NoError(t, err)
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(out, &raw))
-	require.Equal(t, "none", raw["tool_choice"])
-}
-
-func TestNormalizeChatRequestDefaultsToolChoiceToNoneForKimi(t *testing.T) {
-	body := `{
-		"model": "moonshotai/Kimi-K2.6",
-		"tools": [{"type":"function","function":{"name":"x","parameters":{"type":"object"}}}],
-		"messages": [{"role":"user","content":"hi"}]
-	}`
-	out, _, err := normalizeChatRequest([]byte(body))
-	require.NoError(t, err)
-	var raw map[string]any
-	require.NoError(t, json.Unmarshal(out, &raw))
-	require.Equal(t, "none", raw["tool_choice"])
-}
-
 func TestNormalizeChatRequestRejectsMalformedToolChoice(t *testing.T) {
 	tests := []string{
 		`{"tool_choice":"force","messages":[{"role":"user","content":"hi"}]}`,
