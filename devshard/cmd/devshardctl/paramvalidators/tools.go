@@ -83,6 +83,12 @@ func (v ToolsValidator) Validate(vctx ValidatorContext) error {
 		if !ok || name == "" {
 			return fmt.Errorf("%w (tools[%d])", ErrToolFunctionName, i)
 		}
+		// OpenAI Structured Outputs flag. vLLM accepts but does not honor it
+		// (kimi_k2 / hermes tool parsers ignore the field; grammar enforcement
+		// flows through tool_choice="required" instead). Strip silently so
+		// well-behaved OpenAI clients (LangChain, etc.) keep working without
+		// implying schema enforcement we can't deliver.
+		delete(fn, "strict")
 		params, ok := fn["parameters"].(map[string]any)
 		if !ok {
 			continue

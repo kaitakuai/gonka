@@ -141,3 +141,25 @@ func TestToolsValidatorDoesNotTouchToolChoiceWhenToolsAbsent(t *testing.T) {
 	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 	require.NotContains(t, doc, "tool_choice")
 }
+
+func TestToolsValidatorStripsFunctionStrict(t *testing.T) {
+	v := defaultToolsValidator()
+	doc := parseDocument(t, `{"tools":[{"type":"function","function":{"name":"x","strict":true,"parameters":{"type":"object"}}}]}`)
+	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
+	tools := doc["tools"].([]any)
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	require.NotContains(t, fn, "strict")
+	require.Equal(t, "x", fn["name"])
+	require.Contains(t, fn, "parameters")
+}
+
+func TestToolsValidatorStripsFunctionStrictAcrossMultipleTools(t *testing.T) {
+	v := defaultToolsValidator()
+	doc := parseDocument(t, `{"tools":[{"type":"function","function":{"name":"a","strict":true}},{"type":"function","function":{"name":"b","strict":false}}]}`)
+	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
+	tools := doc["tools"].([]any)
+	for _, t0 := range tools {
+		fn := t0.(map[string]any)["function"].(map[string]any)
+		require.NotContains(t, fn, "strict")
+	}
+}
