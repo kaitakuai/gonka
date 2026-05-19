@@ -9,7 +9,7 @@ import (
 
 func defaultToolsValidator() ToolsValidator {
 	return ToolsValidator{
-		MaxDepth:      5,
+		MaxDepth:      16,
 		MaxSize:       16 * 1024,
 		MaxNodes:      128,
 		MaxBranch:     16,
@@ -33,7 +33,8 @@ func TestToolsValidatorAccepts(t *testing.T) {
 		{name: "parameter-less tool with name", body: `{"tools":[{"type":"function","function":{"name":"x"}}]}`},
 		{name: "simple parameters", body: `{"tools":[` + toolWithParams(`{"type":"object","properties":{"city":{"type":"string"}}}`) + `]}`},
 		{name: "two tools both valid", body: `{"tools":[` + toolWithParams(`{"type":"object"}`) + `,` + toolWithParams(`{"type":"object","properties":{"x":{"type":"number"}}}`) + `]}`},
-		{name: "parameters at depth limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(5)) + `]}`},
+		{name: "parameters at depth limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(16)) + `]}`},
+		{name: "parameters at depth 12", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(12)) + `]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,7 +64,7 @@ func TestToolsValidatorRejects(t *testing.T) {
 		{name: "function name missing", body: `{"tools":[{"type":"function","function":{}}]}`, wantErr: ErrToolFunctionName},
 		{name: "function name empty", body: `{"tools":[{"type":"function","function":{"name":""}}]}`, wantErr: ErrToolFunctionName},
 		{name: "function name not a string", body: `{"tools":[{"type":"function","function":{"name":42}}]}`, wantErr: ErrToolFunctionName},
-		{name: "depth exceeds limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(6)) + `]}`, wantErr: ErrSchemaDepth},
+		{name: "depth exceeds limit", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(17)) + `]}`, wantErr: ErrSchemaDepth},
 		{name: "deep recursion attack hidden in tool", body: `{"tools":[` + toolWithParams(nestedPropertiesSchema(200)) + `]}`, wantErr: ErrSchemaDepth},
 		{name: "ref hidden in tool parameters", body: `{"tools":[` + toolWithParams(`{"$ref":"#/foo"}`) + `]}`, wantErr: ErrSchemaRef},
 		{name: "ref hidden under if in tool", body: `{"tools":[` + toolWithParams(`{"if":{"$ref":"#/x"}}`) + `]}`, wantErr: ErrSchemaRef},

@@ -637,7 +637,7 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}).
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ToolsValidator{
-					MaxDepth:      5,
+					MaxDepth:      16,
 					MaxSize:       16 * 1024,
 					MaxNodes:      128,
 					MaxBranch:     16,
