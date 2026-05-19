@@ -57,19 +57,6 @@ func (h ConditionalStripParameterHandler) Apply(ctx *RequestFilterContext, param
 	return nil
 }
 
-type RejectStringValueParameterHandler struct {
-	Value   string
-	Message string
-}
-
-func (h RejectStringValueParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	current, ok := ctx.Document.String(parameter.Name)
-	if ok && current == h.Value {
-		return badChatRequest("%s", h.Message)
-	}
-	return nil
-}
-
 type SanitizeStringListParameterHandler struct {
 	Keep             func(string) bool
 	DropFieldIfEmpty bool
@@ -102,6 +89,7 @@ func (h SanitizeStringListParameterHandler) Apply(ctx *RequestFilterContext, par
 // SanitizeFloatParameterHandler normalizes numeric knobs from either JSON numbers or string-encoded numbers.
 type SanitizeFloatParameterHandler struct {
 	StripNonFinite bool
+	Min            *float64
 	Max            *float64
 }
 
@@ -119,10 +107,13 @@ func (h SanitizeFloatParameterHandler) Apply(ctx *RequestFilterContext, paramete
 		ctx.Document.Delete(parameter.Name)
 		return nil
 	}
-	ctx.Document.Set(parameter.Name, number)
-	if h.Max != nil && number > *h.Max {
-		ctx.Document.Set(parameter.Name, *h.Max)
+	if h.Min != nil && number < *h.Min {
+		number = *h.Min
 	}
+	if h.Max != nil && number > *h.Max {
+		number = *h.Max
+	}
+	ctx.Document.Set(parameter.Name, number)
 	return nil
 }
 
@@ -169,10 +160,35 @@ func (h SanitizeFloatMapParameterHandler) Apply(ctx *RequestFilterContext, param
 
 type ForceLiteralParameterHandler struct {
 	Value any
+	OverwriteOnly bool
 }
 
 func (h ForceLiteralParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
+	if h.OverwriteOnly {
+		if _, exists := ctx.Document.Get(parameter.Name); !exists {
+			return nil
+		}
+	}
 	ctx.Document.Set(parameter.Name, h.Value)
+	return nil
+}
+
+// ModelScopedParameterHandler runs Handler only when ctx.RoutedModel matches one of Models
+// (exact, case-sensitive).
+type ModelScopedParameterHandler struct {
+	Models  []string
+	Handler ParameterHandler
+}
+
+func (h ModelScopedParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
+	if h.Handler == nil {
+		return nil
+	}
+	for _, m := range h.Models {
+		if m == ctx.RoutedModel {
+			return h.Handler.Apply(ctx, parameter)
+		}
+	}
 	return nil
 }
 
@@ -260,22 +276,10 @@ func (h LengthCapListParameterHandler) Apply(ctx *RequestFilterContext, paramete
 	return nil
 }
 
-type CustomParameterHandler struct {
-	ApplyFunc func(*RequestFilterContext, VLLMParameter) error
-}
-
-func (h CustomParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	if h.ApplyFunc == nil {
-		return nil
-	}
-	return h.ApplyFunc(ctx, parameter)
-}
-
-// DocumentValidator is the contract pure validators in paramvalidators expose.
-// Adapter wraps them so their errors become badChatRequest(400) responses without coupling
-// each validator to the gateway's pipeline types.
+// DocumentValidator: validators in paramvalidators expose this contract. May mutate
+// vctx.Document for per-model rewrites alongside shape checks.
 type DocumentValidator interface {
-	Validate(map[string]any) error
+	Validate(paramvalidators.ValidatorContext) error
 }
 
 type DocumentValidatorHandler struct {
@@ -287,8 +291,11 @@ func (h DocumentValidatorHandler) Apply(ctx *RequestFilterContext, _ VLLMParamet
 		return nil
 	}
 	var validateErr error
-	ctx.Document.RLockedScope(func(raw map[string]any) {
-		validateErr = h.Validator.Validate(raw)
+	ctx.Document.LockedScope(func(raw map[string]any) {
+		validateErr = h.Validator.Validate(paramvalidators.ValidatorContext{
+			Document:    raw,
+			RoutedModel: ctx.RoutedModel,
+		})
 	})
 	if validateErr != nil {
 		return wrapBadChatRequest(validateErr)
@@ -473,6 +480,7 @@ type RequestFilterContext struct {
 	OutputLimits       outputTokenLimits
 	AdminAuthenticated bool
 	Request            chatRequest
+	RoutedModel        string
 }
 
 func newRequestFilterContext(body []byte, adminAuthenticated bool, limits outputTokenLimits) (*RequestFilterContext, error) {
@@ -485,6 +493,17 @@ func newRequestFilterContext(body []byte, adminAuthenticated bool, limits output
 		OutputLimits:       normalizedOutputTokenLimits(limits),
 		AdminAuthenticated: adminAuthenticated,
 	}, nil
+}
+
+// ResolveRoutedModel sets ctx.RoutedModel: trimmed body.model wins, else the fallback.
+func (ctx *RequestFilterContext) ResolveRoutedModel(fallback string) {
+	if m, ok := ctx.Document.String("model"); ok {
+		if trimmed := strings.TrimSpace(m); trimmed != "" {
+			ctx.RoutedModel = trimmed
+			return
+		}
+	}
+	ctx.RoutedModel = fallback
 }
 
 // DecodeRequest populates ctx.Request from ctx.Document via direct field reads. Previously
@@ -587,7 +606,10 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("skip_special_tokens"),
 		newParameter("detokenize"),
 		newParameter("n").
-			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}),
+			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}).
+			withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
+				Validator: paramvalidators.GreedySamplingValidator{},
+			}),
 		newParameter("temperature").
 			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
 		newParameter("top_p").
@@ -598,6 +620,18 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
 		newParameter("repetition_penalty").
 			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
+		newParameter("frequency_penalty").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Min: floatPointer(-2.0), Max: floatPointer(2.0)}).
+			withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
+				Models:  []string{kimiK26ModelID},
+				Handler: ForceLiteralParameterHandler{Value: 0.0, OverwriteOnly: true},
+			}),
+		newParameter("presence_penalty").
+			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Min: floatPointer(-2.0), Max: floatPointer(2.0)}).
+			withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
+				Models:  []string{kimiK26ModelID},
+				Handler: ForceLiteralParameterHandler{Value: 0.0, OverwriteOnly: true},
+			}),
 		newParameter("logit_bias").
 			withRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true, MaxEntries: 1024}),
 		newParameter("stop").
@@ -606,18 +640,34 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 64}),
 		newParameter("thinking").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ThinkingValidator{},
+				Validator: paramvalidators.ThinkingValidator{
+					MirrorToTemplateKwargsForModels: []string{kimiK26ModelID},
+				},
 			}),
 		newParameter("chat_template_kwargs").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ChatTemplateKwargsValidator{
-					MaxDepth: 5,
+					MaxDepth: 16,
 					MaxSize:  16 * 1024,
 					MaxNodes: 128,
 				},
 			}),
+		newParameter("tools").
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ToolsValidator{
+					MaxDepth:          16,
+					MaxSize:           16 * 1024,
+					MaxNodes:          256,
+					MaxBranch:         16,
+					MaxEnum:           256,
+					MaxPatternLen:     512,
+					DefaultToolChoice: "auto",
+				},
+			}),
 		newParameter("tool_choice").
-			withRule(RequestFilterStagePreValidation, RejectStringValueParameterHandler{Value: "required", Message: unsupportedChatParameterMessage("tool_choice=required")}),
+			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+				Validator: paramvalidators.ToolChoiceValidator{MaxNameLen: 64},
+			}),
 		newParameter("min_tokens").
 			withRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
 				Predicate: func(ctx *RequestFilterContext) bool {
@@ -633,18 +683,6 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 				DropFieldIfEmpty: true,
 			}).
 			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 64, MaxEntryLen: 128}),
-		newParameter("tools").
-			withRule(RequestFilterStagePreValidation, CustomParameterHandler{ApplyFunc: stripEmptyToolsAndToolChoice}).
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ToolsValidator{
-					MaxDepth:      16,
-					MaxSize:       16 * 1024,
-					MaxNodes:      256,
-					MaxBranch:     16,
-					MaxEnum:       256,
-					MaxPatternLen: 512,
-				},
-			}),
 		// OpenAI Chat Completions standard observability fields. No inference-side
 		// semantics on the vLLM upstream; clients send them for end-user tracking,
 		// distributed tracing, agent control, and streaming token accounting.
@@ -678,7 +716,7 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 		newParameter("response_format").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ResponseFormatValidator{
-					MaxDepth:      5,
+					MaxDepth:      16,
 					MaxSize:       16 * 1024,
 					MaxNodes:      128,
 					MaxBranch:     16,
@@ -742,15 +780,6 @@ func newParameter(name string) VLLMParameter {
 func (p VLLMParameter) withRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
 	p.Rules = append(p.Rules, ParameterRule{Stage: stage, Handler: handler})
 	return p
-}
-
-func stripEmptyToolsAndToolChoice(ctx *RequestFilterContext, _ VLLMParameter) error {
-	tools, ok := ctx.Document.Array("tools")
-	if ok && len(tools) == 0 {
-		ctx.Document.Delete("tools")
-		ctx.Document.Delete("tool_choice")
-	}
-	return nil
 }
 
 func floatPointer(value float64) *float64 {

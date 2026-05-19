@@ -18,7 +18,7 @@ func TestStreamOptionsValidatorAccepts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.NoError(t, v.Validate(parseDocument(t, tt.body)))
+			require.NoError(t, v.Validate(ValidatorContext{Document: parseDocument(t, tt.body)}))
 		})
 	}
 }
@@ -37,7 +37,7 @@ func TestStreamOptionsValidatorRejects(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := v.Validate(parseDocument(t, tt.body))
+			err := v.Validate(ValidatorContext{Document: parseDocument(t, tt.body)})
 			require.Error(t, err)
 			require.ErrorIs(t, err, tt.wantErr)
 		})
@@ -50,7 +50,7 @@ func TestStreamOptionsValidatorRejects(t *testing.T) {
 func TestStreamOptionsValidatorStripsContinuousUsageStats(t *testing.T) {
 	v := StreamOptionsValidator{}
 	doc := parseDocument(t, `{"stream_options":{"include_usage":true,"continuous_usage_stats":true}}`)
-	require.NoError(t, v.Validate(doc))
+	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 
 	so, ok := doc["stream_options"].(map[string]any)
 	require.True(t, ok, "stream_options should survive when include_usage remains")
@@ -63,7 +63,7 @@ func TestStreamOptionsValidatorStripsContinuousUsageStats(t *testing.T) {
 func TestStreamOptionsValidatorStripsUnknownSubField(t *testing.T) {
 	v := StreamOptionsValidator{}
 	doc := parseDocument(t, `{"stream_options":{"include_usage":true,"fancy_new_field":42}}`)
-	require.NoError(t, v.Validate(doc))
+	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 
 	so := doc["stream_options"].(map[string]any)
 	require.Equal(t, true, so["include_usage"])
@@ -75,7 +75,7 @@ func TestStreamOptionsValidatorStripsUnknownSubField(t *testing.T) {
 func TestStreamOptionsValidatorDropsEmptyObject(t *testing.T) {
 	v := StreamOptionsValidator{}
 	doc := parseDocument(t, `{"stream_options":{"continuous_usage_stats":true}}`)
-	require.NoError(t, v.Validate(doc))
+	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 	require.NotContains(t, doc, "stream_options")
 }
 
@@ -83,6 +83,6 @@ func TestStreamOptionsValidatorDropsEmptyObject(t *testing.T) {
 func TestStreamOptionsValidatorDropsEmptyInput(t *testing.T) {
 	v := StreamOptionsValidator{}
 	doc := parseDocument(t, `{"stream_options":{}}`)
-	require.NoError(t, v.Validate(doc))
+	require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 	require.NotContains(t, doc, "stream_options")
 }

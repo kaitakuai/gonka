@@ -89,7 +89,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, req, err := prepareChatRequestBodyWithTokenLimits(r, p.outputTokenLimits())
+	body, req, err := prepareChatRequestBodyWithTokenLimits(r, p.outputTokenLimits(), p.model)
 	if err != nil {
 		logRequestStage(ctx, "proxy_read_body_failed", "error", err)
 		writeGatewayJSONError(w, chatRequestErrorStatus(err, http.StatusBadRequest), err.Error())
@@ -99,12 +99,6 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	model := req.Model
 	if model == "" {
 		model = p.model
-	}
-	body, req, err = applyKimiRequestOverrides(body, req, model)
-	if err != nil {
-		logRequestStage(ctx, "proxy_request_filter_failed", "error", err)
-		writeGatewayJSONError(w, chatRequestErrorStatus(err, http.StatusBadRequest), err.Error())
-		return
 	}
 	params := user.InferenceParams{
 		Model:       model,

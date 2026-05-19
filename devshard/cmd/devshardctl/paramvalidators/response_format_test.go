@@ -11,7 +11,7 @@ import (
 
 func defaultResponseFormatValidator() ResponseFormatValidator {
 	return ResponseFormatValidator{
-		MaxDepth:      5,
+		MaxDepth:      16,
 		MaxSize:       16 * 1024,
 		MaxNodes:      128,
 		MaxBranch:     16,
@@ -42,7 +42,7 @@ func TestResponseFormatValidatorAccepts(t *testing.T) {
 		{name: "type text", body: `{"response_format":{"type":"text"}}`},
 		{name: "type json_object", body: `{"response_format":{"type":"json_object"}}`},
 		{name: "json_schema simple", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"weather_v1","schema":{"type":"object","properties":{"city":{"type":"string"},"temp":{"type":"number"}},"required":["city"]}}}}`},
-		{name: "json_schema at depth limit", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(5))},
+		{name: "json_schema at depth limit", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(16))},
 		{name: "json_schema with anyOf at branch limit", body: jsonSchemaResponseFormatBody(`{"anyOf":[` + strings.Repeat(`{"type":"string"},`, 15) + `{"type":"string"}]}`)},
 		{name: "json_schema with enum at limit", body: jsonSchemaResponseFormatBody(bigEnumSchema(256))},
 		{name: "json_schema name with dots dashes underscores", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"abc_DEF-1.2","schema":{"type":"object"}}}}`},
@@ -50,16 +50,16 @@ func TestResponseFormatValidatorAccepts(t *testing.T) {
 		{name: "schema type as array of primitives", body: jsonSchemaResponseFormatBody(`{"type":["string","null"]}`)},
 		// A reasonable regex pattern under the length cap compiles and is accepted.
 		{name: "schema with valid pattern", body: jsonSchemaResponseFormatBody(`{"type":"string","pattern":"^[a-zA-Z0-9_-]+$"}`)},
-		// Co-boundary: hit both MaxDepth=5 and MaxNodes=128 simultaneously. 4 chain levels
-		// + 124 leaf properties = 128 nodes, leaves sit at depth 5.
-		{name: "depth and nodes both at limit", body: jsonSchemaResponseFormatBody(coBoundarySchema(4, 124))},
+		// Co-boundary: hit MaxDepth=16 and MaxNodes=128 simultaneously. 15 chain levels
+		// + 113 leaf properties = 128 nodes, leaves sit at depth 16.
+		{name: "depth and nodes both at limit", body: jsonSchemaResponseFormatBody(coBoundarySchema(15, 113))},
 		// Size boundary: exactly MaxSize=16384 bytes after json.Marshal. > MaxSize rejects.
 		{name: "marshalled size exactly at limit", body: jsonSchemaResponseFormatBody(schemaOfMarshalledSize(t, 16*1024))},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := parseDocument(t, tt.body)
-			require.NoError(t, v.Validate(doc))
+			require.NoError(t, v.Validate(ValidatorContext{Document: doc}))
 		})
 	}
 }
@@ -81,7 +81,7 @@ func TestResponseFormatValidatorRejects(t *testing.T) {
 		{name: "json_schema name too long", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"` + strings.Repeat("a", 65) + `","schema":{"type":"object"}}}}`, wantErr: ErrResponseFormatName},
 		{name: "json_schema missing schema", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"r"}}}`, wantErr: ErrResponseFormatSchemaShape},
 		{name: "schema not an object", body: `{"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":"x"}}}`, wantErr: ErrResponseFormatSchemaShape},
-		{name: "depth exceeds limit", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(6)), wantErr: ErrSchemaDepth},
+		{name: "depth exceeds limit", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(17)), wantErr: ErrSchemaDepth},
 		{name: "deep recursion attack", body: jsonSchemaResponseFormatBody(nestedPropertiesSchema(200)), wantErr: ErrSchemaDepth},
 		{name: "schema size exceeds 16 KiB", body: jsonSchemaResponseFormatBody(`{"type":"object","properties":{"` + strings.Repeat("a", 17*1024) + `":{"type":"string"}}}`), wantErr: ErrSchemaSize},
 		// Size boundary: MaxSize+1 must reject. CheckSize uses `> MaxSize`, so the off-by-one
@@ -128,7 +128,7 @@ func TestResponseFormatValidatorRejects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := parseDocument(t, tt.body)
-			err := v.Validate(doc)
+			err := v.Validate(ValidatorContext{Document: doc})
 			require.Error(t, err)
 			require.ErrorIs(t, err, tt.wantErr)
 		})

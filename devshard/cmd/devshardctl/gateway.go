@@ -1473,8 +1473,9 @@ func (g *Gateway) parseChatReservation(r *http.Request, defaultModel string) ([]
 		return nil, "", 0, err
 	}
 	model := chatRequestModel(body)
-	limits := g.outputTokenLimitsForModel(firstNonEmpty(model, defaultModel))
-	updatedBody, req, err := normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits)
+	routedModel := firstNonEmpty(model, defaultModel)
+	limits := g.outputTokenLimitsForModel(routedModel)
+	updatedBody, req, err := normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits, routedModel)
 	if err != nil {
 		return nil, "", 0, err
 	}

@@ -23,7 +23,7 @@ func TestMetadataValidatorAccepts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.NoError(t, v.Validate(parseDocument(t, tt.body)))
+			require.NoError(t, v.Validate(ValidatorContext{Document: parseDocument(t, tt.body)}))
 		})
 	}
 }
@@ -47,7 +47,7 @@ func TestMetadataValidatorRejects(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := v.Validate(parseDocument(t, tt.body))
+			err := v.Validate(ValidatorContext{Document: parseDocument(t, tt.body)})
 			require.Error(t, err)
 			require.ErrorIs(t, err, tt.wantErr)
 		})
@@ -58,14 +58,14 @@ func TestMetadataValidatorRejects(t *testing.T) {
 func TestMetadataValidatorRespectsCustomLimits(t *testing.T) {
 	v := MetadataValidator{MaxKeys: 1, MaxKeyLen: 4, MaxValueLen: 4}
 
-	require.NoError(t, v.Validate(parseDocument(t, `{"metadata":{"key":"val"}}`)))
+	require.NoError(t, v.Validate(ValidatorContext{Document: parseDocument(t, `{"metadata":{"key":"val"}}`)}))
 
-	err := v.Validate(parseDocument(t, `{"metadata":{"k1":"v","k2":"v"}}`))
+	err := v.Validate(ValidatorContext{Document: parseDocument(t, `{"metadata":{"k1":"v","k2":"v"}}`)})
 	require.ErrorIs(t, err, ErrMetadataKeyCount)
 
-	err = v.Validate(parseDocument(t, `{"metadata":{"keyy":"v"}}`))
+	err = v.Validate(ValidatorContext{Document: parseDocument(t, `{"metadata":{"keyy":"v"}}`)})
 	require.NoError(t, err) // 4 chars exactly
-	err = v.Validate(parseDocument(t, `{"metadata":{"keyyy":"v"}}`))
+	err = v.Validate(ValidatorContext{Document: parseDocument(t, `{"metadata":{"keyyy":"v"}}`)})
 	require.ErrorIs(t, err, ErrMetadataKey)
 }
 
