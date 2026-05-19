@@ -639,7 +639,7 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 				Validator: paramvalidators.ToolsValidator{
 					MaxDepth:      16,
 					MaxSize:       16 * 1024,
-					MaxNodes:      128,
+					MaxNodes:      256,
 					MaxBranch:     16,
 					MaxEnum:       256,
 					MaxPatternLen: 512,
