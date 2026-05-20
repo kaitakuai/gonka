@@ -1033,6 +1033,7 @@ func TestGatewayHandlePooledChatSetsChosenDevshardHeader(t *testing.T) {
 	fast.activeRequests.Store(0)
 
 	g := NewGateway([]*devshardRuntime{slow, fast}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen/Test","messages":[{"role":"user","content":"hello"}]}`))
 	rec := httptest.NewRecorder()
@@ -1237,6 +1238,10 @@ func TestGatewayHandlePooledChatRejectsUnsupportedModel(t *testing.T) {
 		}),
 	}
 	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{
+		{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)},
+		{ModelID: "Nope/Unsupported", AccessMode: string(gatewayAccessModeOpen)},
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"Nope/Unsupported","messages":[{"role":"user","content":"hello"}]}`))
@@ -1288,6 +1293,7 @@ func TestGatewayPooledChatRefreshesCapacityScaleBeforeAcquire(t *testing.T) {
 		participantSlotCounts: map[string]int{"host-a": 1, "host-b": 1},
 	}
 	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(4, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
 	g.participantLimiter = limiter
 	g.capacity.SetLiveAvailable(limiter.IsAvailable)
 	g.capacity.SetHostWeights(map[string]float64{"host-a": 1, "host-b": 1}, false)
@@ -2287,6 +2293,7 @@ func TestGatewayMetricsEndpointExposedAndUpdated(t *testing.T) {
 		}),
 	}
 	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(10, 1), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
 	handler := buildGatewayHandler(g, runtimeOptions{apiKeys: map[string]struct{}{"secret": {}}})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
@@ -2373,6 +2380,7 @@ func TestGatewayLimiterBypassedDuringRelaxedPoC(t *testing.T) {
 	rt.active.Store(true)
 
 	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(1, 1), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"Qwen/Test","messages":[{"role":"user","content":"hello world"}]}`))
 	rec := httptest.NewRecorder()
