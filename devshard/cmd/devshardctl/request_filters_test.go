@@ -1572,22 +1572,22 @@ func TestNormalizeChatRequestKimiThinkingTokenBudgetClampsAboveAbsoluteMax(t *te
 	require.Contains(t, string(body), `"thinking_token_budget":96000`)
 }
 
-func TestNormalizeChatRequestKimiThinkingTokenBudgetSmallMaxTokensSaturates(t *testing.T) {
+func TestNormalizeChatRequestKimiThinkingTokenBudgetSmallMaxTokensSplitsInHalf(t *testing.T) {
 	body, _, err := normalizeChatRequestForModel(
 		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":200}`),
 		kimiK26ModelID,
 	)
 	require.NoError(t, err)
-	require.Contains(t, string(body), `"thinking_token_budget":200`)
+	require.Contains(t, string(body), `"thinking_token_budget":100`)
 }
 
-func TestNormalizeChatRequestKimiThinkingTokenBudgetMinFloorAppliesWhenBelow(t *testing.T) {
+func TestNormalizeChatRequestKimiThinkingTokenBudgetHalfSplitMidRange(t *testing.T) {
 	body, _, err := normalizeChatRequestForModel(
 		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":400}`),
 		kimiK26ModelID,
 	)
 	require.NoError(t, err)
-	require.Contains(t, string(body), `"thinking_token_budget":256`)
+	require.Contains(t, string(body), `"thinking_token_budget":200`)
 }
 
 func TestNormalizeChatRequestKimiThinkingTokenBudgetEnforcedEvenWhenDisabled(t *testing.T) {

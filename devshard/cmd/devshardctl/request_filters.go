@@ -17,7 +17,6 @@ const emptyToolResultContent = "<empty tool result>"
 
 const (
 	kimiThinkingTokenBudgetDefaultDivisor uint64 = 2
-	kimiThinkingTokenBudgetMin            uint64 = 256
 	kimiThinkingTokenBudgetMax            uint64 = 96_000
 )
 

@@ -2,7 +2,6 @@ package paramvalidators
 
 type ThinkingTokenBudgetDefaultsValidator struct {
 	DefaultDivisor uint64
-	MinValue       uint64
 	Models         []string
 }
 
@@ -20,9 +19,6 @@ func (v ThinkingTokenBudgetDefaultsValidator) Validate(vctx ValidatorContext) er
 	value := maxTokens
 	if v.DefaultDivisor > 0 {
 		value = maxTokens / v.DefaultDivisor
-	}
-	if v.MinValue > 0 && value < v.MinValue {
-		value = v.MinValue
 	}
 	vctx.Document["thinking_token_budget"] = value
 	return nil

@@ -657,7 +657,6 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
 				Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
 					DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
-					MinValue:       kimiThinkingTokenBudgetMin,
 					Models:         []string{kimiK26ModelID},
 				},
 			}).

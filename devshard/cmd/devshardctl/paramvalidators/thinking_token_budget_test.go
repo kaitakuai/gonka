@@ -7,7 +7,7 @@ import (
 )
 
 func TestThinkingTokenBudgetDefaultsValidator(t *testing.T) {
-	v := ThinkingTokenBudgetDefaultsValidator{DefaultDivisor: 2, MinValue: 256, Models: []string{"kimi-model"}}
+	v := ThinkingTokenBudgetDefaultsValidator{DefaultDivisor: 2, Models: []string{"kimi-model"}}
 
 	t.Run("injects default for scoped model when absent", func(t *testing.T) {
 		doc := parseDocument(t, `{"max_tokens":4096}`)
@@ -21,10 +21,16 @@ func TestThinkingTokenBudgetDefaultsValidator(t *testing.T) {
 		require.EqualValues(t, float64(500), doc["thinking_token_budget"])
 	})
 
-	t.Run("applies min floor when default is below it", func(t *testing.T) {
+	t.Run("splits in half regardless of size", func(t *testing.T) {
 		doc := parseDocument(t, `{"max_tokens":400}`)
 		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
-		require.EqualValues(t, 256, doc["thinking_token_budget"])
+		require.EqualValues(t, 200, doc["thinking_token_budget"])
+	})
+
+	t.Run("small max_tokens still leaves content room", func(t *testing.T) {
+		doc := parseDocument(t, `{"max_tokens":100}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		require.EqualValues(t, 50, doc["thinking_token_budget"])
 	})
 
 	t.Run("no injection for non-scoped models", func(t *testing.T) {
