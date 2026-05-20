@@ -1616,3 +1616,351 @@ func TestNormalizeChatRequestThinkingTokenBudgetClampedForAllModels(t *testing.T
 	require.NoError(t, err)
 	require.Contains(t, string(body), `"thinking_token_budget":4096`)
 }
+
+// safety_identifier is forwarded to Kimi K2.6 (Moonshot consumes it for abuse tracking)
+// and silently stripped for every other model (no documented downstream consumer).
+func TestNormalizeChatRequestForwardsSafetyIdentifierForKimi(t *testing.T) {
+	body := []byte(`{
+		"model":"moonshotai/Kimi-K2.6",
+		"messages":[{"role":"user","content":"hi"}],
+		"safety_identifier":"hashed-user-abc"
+	}`)
+	out, _, err := normalizeChatRequestForModel(body, kimiK26ModelID)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.Equal(t, "hashed-user-abc", raw["safety_identifier"])
+}
+
+func TestNormalizeChatRequestStripsSafetyIdentifierForOtherModels(t *testing.T) {
+	body := []byte(`{
+		"model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
+		"messages":[{"role":"user","content":"hi"}],
+		"safety_identifier":"hashed-user-abc"
+	}`)
+	out, _, err := normalizeChatRequestForModel(body, "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8")
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "safety_identifier")
+}
+
+// Kimi K2.6 still rejects safety_identifier when it violates the shape contract
+// (non-string or over the 512 B cap) — gate runs validation, not blind pass-through.
+func TestNormalizeChatRequestRejectsMalformedSafetyIdentifierForKimi(t *testing.T) {
+	tests := []string{
+		`{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"safety_identifier":42}`,
+		`{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"safety_identifier":{}}`,
+		`{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"safety_identifier":"` + strings.Repeat("x", 513) + `"}`,
+	}
+	for _, body := range tests {
+		t.Run(body[:80], func(t *testing.T) {
+			_, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "safety_identifier")
+		})
+	}
+}
+
+func TestNormalizeChatRequestStripsSilentDropFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{name: "service_tier", body: `{"messages":[{"role":"user","content":"hi"}],"service_tier":"flex"}`, field: "service_tier"},
+		{name: "store true", body: `{"messages":[{"role":"user","content":"hi"}],"store":true}`, field: "store"},
+		{name: "store false", body: `{"messages":[{"role":"user","content":"hi"}],"store":false}`, field: "store"},
+		{name: "provider object", body: `{"messages":[{"role":"user","content":"hi"}],"provider":{"order":["openai","anthropic"]}}`, field: "provider"},
+		{name: "plugins array", body: `{"messages":[{"role":"user","content":"hi"}],"plugins":[{"id":"web","max_results":5}]}`, field: "plugins"},
+		{name: "prompt_cache_key", body: `{"messages":[{"role":"user","content":"hi"}],"prompt_cache_key":"session-42"}`, field: "prompt_cache_key"},
+		{name: "extra_headers object", body: `{"messages":[{"role":"user","content":"hi"}],"extra_headers":{"x-trace-id":"abc"}}`, field: "extra_headers"},
+		{name: "thinking_config object", body: `{"messages":[{"role":"user","content":"hi"}],"thinking_config":{"thinkingBudget":1000}}`, field: "thinking_config"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tt.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, tt.field)
+		})
+	}
+}
+
+func TestNormalizeChatRequestUnwrapsExtraBodyThinkingForKimi(t *testing.T) {
+	body := `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"extra_body":{"thinking":{"type":"disabled"}}}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "extra_body")
+	kwargs, ok := raw["chat_template_kwargs"].(map[string]any)
+	require.True(t, ok, "thinking must mirror to chat_template_kwargs for Kimi")
+	require.Equal(t, false, kwargs["thinking"])
+}
+
+func TestNormalizeChatRequestUnwrapsExtraBodyThinkingForNonKimi(t *testing.T) {
+	body := `{"model":"Qwen/Test","messages":[{"role":"user","content":"hi"}],"extra_body":{"thinking":{"type":"enabled"}}}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), "Qwen/Test")
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "extra_body")
+	thinking, ok := raw["thinking"].(map[string]any)
+	require.True(t, ok, "thinking lifted to top-level even for non-Kimi")
+	require.Equal(t, "enabled", thinking["type"])
+	_, hasKwargs := raw["chat_template_kwargs"]
+	require.False(t, hasKwargs, "no mirror to chat_template_kwargs for non-Kimi")
+}
+
+func TestNormalizeChatRequestExtraBodyTopLevelWinsOnConflict(t *testing.T) {
+	body := `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"extra_body":{"thinking":{"type":"enabled"}}}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "extra_body")
+	kwargs, _ := raw["chat_template_kwargs"].(map[string]any)
+	require.Equal(t, false, kwargs["thinking"], "top-level thinking wins over extra_body")
+}
+
+func TestNormalizeChatRequestExtraBodyRejectsUnknownLiftedField(t *testing.T) {
+	body := `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"extra_body":{"weird_field":1}}`
+	_, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+	require.Error(t, err, "unknown lifted field must hit the unknown-parameter check")
+	require.Contains(t, err.Error(), "weird_field")
+}
+
+func TestNormalizeChatRequestExtraBodyNonObjectSilentlyDropped(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "string", body: `{"messages":[{"role":"user","content":"hi"}],"extra_body":"thinking"}`},
+		{name: "number", body: `{"messages":[{"role":"user","content":"hi"}],"extra_body":42}`},
+		{name: "bool", body: `{"messages":[{"role":"user","content":"hi"}],"extra_body":true}`},
+		{name: "null", body: `{"messages":[{"role":"user","content":"hi"}],"extra_body":null}`},
+		{name: "array", body: `{"messages":[{"role":"user","content":"hi"}],"extra_body":[{"thinking":{"type":"enabled"}}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, "extra_body")
+			require.NotContains(t, raw, "thinking")
+		})
+	}
+}
+
+func TestNormalizeChatRequestExtraBodyDoesNotRecurse(t *testing.T) {
+	body := `{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"extra_body":{"extra_body":{"thinking":{"type":"enabled"}}}}`
+	out, _, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "extra_body", "inner extra_body must be dropped, not re-lifted")
+	require.NotContains(t, raw, "thinking")
+	_, hasKwargs := raw["chat_template_kwargs"]
+	require.False(t, hasKwargs)
+}
+
+func TestNormalizeChatRequestExtraBodyEmptyObjectJustDrops(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"extra_body":{}}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "extra_body")
+}
+
+func TestNormalizeChatRequestStripsReasoningEffort(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{name: "high", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`},
+		{name: "none", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`},
+		{name: "xhigh", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, "reasoning_effort", "all routed models are non-reasoning today, field must be stripped")
+		})
+	}
+}
+
+func TestNormalizeChatRequestRejectsInvalidReasoningEffort(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{name: "unknown enum", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max"}`},
+		{name: "non-string", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":5}`},
+		{name: "empty", body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":""}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := normalizeChatRequest([]byte(tc.body))
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "reasoning_effort")
+		})
+	}
+}
+
+func TestNormalizeChatRequestTranslatesReasoningObjectToEffort(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"high","max_tokens":2000,"exclude":true}}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "reasoning", "wrapper removed — inner max_tokens/exclude dropped with it")
+	require.NotContains(t, raw, "reasoning_effort", "lifted then stripped — non-reasoning routes")
+	require.NotContains(t, raw, "exclude")
+}
+
+func TestNormalizeChatRequestReasoningEnabledFalseOverridesEffort(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":false,"effort":"high"}}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "reasoning")
+	require.NotContains(t, raw, "reasoning_effort")
+}
+
+func TestNormalizeChatRequestReasoningInvalidEffortRejected(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"max"}}`
+	_, _, err := normalizeChatRequest([]byte(body))
+	require.Error(t, err, "invalid effort must surface from ReasoningEffortValidator after lift")
+	require.Contains(t, err.Error(), "reasoning_effort")
+}
+
+func TestNormalizeChatRequestTranslatesEnableThinkingToChatTemplateKwargs(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		want  bool
+	}{
+		{name: "true", body: `{"messages":[{"role":"user","content":"hi"}],"enable_thinking":true}`, want: true},
+		{name: "false", body: `{"messages":[{"role":"user","content":"hi"}],"enable_thinking":false}`, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, "enable_thinking")
+			kwargs, ok := raw["chat_template_kwargs"].(map[string]any)
+			require.True(t, ok)
+			require.Equal(t, tc.want, kwargs["enable_thinking"])
+		})
+	}
+}
+
+func TestNormalizeChatRequestEnableThinkingPreservesExistingNested(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"enable_thinking":true,"chat_template_kwargs":{"enable_thinking":false}}`
+	out, _, err := normalizeChatRequest([]byte(body))
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	require.NotContains(t, raw, "enable_thinking")
+	kwargs, _ := raw["chat_template_kwargs"].(map[string]any)
+	require.Equal(t, false, kwargs["enable_thinking"])
+}
+
+func TestNormalizeChatRequestRejectsNonBoolEnableThinking(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"enable_thinking":"true"}`
+	_, _, err := normalizeChatRequest([]byte(body))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "enable_thinking")
+}
+
+func TestNormalizeChatRequestReasoningLiftsNonStringEffortThenRejected(t *testing.T) {
+	body := `{"messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":5}}`
+	_, _, err := normalizeChatRequest([]byte(body))
+	require.Error(t, err, "non-string effort must be lifted then surface from ReasoningEffortValidator")
+	require.Contains(t, err.Error(), "reasoning_effort")
+}
+
+func TestModelScopedParameterHandlerBranches(t *testing.T) {
+	track := func(label string) ParameterHandler {
+		return parameterHandlerFunc(func(ctx *RequestFilterContext, _ VLLMParameter) error {
+			ctx.Document.Set("_branch", label)
+			return nil
+		})
+	}
+	cases := []struct {
+		name        string
+		handler     ModelScopedParameterHandler
+		routedModel string
+		want        string
+	}{
+		{
+			name: "match runs Handler",
+			handler: ModelScopedParameterHandler{
+				Models:           []string{"kimi"},
+				Handler:          track("matched"),
+				UnmatchedHandler: track("unmatched"),
+			},
+			routedModel: "kimi",
+			want:        "matched",
+		},
+		{
+			name: "unmatched runs UnmatchedHandler",
+			handler: ModelScopedParameterHandler{
+				Models:           []string{"kimi"},
+				Handler:          track("matched"),
+				UnmatchedHandler: track("unmatched"),
+			},
+			routedModel: "qwen",
+			want:        "unmatched",
+		},
+		{
+			name: "nil Models always runs UnmatchedHandler",
+			handler: ModelScopedParameterHandler{
+				Models:           nil,
+				UnmatchedHandler: track("unmatched"),
+			},
+			routedModel: "anything",
+			want:        "unmatched",
+		},
+		{
+			name: "match with nil Handler is a no-op",
+			handler: ModelScopedParameterHandler{
+				Models:           []string{"kimi"},
+				UnmatchedHandler: track("unmatched"),
+			},
+			routedModel: "kimi",
+			want:        "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, err := newRequestFilterContext([]byte(`{}`), false, defaultOutputTokenLimits())
+			require.NoError(t, err)
+			ctx.RoutedModel = tc.routedModel
+
+			require.NoError(t, tc.handler.Apply(ctx, VLLMParameter{Name: "test"}))
+
+			if tc.want == "" {
+				require.False(t, ctx.Document.Has("_branch"))
+				return
+			}
+			v, ok := ctx.Document.Get("_branch")
+			require.True(t, ok)
+			require.Equal(t, tc.want, v)
+		})
+	}
+}
+
+type parameterHandlerFunc func(*RequestFilterContext, VLLMParameter) error
+
+func (f parameterHandlerFunc) Apply(ctx *RequestFilterContext, p VLLMParameter) error {
+	return f(ctx, p)
+}

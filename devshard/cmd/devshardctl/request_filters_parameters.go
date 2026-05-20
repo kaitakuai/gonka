@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,24 +174,28 @@ func (h ForceLiteralParameterHandler) Apply(ctx *RequestFilterContext, parameter
 	return nil
 }
 
-
-// ModelScopedParameterHandler runs Handler only when ctx.RoutedModel matches one of Models
-// (exact, case-sensitive).
+// ModelScopedParameterHandler runs Handler when ctx.RoutedModel matches one of Models
+// (exact, case-sensitive), and UnmatchedHandler otherwise. Either handler may be nil for
+// a no-op on that path.
 type ModelScopedParameterHandler struct {
-	Models  []string
-	Handler ParameterHandler
+	Models           []string
+	Handler          ParameterHandler
+	UnmatchedHandler ParameterHandler
 }
 
 func (h ModelScopedParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	if h.Handler == nil {
-		return nil
-	}
 	for _, m := range h.Models {
 		if m == ctx.RoutedModel {
+			if h.Handler == nil {
+				return nil
+			}
 			return h.Handler.Apply(ctx, parameter)
 		}
 	}
-	return nil
+	if h.UnmatchedHandler == nil {
+		return nil
+	}
+	return h.UnmatchedHandler.Apply(ctx, parameter)
 }
 
 type CapUintParameterHandler struct {
@@ -332,17 +337,6 @@ func (d *ChatRequestDocument) RLockedScope(fn func(map[string]any)) {
 	defer d.mu.RUnlock()
 	fn(d.raw)
 }
-
-// MaxRequestNestingDepth bounds JSON nesting before we hand the bytes to encoding/json.
-// encoding/json allocates O(input size) per recursion level, so a 7 KiB body nested 200
-// levels deep blows up to ~180 KiB of map[string]any wrappers. The whitelist rules then
-// reject in nanoseconds, but the decoder has already paid the cost. The pre-scan defuses
-// that amplification cheaply.
-//
-// 32 leaves at least 3x headroom over the deepest legitimate request shape we forward:
-// `tools[].function.parameters` or `response_format.json_schema.schema` nested under their
-// wrappers (~9-10 levels) plus a small allowance for client-side structuring.
-const MaxRequestNestingDepth = 32
 
 func decodeChatRequestDocument(body []byte) (*ChatRequestDocument, error) {
 	raw, err := decodeChatRequestRaw(body)
@@ -595,147 +589,185 @@ var defaultParameterCatalog = defaultVLLMParameterCatalog()
 
 // The catalog is the single source of truth for how each supported OpenAI/vLLM field is treated.
 func defaultVLLMParameterCatalog() VLLMParameterCatalog {
-	parameters := []VLLMParameter{
-		newParameter("model"),
-		newParameter("stream"),
-		newParameter("messages").
-			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 2048}),
-		newParameter("max_tokens"),
-		newParameter("max_completion_tokens"),
-		newParameter("seed").
-			withRule(RequestFilterStagePreValidation, ValidateUintParameterHandler{}),
-		newParameter("skip_special_tokens"),
-		newParameter("detokenize"),
-		newParameter("n").
-			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}).
-			withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
-				Validator: paramvalidators.GreedySamplingValidator{},
-			}),
-		newParameter("temperature").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
-		newParameter("top_p").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newParameter("top_k").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newParameter("min_p").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true}),
-		newParameter("repetition_penalty").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
-		newParameter("frequency_penalty").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Min: floatPointer(-2.0), Max: floatPointer(2.0)}).
-			withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
-				Models:  []string{kimiK26ModelID},
-				Handler: ForceLiteralParameterHandler{Value: 0.0, OverwriteOnly: true},
-			}),
-		newParameter("presence_penalty").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Min: floatPointer(-2.0), Max: floatPointer(2.0)}).
-			withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
-				Models:  []string{kimiK26ModelID},
-				Handler: ForceLiteralParameterHandler{Value: 0.0, OverwriteOnly: true},
-			}),
-		newParameter("logit_bias").
-			withRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(-100), Max: floatPointer(100), DropFieldIfEmpty: true, MaxEntries: 1024}),
-		newParameter("stop").
-			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 16, MaxEntryLen: 256}),
-		newParameter("stop_token_ids").
-			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 64}),
-		newParameter("thinking").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ThinkingValidator{
-					MirrorToTemplateKwargsForModels: []string{kimiK26ModelID},
+	parameters := slices.Concat(
+		[]VLLMParameter{
+			newParameter("messages").
+				withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: MessagesMaxEntries}),
+			newParameter("seed").
+				withRule(RequestFilterStagePreValidation, ValidateUintParameterHandler{}),
+			newParameter("n").
+				withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: MaxChatRequestChoices}).
+				withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
+					Validator: paramvalidators.GreedySamplingValidator{},
+				}),
+			newParameter("temperature").
+				withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxTemperature)}),
+			newParameter("repetition_penalty").
+				withRule(RequestFilterStagePostLimits, SanitizeFloatParameterHandler{StripNonFinite: true, Max: floatPointer(MaxRepetitionPenalty)}),
+			newParameter("logit_bias").
+				withRule(RequestFilterStagePostLimits, SanitizeFloatMapParameterHandler{StripNonFinite: true, Min: floatPointer(LogitBiasMinValue), Max: floatPointer(LogitBiasMaxValue), DropFieldIfEmpty: true, MaxEntries: LogitBiasMaxEntries}),
+			newParameter("stop").
+				withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: StopMaxEntries, MaxEntryLen: StopMaxEntryLen}),
+			newParameter("stop_token_ids").
+				withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: StopTokenIdsMaxEntries}),
+			newParameter("reasoning").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ReasoningValidator{},
+				}),
+			// reasoning_effort: enum-validate then strip. Models: nil keeps the strip
+			// universal until a reasoning-capable model is routed. List models in Models
+			// to start forwarding.
+			newParameter("reasoning_effort").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ReasoningEffortValidator{},
+				}).
+				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
+					Models:           nil,
+					UnmatchedHandler: StripParameterHandler{},
+				}),
+			newParameter("enable_thinking").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.EnableThinkingValidator{},
+				}),
+			newParameter("thinking").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ThinkingValidator{
+						MirrorToTemplateKwargsForModels: []string{kimiK26ModelID},
+					},
+				}),
+			newParameter("chat_template_kwargs").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ChatTemplateKwargsValidator{
+						MaxDepth: ChatTemplateKwargsMaxDepth,
+						MaxSize:  ChatTemplateKwargsMaxSize,
+						MaxNodes: ChatTemplateKwargsMaxNodes,
+					},
+				}),
+			newParameter("thinking_token_budget").
+				withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
+					Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
+						DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
+						Models:         []string{kimiK26ModelID},
+					},
+				}).
+				withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: kimiThinkingTokenBudgetMax}).
+				withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
+			newParameter("tools").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ToolsValidator{
+						MaxDepth:          ToolsMaxDepth,
+						MaxSize:           ToolsMaxSize,
+						MaxNodes:          ToolsMaxNodes,
+						MaxBranch:         ToolsMaxBranch,
+						MaxEnum:           ToolsMaxEnum,
+						MaxPatternLen:     ToolsMaxPatternLen,
+						DefaultToolChoice: "auto",
+					},
+				}),
+			newParameter("tool_choice").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ToolChoiceValidator{MaxNameLen: ToolChoiceMaxNameLen},
+				}),
+			newParameter("min_tokens").
+				withRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
+					Predicate: func(ctx *RequestFilterContext) bool {
+						return ctx.Document.Has("stop_token_ids")
+					},
+				}).
+				withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
+			newParameter("bad_words").
+				withRule(RequestFilterStagePreValidation, SanitizeStringListParameterHandler{
+					Keep: func(value string) bool {
+						return strings.TrimSpace(value) != ""
+					},
+					DropFieldIfEmpty: true,
+				}).
+				withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: BadWordsMaxEntries, MaxEntryLen: BadWordsMaxEntryLen}),
+			// OpenAI Chat Completions standard observability fields. No inference-side
+			// semantics on the vLLM upstream; clients send them for end-user tracking,
+			// distributed tracing, agent control, and streaming token accounting.
+			// `user`: type-checked and byte-capped at the gateway boundary so a non-string
+			// payload (number, object, …) and an over-long string are caught early instead
+			// of being forwarded as a no-op carrier under the 10 MiB body cap.
+			newParameter("user").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.UserValidator{},
+				}),
+			// metadata: OpenAI bounds it to 16 keys × 64-char keys × 512-char string values;
+			// we enforce the same bounds at the gateway boundary as a free defensive cap.
+			newParameter("metadata").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.MetadataValidator{},
+				}),
+			// stream_options: sub-field whitelist. Only `include_usage` survives;
+			// `continuous_usage_stats` is stripped to neutralize vLLM-project/vllm#9028
+			// (per-chunk usage counter is wrong under chunked prefill), and any other /
+			// future sub-field is default-stripped. If nothing remains the field is dropped
+			// so the upstream does not receive an empty `{}` object.
+			newParameter("stream_options").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.StreamOptionsValidator{},
+				}),
+			newParameter("logprobs").
+				withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
+			newParameter("top_logprobs").
+				withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: TopLogprobsForcedValue}),
+			newParameter("response_format").
+				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
+					Validator: paramvalidators.ResponseFormatValidator{
+						MaxDepth:      ResponseFormatMaxDepth,
+						MaxSize:       ResponseFormatMaxSize,
+						MaxNodes:      ResponseFormatMaxNodes,
+						MaxBranch:     ResponseFormatMaxBranch,
+						MaxEnum:       ResponseFormatMaxEnum,
+						MaxNameLen:    ResponseFormatMaxNameLen,
+						MaxPatternLen: ResponseFormatMaxPatternLen,
+					},
+				}),
+			newParameter("safety_identifier").
+				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
+					Models: []string{kimiK26ModelID},
+					Handler: DocumentValidatorHandler{
+						Validator: paramvalidators.SafetyIdentifierValidator{},
+					},
+					UnmatchedHandler: StripParameterHandler{},
+				}),
+		},
+		newParameters([]string{
+			"model",
+			"stream",
+			"max_tokens",
+			"max_completion_tokens",
+			"skip_special_tokens",
+			"detokenize",
+			"parallel_tool_calls",
+		}),
+		newParameters([]string{"top_p", "top_k", "min_p"},
+			ParameterRule{
+				Stage:   RequestFilterStagePostLimits,
+				Handler: SanitizeFloatParameterHandler{StripNonFinite: true},
+			},
+		),
+		newParameters([]string{"service_tier", "store", "provider", "plugins", "prompt_cache_key", "extra_headers", "thinking_config"},
+			ParameterRule{Stage: RequestFilterStagePreValidation, Handler: StripParameterHandler{}},
+		),
+		// frequency_penalty / presence_penalty share identical rules: catalog clamp
+		// [-2, 2] for all models + per-Kimi force-rewrite to 0.0 (Moonshot's K2.6 wire
+		// accepts only 0.0 -- model-side constraint).
+		newParameters([]string{"frequency_penalty", "presence_penalty"},
+			ParameterRule{
+				Stage:   RequestFilterStagePostLimits,
+				Handler: SanitizeFloatParameterHandler{StripNonFinite: true, Min: floatPointer(PenaltyMin), Max: floatPointer(PenaltyMax)},
+			},
+			ParameterRule{
+				Stage: RequestFilterStagePostLimits,
+				Handler: ModelScopedParameterHandler{
+					Models:  []string{kimiK26ModelID},
+					Handler: ForceLiteralParameterHandler{Value: KimiK2PenaltyForcedValue, OverwriteOnly: true},
 				},
-			}),
-		newParameter("chat_template_kwargs").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ChatTemplateKwargsValidator{
-					MaxDepth: 16,
-					MaxSize:  16 * 1024,
-					MaxNodes: 128,
-				},
-			}),
-		newParameter("thinking_token_budget").
-			withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
-				Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
-					DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
-					Models:         []string{kimiK26ModelID},
-				},
-			}).
-			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: kimiThinkingTokenBudgetMax}).
-			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
-		newParameter("tools").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ToolsValidator{
-					MaxDepth:          16,
-					MaxSize:           16 * 1024,
-					MaxNodes:          256,
-					MaxBranch:         16,
-					MaxEnum:           256,
-					MaxPatternLen:     512,
-					DefaultToolChoice: "auto",
-				},
-			}),
-		newParameter("tool_choice").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ToolChoiceValidator{MaxNameLen: 64},
-			}),
-		newParameter("min_tokens").
-			withRule(RequestFilterStagePreValidation, ConditionalStripParameterHandler{
-				Predicate: func(ctx *RequestFilterContext) bool {
-					return ctx.Document.Has("stop_token_ids")
-				},
-			}).
-			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
-		newParameter("bad_words").
-			withRule(RequestFilterStagePreValidation, SanitizeStringListParameterHandler{
-				Keep: func(value string) bool {
-					return strings.TrimSpace(value) != ""
-				},
-				DropFieldIfEmpty: true,
-			}).
-			withRule(RequestFilterStagePreValidation, LengthCapListParameterHandler{MaxEntries: 64, MaxEntryLen: 128}),
-		// OpenAI Chat Completions standard observability fields. No inference-side
-		// semantics on the vLLM upstream; clients send them for end-user tracking,
-		// distributed tracing, agent control, and streaming token accounting.
-		// `user`: type-checked and byte-capped at the gateway boundary so a non-string
-		// payload (number, object, …) and an over-long string are caught early instead
-		// of being forwarded as a no-op carrier under the 10 MiB body cap.
-		newParameter("user").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.UserValidator{},
-			}),
-		newParameter("parallel_tool_calls"),
-		// metadata: OpenAI bounds it to 16 keys × 64-char keys × 512-char string values;
-		// we enforce the same bounds at the gateway boundary as a free defensive cap.
-		newParameter("metadata").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.MetadataValidator{},
-			}),
-		// stream_options: sub-field whitelist. Only `include_usage` survives;
-		// `continuous_usage_stats` is stripped to neutralize vLLM-project/vllm#9028
-		// (per-chunk usage counter is wrong under chunked prefill), and any other /
-		// future sub-field is default-stripped. If nothing remains the field is dropped
-		// so the upstream does not receive an empty `{}` object.
-		newParameter("stream_options").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.StreamOptionsValidator{},
-			}),
-		newParameter("logprobs").
-			withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: true}),
-		newParameter("top_logprobs").
-			withRule(RequestFilterStagePostLimits, ForceLiteralParameterHandler{Value: 5}),
-		newParameter("response_format").
-			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-				Validator: paramvalidators.ResponseFormatValidator{
-					MaxDepth:      16,
-					MaxSize:       16 * 1024,
-					MaxNodes:      128,
-					MaxBranch:     16,
-					MaxEnum:       256,
-					MaxNameLen:    64,
-					MaxPatternLen: 512,
-				},
-			}),
-	}
+			},
+		),
+	)
 	known := make(map[string]struct{}, len(parameters))
 	for _, p := range parameters {
 		known[p.Name] = struct{}{}
@@ -745,6 +777,9 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 
 func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilterContext) error {
 	if stage == RequestFilterStagePreValidation {
+		// PreValidation pre-passes run before rejectUnknownParameters so lifted keys are
+		// subject to the standard whitelist. Keep them side-effect-light and ordered.
+		c.unwrapExtraBody(ctx)
 		if err := c.rejectUnknownParameters(ctx); err != nil {
 			return err
 		}
@@ -760,6 +795,36 @@ func (c VLLMParameterCatalog) Apply(stage RequestFilterStage, ctx *RequestFilter
 		}
 	}
 	return nil
+}
+
+// unwrapExtraBody flattens an OpenAI-SDK-style `extra_body` envelope into top-level
+// fields before the unknown-parameter check runs. Lifted keys then flow through the
+// catalog's normal validation. Top-level keys always win on conflict; non-object
+// envelopes and nested `extra_body` keys are dropped without surfacing.
+func (c VLLMParameterCatalog) unwrapExtraBody(ctx *RequestFilterContext) {
+	if ctx == nil {
+		return
+	}
+	ctx.Document.LockedScope(func(raw map[string]any) {
+		envelope, exists := raw["extra_body"]
+		if !exists {
+			return
+		}
+		delete(raw, "extra_body")
+		inner, ok := envelope.(map[string]any)
+		if !ok {
+			return
+		}
+		for key, value := range inner {
+			if key == "extra_body" {
+				continue
+			}
+			if _, alreadyTop := raw[key]; alreadyTop {
+				continue
+			}
+			raw[key] = value
+		}
+	})
 }
 
 func (c VLLMParameterCatalog) rejectUnknownParameters(ctx *RequestFilterContext) error {
@@ -790,6 +855,15 @@ func newParameter(name string) VLLMParameter {
 func (p VLLMParameter) withRule(stage RequestFilterStage, handler ParameterHandler) VLLMParameter {
 	p.Rules = append(p.Rules, ParameterRule{Stage: stage, Handler: handler})
 	return p
+}
+
+func newParameters(names []string, rules ...ParameterRule) []VLLMParameter {
+	out := make([]VLLMParameter, len(names))
+	for i, name := range names {
+		copied := append([]ParameterRule(nil), rules...)
+		out[i] = VLLMParameter{Name: name, Rules: copied}
+	}
+	return out
 }
 
 func floatPointer(value float64) *float64 {

@@ -37,7 +37,7 @@ func (v ThinkingValidator) Validate(vctx ValidatorContext) error {
 		return fmt.Errorf("%w: got %q", ErrThinkingType, typeStr)
 	}
 	if v.shouldMirror(vctx.RoutedModel) {
-		mirrorThinkingToTemplateKwargs(vctx.Document, typeStr == "enabled")
+		return mirrorThinkingToTemplateKwargs(vctx.Document, typeStr == "enabled")
 	}
 	return nil
 }
@@ -51,14 +51,14 @@ func (v ThinkingValidator) shouldMirror(routedModel string) bool {
 	return false
 }
 
-func mirrorThinkingToTemplateKwargs(document map[string]any, enabled bool) {
-	chatTemplateKwargs, _ := document["chat_template_kwargs"].(map[string]any)
-	if chatTemplateKwargs == nil {
-		chatTemplateKwargs = map[string]any{}
-		document["chat_template_kwargs"] = chatTemplateKwargs
+func mirrorThinkingToTemplateKwargs(document map[string]any, enabled bool) error {
+	chatTemplateKwargs, err := getOrCreateChatTemplateKwargs(document)
+	if err != nil {
+		return err
 	}
 	if _, exists := chatTemplateKwargs["thinking"]; exists {
-		return
+		return nil
 	}
 	chatTemplateKwargs["thinking"] = enabled
+	return nil
 }
