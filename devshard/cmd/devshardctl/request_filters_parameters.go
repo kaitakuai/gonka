@@ -644,6 +644,10 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					},
 				}),
 			newParameter("thinking_token_budget").
+				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
+					Models:           []string{kimiK26ModelID},
+					UnmatchedHandler: StripParameterHandler{},
+				}).
 				withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
 					Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
 						DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
