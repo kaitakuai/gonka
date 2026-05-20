@@ -16,9 +16,9 @@ const kimiK26ModelID = "moonshotai/Kimi-K2.6"
 const emptyToolResultContent = "<empty tool result>"
 
 const (
-	KimiThinkingTokenBudgetDefaultDivisor uint64 = 2
-	KimiThinkingTokenBudgetMin            uint64 = 256
-	KimiThinkingTokenBudgetMax            uint64 = 96_000
+	kimiThinkingTokenBudgetDefaultDivisor uint64 = 2
+	kimiThinkingTokenBudgetMin            uint64 = 256
+	kimiThinkingTokenBudgetMax            uint64 = 96_000
 )
 
 type chatRequest struct {

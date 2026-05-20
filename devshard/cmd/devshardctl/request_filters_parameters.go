@@ -173,34 +173,12 @@ func (h ForceLiteralParameterHandler) Apply(ctx *RequestFilterContext, parameter
 	return nil
 }
 
-type DefaultUintFromMaxTokensHandler struct {
-	Divisor uint64
-	Min     uint64
-	Max     uint64
+type CustomParameterHandler struct {
+	ApplyFunc func(*RequestFilterContext, VLLMParameter) error
 }
 
-func (h DefaultUintFromMaxTokensHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	if _, exists := ctx.Document.Get(parameter.Name); exists {
-		return nil
-	}
-	if ctx.Request.MaxTokens == 0 {
-		return nil
-	}
-	value := ctx.Request.MaxTokens
-	if h.Divisor > 0 {
-		value = ctx.Request.MaxTokens / h.Divisor
-	}
-	if h.Min > 0 && value < h.Min {
-		value = h.Min
-	}
-	if value > ctx.Request.MaxTokens {
-		value = ctx.Request.MaxTokens
-	}
-	if h.Max > 0 && value > h.Max {
-		value = h.Max
-	}
-	ctx.Document.Set(parameter.Name, value)
-	return nil
+func (h CustomParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
+	return h.ApplyFunc(ctx, parameter)
 }
 
 // ModelScopedParameterHandler runs Handler only when ctx.RoutedModel matches one of Models
@@ -683,16 +661,25 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 				},
 			}),
 		newParameter("thinking_token_budget").
-			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: KimiThinkingTokenBudgetMax}).
-			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}).
 			withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
 				Models: []string{kimiK26ModelID},
-				Handler: DefaultUintFromMaxTokensHandler{
-					Divisor: KimiThinkingTokenBudgetDefaultDivisor,
-					Min:     KimiThinkingTokenBudgetMin,
-					Max:     KimiThinkingTokenBudgetMax,
-				},
-			}),
+				Handler: CustomParameterHandler{ApplyFunc: func(ctx *RequestFilterContext, p VLLMParameter) error {
+					if _, exists := ctx.Document.Get(p.Name); exists {
+						return nil
+					}
+					if ctx.Request.MaxTokens == 0 {
+						return nil
+					}
+					v := ctx.Request.MaxTokens / kimiThinkingTokenBudgetDefaultDivisor
+					if v < kimiThinkingTokenBudgetMin {
+						v = kimiThinkingTokenBudgetMin
+					}
+					ctx.Document.Set(p.Name, v)
+					return nil
+				}},
+			}).
+			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: kimiThinkingTokenBudgetMax}).
+			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
 		newParameter("tools").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ToolsValidator{
