@@ -1329,7 +1329,9 @@ func TestGatewayStatusExposesCapacityLossAndEffectiveLimits(t *testing.T) {
 		participantSlotCounts: map[string]int{"host-b": 1},
 	}
 	g := NewGateway([]*devshardRuntime{a, b}, NewGatewayLimiter(4, 100), "Qwen/Test")
-	g.capacity.SetHostWeights(map[string]float64{"host-a": 1, "host-b": 1}, false)
+	g.settings.MaxConcurrentPer10000Weight = 2
+	g.settings.PoCMaxConcurrentPer10000Weight = 2
+	g.capacity.SetHostWeights(map[string]float64{"host-a": 10_000, "host-b": 10_000}, false)
 	g.capacity.SetLiveAvailable(func(host string) bool {
 		return host != "host-a"
 	})
@@ -1347,18 +1349,18 @@ func TestGatewayStatusExposesCapacityLossAndEffectiveLimits(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.EqualValues(t, 2, body.Limiter.EffectiveMaxConcurrent)
 	require.EqualValues(t, 50, body.Limiter.EffectiveMaxInputTokens)
-	require.InDelta(t, 2.0, body.Capacity.BaselineWeight, 1e-9)
-	require.InDelta(t, 1.0, body.Capacity.TotalWeight, 1e-9)
-	require.InDelta(t, 1.0, body.Capacity.LostWeight, 1e-9)
+	require.InDelta(t, 20_000.0, body.Capacity.BaselineWeight, 1e-9)
+	require.InDelta(t, 10_000.0, body.Capacity.TotalWeight, 1e-9)
+	require.InDelta(t, 10_000.0, body.Capacity.LostWeight, 1e-9)
 	require.InDelta(t, 50.0, body.Capacity.AvailablePercent, 1e-9)
 	require.InDelta(t, 50.0, body.Capacity.LostPercent, 1e-9)
 	require.Equal(t, 1, body.Capacity.UnavailableHostCount)
 	require.Equal(t, 2, body.Capacity.CurrentWeightMatched)
 	require.Equal(t, 0, body.Capacity.CurrentWeightFallback)
-	require.InDelta(t, 1.0, body.Capacity.Models["Qwen/Test"].TotalWeight, 1e-9)
-	require.InDelta(t, 1.0, body.Capacity.Models["Qwen/Test"].CurrentWeight, 1e-9)
-	require.InDelta(t, 2.0, body.Capacity.Models["Qwen/Test"].FullWeight, 1e-9)
-	require.InDelta(t, 2.0, body.Capacity.Models["Qwen/Test"].BaselineWeight, 1e-9)
+	require.InDelta(t, 10_000.0, body.Capacity.Models["Qwen/Test"].TotalWeight, 1e-9)
+	require.InDelta(t, 10_000.0, body.Capacity.Models["Qwen/Test"].CurrentWeight, 1e-9)
+	require.InDelta(t, 20_000.0, body.Capacity.Models["Qwen/Test"].FullWeight, 1e-9)
+	require.InDelta(t, 20_000.0, body.Capacity.Models["Qwen/Test"].BaselineWeight, 1e-9)
 	require.InDelta(t, 0.5, body.Capacity.Models["Qwen/Test"].LimitShare, 1e-9)
 	require.EqualValues(t, 2, body.Limiter.Models["Qwen/Test"].EffectiveMaxConcurrent)
 	require.EqualValues(t, 50, body.Limiter.Models["Qwen/Test"].EffectiveMaxInputTokens)
