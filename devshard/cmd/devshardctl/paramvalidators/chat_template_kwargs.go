@@ -17,6 +17,20 @@ var ErrChatTemplateKwargsShape = errors.New("chat_template_kwargs: invalid wrapp
 // in synchronous tokenization.
 var ErrChatTemplateKwargsForbiddenKey = errors.New("chat_template_kwargs: forbidden key (overrides apply_hf_chat_template positional argument)")
 
+func getOrCreateChatTemplateKwargs(document map[string]any) (map[string]any, error) {
+	raw, exists := document["chat_template_kwargs"]
+	if !exists {
+		kwargs := map[string]any{}
+		document["chat_template_kwargs"] = kwargs
+		return kwargs, nil
+	}
+	kwargs, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: must be an object", ErrChatTemplateKwargsShape)
+	}
+	return kwargs, nil
+}
+
 // forbiddenChatTemplateKwargsKeys are top-level keys that, when set via
 // chat_template_kwargs, override `apply_hf_chat_template(conversation, chat_template,
 // add_generation_prompt, continue_final_message, tokenize, padding, truncation, max_length,

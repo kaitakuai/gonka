@@ -73,6 +73,16 @@ func TestThinkingValidatorMirrorsToTemplateKwargsForScopedModels(t *testing.T) {
 	})
 }
 
+func TestThinkingValidatorRejectsWrongShapeChatTemplateKwargs(t *testing.T) {
+	v := ThinkingValidator{MirrorToTemplateKwargsForModels: []string{"kimi-model"}}
+	doc := parseDocument(t, `{"thinking":{"type":"enabled"},"chat_template_kwargs":"broken"}`)
+
+	err := v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"})
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrChatTemplateKwargsShape)
+	require.Equal(t, "broken", doc["chat_template_kwargs"], "wrong-type value must not be overwritten by mirror")
+}
+
 func TestThinkingValidatorRejects(t *testing.T) {
 	v := ThinkingValidator{}
 	tests := []struct {

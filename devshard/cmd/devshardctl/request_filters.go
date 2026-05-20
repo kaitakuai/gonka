@@ -8,18 +8,6 @@ import (
 	"net/http"
 )
 
-const MaxChatRequestBodySize = 10 * 1024 * 1024
-const MaxChatRequestChoices = 5
-const MaxTemperature = 2.0
-const MaxRepetitionPenalty = 2.0
-const kimiK26ModelID = "moonshotai/Kimi-K2.6"
-const emptyToolResultContent = "<empty tool result>"
-
-const (
-	kimiThinkingTokenBudgetDefaultDivisor uint64 = 2
-	kimiThinkingTokenBudgetMax            uint64 = 96_000
-)
-
 type chatRequest struct {
 	Model               string `json:"model"`
 	Stream              bool   `json:"stream"`
