@@ -20,6 +20,7 @@ import (
 )
 
 type adminAuthContextKey struct{}
+type adminAPIKeySuffixContextKey struct{}
 
 const (
 	defaultChainRESTURL          = "http://localhost:1317"
@@ -77,6 +78,14 @@ type runtimeOptions struct {
 	adminAPIKey    string
 }
 
+type gatewayAccessMode string
+
+const (
+	gatewayAccessModeOpen      gatewayAccessMode = "open"
+	gatewayAccessModeAPIKey    gatewayAccessMode = "api_key"
+	gatewayAccessModeAdminOnly gatewayAccessMode = "admin_only"
+)
+
 type bootstrapOptions struct {
 	escrowID          string
 	privateKeyHex     string
@@ -133,6 +142,7 @@ func mustLoadRuntimeOptions(flags cliFlags) runtimeOptions {
 	if err := os.MkdirAll(opts.baseStorageDir, 0o755); err != nil {
 		log.Fatalf("create storage dir: %v", err)
 	}
+	configureRequestCaptureStore(opts.baseStorageDir)
 	return opts
 }
 
@@ -155,14 +165,16 @@ func mustLoadBootstrapOptions(flags cliFlags, baseStorageDir string) bootstrapOp
 		opts.storagePath = defaultStoragePath(opts.baseStorageDir, opts.escrowID)
 	}
 	opts.bootstrapSettings = GatewaySettings{
-		ChainREST:               opts.chainREST,
-		PublicAPI:               opts.publicAPI,
-		DefaultModel:            opts.defaultModel,
-		DefaultRequestMaxTokens: uint64(readInt64Env("GATEWAY_DEFAULT_MAX_TOKENS", int64(DefaultRequestMaxTokens))),
-		RequestMaxTokensCap:     uint64(readInt64Env("GATEWAY_MAX_TOKENS_CAP", int64(RequestMaxTokensCap))),
-		MaxConcurrentRequests:   readInt64Env("GATEWAY_MAX_CONCURRENT_REQUESTS", defaultMaxConcurrentRequests),
-		MaxInputTokensInFlight:  readInt64Env("GATEWAY_MAX_INPUT_TOKENS_IN_FLIGHT", 0),
-		TxGasLimit:              uint64(readInt64Env("DEVSHARD_TX_GAS_LIMIT", 0)),
+		ChainREST:                      opts.chainREST,
+		PublicAPI:                      opts.publicAPI,
+		DefaultModel:                   opts.defaultModel,
+		DefaultRequestMaxTokens:        uint64(readInt64Env("GATEWAY_DEFAULT_MAX_TOKENS", int64(DefaultRequestMaxTokens))),
+		RequestMaxTokensCap:            uint64(readInt64Env("GATEWAY_MAX_TOKENS_CAP", int64(RequestMaxTokensCap))),
+		MaxConcurrentRequests:          readInt64Env("GATEWAY_MAX_CONCURRENT_REQUESTS", defaultMaxConcurrentRequests),
+		MaxConcurrentPer10000Weight:    readFloat64Env("GATEWAY_MAX_CONCURRENT_REQUESTS_PER_10000_WEIGHT", defaultMaxConcurrentPer10000Weight),
+		PoCMaxConcurrentPer10000Weight: readFloat64Env("GATEWAY_POC_MAX_CONCURRENT_REQUESTS_PER_10000_WEIGHT", defaultPoCMaxConcurrentPer10000Weight),
+		MaxInputTokensInFlight:         readInt64Env("GATEWAY_MAX_INPUT_TOKENS_IN_FLIGHT", 0),
+		TxGasLimit:                     uint64(readInt64Env("DEVSHARD_TX_GAS_LIMIT", 0)),
 		Disabled: GatewayDisabledSettings{
 			Enabled: readBoolEnv("DEVSHARD_GATEWAY_DISABLED", false),
 			Message: os.Getenv("DEVSHARD_GATEWAY_DISABLED_MESSAGE"),
@@ -238,7 +250,7 @@ func mustLoadParticipantThrottleState(store *GatewayStore) {
 		return
 	}
 	for _, t := range throttles {
-		sharedParticipantRequestLimiter.LoadStateWithQuarantine(t.Key, t.Tokens, t.LastRefillAt, t.Status, t.QuarantineUntil, t.EmptyStreamStreak)
+		sharedParticipantRequestLimiter.LoadStateWithQuarantine(t.Key, t.Tokens, t.LastRefillAt, t.Status, t.QuarantineUntil, t.EmptyStreamStreak, t.EOFTransportFailureStreak)
 	}
 	if len(throttles) > 0 {
 		log.Printf("loaded %d persisted participant throttle state(s)", len(throttles))
@@ -486,10 +498,12 @@ func closeRuntimes(runtimes []*devshardRuntime) {
 
 func buildGatewayHandler(gateway *Gateway, opts runtimeOptions) http.Handler {
 	var handler http.Handler = gateway.Handler()
-	if len(opts.apiKeys) > 0 {
-		log.Printf("API key auth enabled (%d key(s))", len(opts.apiKeys))
-		handler = bearerAuthMiddleware(opts.apiKeys, handler)
+	if gateway != nil {
+		gateway.mu.Lock()
+		gateway.apiKeys = opts.apiKeys
+		gateway.mu.Unlock()
 	}
+	log.Printf("gateway API keys loaded (%d key(s)); per-model access modes are configured in gateway settings", len(opts.apiKeys))
 	handler = adminAuthMiddleware(opts.adminAPIKey, handler)
 	handler = gateway.disabledMiddleware(handler)
 	return gateway.metrics.Wrap(handler)
@@ -556,37 +570,6 @@ func isAdminPath(path string) bool {
 		strings.HasPrefix(innerPath, "/v1/debug/"))
 }
 
-func bearerAuthMiddleware(validKeys map[string]struct{}, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isAuthExemptPath(r.URL.Path) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if requestHasAdminAuth(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, `{"error":{"message":"Missing or invalid Authorization header. Expected: Bearer <api-key>","type":"invalid_request_error","code":"invalid_api_key"}}`)
-			return
-		}
-
-		key := strings.TrimPrefix(auth, "Bearer ")
-		if _, ok := validKeys[key]; !ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, `{"error":{"message":"Invalid API key provided.","type":"invalid_request_error","code":"invalid_api_key"}}`)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 func adminAuthMiddleware(adminKey string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -595,6 +578,7 @@ func adminAuthMiddleware(adminKey string, next http.Handler) http.Handler {
 			strings.TrimPrefix(auth, "Bearer ") == adminKey
 		if adminAuthenticated {
 			r = r.WithContext(context.WithValue(r.Context(), adminAuthContextKey{}, true))
+			r = r.WithContext(context.WithValue(r.Context(), adminAPIKeySuffixContextKey{}, apiKeySuffix(adminKey)))
 		}
 		if !isAdminPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
@@ -622,6 +606,14 @@ func requestHasAdminAuth(r *http.Request) bool {
 	return ok
 }
 
+func requestAdminAPIKeySuffix(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	suffix, ok := r.Context().Value(adminAPIKeySuffixContextKey{}).(string)
+	return suffix, ok && suffix != ""
+}
+
 func readInt64Env(name string, fallback int64) int64 {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
@@ -630,6 +622,19 @@ func readInt64Env(name string, fallback int64) int64 {
 	var v int64
 	if _, err := fmt.Sscan(raw, &v); err != nil {
 		log.Printf("invalid %s=%q, using %d", name, raw, fallback)
+		return fallback
+	}
+	return v
+}
+
+func readFloat64Env(name string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	var v float64
+	if _, err := fmt.Sscan(raw, &v); err != nil {
+		log.Printf("invalid %s=%q, using %g", name, raw, fallback)
 		return fallback
 	}
 	return v

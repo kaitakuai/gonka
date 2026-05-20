@@ -263,6 +263,55 @@ func TestGatewayLimiterUsesPerModelConfiguredCaps(t *testing.T) {
 	require.NoError(t, l.AcquireForModel("Model/B", 10, 1))
 }
 
+func TestGatewayLimiterDerivesModelConcurrencyFromWeight(t *testing.T) {
+	l := NewGatewayLimiter(512, 0)
+	capacity := LimiterModelCapacity{
+		ScaleFactor:                 0.5,
+		BaselineWeight:              10_000,
+		CurrentWeight:               6_000,
+		MaxConcurrentPer10000Weight: 5,
+	}
+
+	require.NoError(t, l.AcquireForModelWithCapacity("Model/A", 1, capacity))
+	require.NoError(t, l.AcquireForModelWithCapacity("Model/A", 1, capacity))
+	require.NoError(t, l.AcquireForModelWithCapacity("Model/A", 1, capacity))
+	require.ErrorContains(t, l.AcquireForModelWithCapacity("Model/A", 1, capacity), "too many concurrent requests")
+
+	snap := l.SnapshotWithModelCapacities(map[string]LimiterModelCapacity{"Model/A": capacity})
+	require.EqualValues(t, 5, snap.Models["Model/A"].MaxConcurrent)
+	require.EqualValues(t, 3, snap.Models["Model/A"].EffectiveMaxConcurrent)
+	require.InDelta(t, 6_000.0, snap.Models["Model/A"].CurrentWeight, 1e-9)
+	require.InDelta(t, 10_000.0, snap.Models["Model/A"].BaselineWeight, 1e-9)
+	require.InDelta(t, 5.0, snap.Models["Model/A"].MaxConcurrentPer10000Weight, 1e-9)
+}
+
+func TestGatewaySelectsPoCWeightConcurrencyRate(t *testing.T) {
+	g := NewGateway(nil, NewGatewayLimiter(512, 0), "Model/A")
+	g.settings = GatewaySettings{
+		DefaultRequestMaxTokens:        1024,
+		RequestMaxTokensCap:            4096,
+		MaxConcurrentPer10000Weight:    5,
+		PoCMaxConcurrentPer10000Weight: 10,
+		ParticipantThrottle:            DefaultParticipantThrottleSettings(),
+		Redundancy:                     DefaultRedundancySettings(),
+		Perf:                           PerfSettings{SampleSize: 1, WindowMS: 1},
+	}
+	g.capacity.SetEscrowMembership("A", map[string]int{"host-a": 1})
+	g.capacity.SetHostWeights(map[string]float64{"host-a": 10_000}, false)
+	g.capacity.SetHostWeightsByModel(map[string]map[string]float64{
+		"Model/A": {"host-a": 10_000},
+	}, false)
+
+	regular := g.limiterCapacityForModel("Model/A")
+	require.InDelta(t, 5.0, regular.MaxConcurrentPer10000Weight, 1e-9)
+
+	g.phaseGate = &ChainPhaseGate{}
+	g.phaseGate.storeSnapshot(ChainPhaseSnapshot{BlockReason: "confirmation_poc"})
+	t.Cleanup(func() { setPoCPhaseState(false, "") })
+	poc := g.limiterCapacityForModel("Model/A")
+	require.InDelta(t, 10.0, poc.MaxConcurrentPer10000Weight, 1e-9)
+}
+
 func TestGatewayLimiterAcquireBlocksWhenScaledToZero(t *testing.T) {
 	l := NewGatewayLimiter(4, 100)
 	l.ApplyScaleFactor(0)

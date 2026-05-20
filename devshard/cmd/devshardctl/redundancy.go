@@ -2436,24 +2436,61 @@ func inflightByNonce(attempts []*inflight, nonce uint64) *inflight {
 	return nil
 }
 
-func (e *Redundancy) recordSampleOnce(inf *inflight, params user.InferenceParams) {
+func (e *Redundancy) recordSampleOnce(inf *inflight, params user.InferenceParams, requestSucceeded bool) {
 	if isErrorStreamAttempt(inf) {
+		e.maybeRecordContextLimit(inf)
 		return
 	}
 	if e.longResponseFailureExempt(inf) {
 		return
 	}
 	inf.sampleOnce.Do(func() {
-		e.recordSample(inf, params)
+		e.recordSample(inf, params, requestSucceeded)
 	})
 }
 
-func (e *Redundancy) recordStartedAttemptSamples(attempts []*inflight, params user.InferenceParams) {
+func (e *Redundancy) maybeRecordContextLimit(inf *inflight) {
+	if inf == nil || inf.probe || inf.errorMessage == "" || e.perf == nil {
+		return
+	}
+	maxTokens := parseContextLengthLimit(inf.errorMessage)
+	if maxTokens == 0 {
+		return
+	}
+	participantKey := e.participantKeyForHost(inf.hostIdx)
+	e.perf.RecordContextLimit(participantKey, maxTokens)
+}
+
+// parseContextLengthLimit extracts the maximum context length from an error
+// message like "maximum context length is 131072 tokens" or
+// "This model's maximum context length is 120000 tokens".
+func parseContextLengthLimit(msg string) uint64 {
+	lower := strings.ToLower(msg)
+	marker := "maximum context length is "
+	idx := strings.Index(lower, marker)
+	if idx < 0 {
+		return 0
+	}
+	rest := msg[idx+len(marker):]
+	end := strings.IndexFunc(rest, func(r rune) bool {
+		return r < '0' || r > '9'
+	})
+	if end <= 0 {
+		return 0
+	}
+	n, err := strconv.ParseUint(rest[:end], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func (e *Redundancy) recordStartedAttemptSamples(attempts []*inflight, params user.InferenceParams, requestSucceeded bool) {
 	for _, inf := range attempts {
 		if inf == nil || inf.probe || inf.sendTime.IsZero() {
 			continue
 		}
-		e.recordSampleOnce(inf, params)
+		e.recordSampleOnce(inf, params, requestSucceeded)
 	}
 }
 
@@ -2599,7 +2636,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 	effectiveSuccess := anySucceeded && !opts.forceTreatAsFailure
 	if !effectiveSuccess {
 		if opts.recordFailureSamples {
-			e.recordStartedAttemptSamples(attempts, params)
+			e.recordStartedAttemptSamples(attempts, params, false)
 		}
 		for _, inf := range failed {
 			if inf.probe {
@@ -2642,6 +2679,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 			}
 		}
 		if hostErr := hostApplicationErrorFromAttempts(attempts, winnerNonce); hostErr != nil {
+			captureAllAttemptsFailedRequest(ctx, e.devshardID, params, hostErr)
 			logRequestStage(ctx, "request_failed", "escrow", e.devshardID, "error", hostErr)
 			e.completeAccountingRequest(ctx, 0, decision, "failed")
 			e.logRequestSettled(ctx, 0, decision, "failed")
@@ -2655,6 +2693,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		if opts.nonStreamingReducedTokenTimeout {
 			errMsg = (&nonStreamingReducedMaxTokensTimeoutError{}).Error()
 		}
+		captureAllAttemptsFailedRequest(ctx, e.devshardID, params, fmt.Errorf("%s", errMsg))
 		logRequestStage(ctx, "request_failed", "escrow", e.devshardID, "error", errMsg)
 		e.completeAccountingRequest(ctx, 0, decision, "failed")
 		e.logRequestSettled(ctx, 0, decision, "failed")
@@ -2670,7 +2709,7 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		if inf.probe {
 			continue
 		}
-		e.recordSampleOnce(inf, params)
+		e.recordSampleOnce(inf, params, true)
 		involvement = append(involvement, e.buildInvolvement(inf, winnerNonce, params))
 	}
 	e.perf.RecordRequest(RequestRecord{
@@ -2846,7 +2885,7 @@ func (e *Redundancy) buildInvolvement(inf *inflight, winnerNonce uint64, params 
 	return hi
 }
 
-func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams) {
+func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams, requestSucceeded bool) {
 	if inf.probe {
 		return
 	}
@@ -2871,7 +2910,7 @@ func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams) {
 	e.perf.Record(sample)
 	if e.participantLimiter != nil {
 		switch {
-		case isEmptyStreamAttempt(inf) && !longNonStreamEmptyExempt:
+		case requestSucceeded && isEmptyStreamAttempt(inf) && !longNonStreamEmptyExempt:
 			e.participantLimiter.ObserveEmptyStream(participantKey)
 		case e.session.IsNonceFinished(inf.nonce) && !longNonStreamEmptyExempt:
 			e.participantLimiter.ObserveSuccessfulInference(participantKey)

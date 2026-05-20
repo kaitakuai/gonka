@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -29,6 +31,9 @@ const (
 	// emptyStreamQuarantineThreshold is the number of consecutive empty
 	// content responses before the host is temporarily quarantined.
 	emptyStreamQuarantineThreshold = 3
+	// eofTransportFailureThreshold is the number of consecutive EOF-style
+	// inference transport failures before the host is temporarily quarantined.
+	eofTransportFailureThreshold = 3
 	// participantProbationSuccessesAfterQuarantine keeps recently recovered hosts
 	// out of proactive pairwise/A-B routing until they prove they can finish
 	// normal inference requests again.
@@ -42,6 +47,9 @@ const (
 	// participantStatusStalledWinner is persisted when a crowned winner
 	// stalls after streaming content to the client.
 	participantStatusStalledWinner = -2
+	// participantStatusEOFTransport is persisted when EOF transport failures
+	// trip the short quarantine.
+	participantStatusEOFTransport = -3
 )
 
 var sharedParticipantRequestLimiter = NewParticipantRequestLimiter(
@@ -58,6 +66,7 @@ func DefaultParticipantThrottleSettings() ParticipantThrottleSettings {
 		EmptyStreamQuarantineMS:        emptyStreamQuarantine.Milliseconds(),
 		StalledWinnerQuarantineMS:      stalledWinnerQuarantine.Milliseconds(),
 		EmptyStreamQuarantineThreshold: emptyStreamQuarantineThreshold,
+		EOFTransportFailureThreshold:   eofTransportFailureThreshold,
 	}
 }
 
@@ -87,7 +96,7 @@ func (e *EscrowParticipantRateLimitError) Error() string {
 
 // ParticipantThrottleStore is the persistence interface for reactive throttle state.
 type ParticipantThrottleStore interface {
-	SaveParticipantThrottle(key string, tokens float64, lastRefillAt time.Time, status int, quarantineUntil time.Time, emptyStreamStreak int) error
+	SaveParticipantThrottle(key string, tokens float64, lastRefillAt time.Time, status int, quarantineUntil time.Time, emptyStreamStreak int, eofTransportFailureStreak int) error
 	DeleteParticipantThrottle(key string) error
 }
 
@@ -106,6 +115,7 @@ type ParticipantRequestLimiter struct {
 	emptyStreamQuarantine          time.Duration
 	stalledWinnerQuarantine        time.Duration
 	emptyStreamQuarantineThreshold int
+	eofTransportFailureThreshold   int
 	participants                   map[string]*participantRequestState
 	metrics                        *DevshardMetrics
 	store                          ParticipantThrottleStore
@@ -117,6 +127,7 @@ type participantRequestState struct {
 	quarantineUntil             time.Time // non-zero: wall-clock unavailability
 	probationSuccessesRemaining int       // recently exited quarantine; not blocked
 	emptyStreamStreak           int
+	eofTransportFailureStreak   int
 }
 
 type ParticipantThrottleSnapshot struct {
@@ -130,6 +141,7 @@ type ParticipantThrottleSnapshot struct {
 	QuarantineUntil       string  `json:"quarantine_until,omitempty"`
 	QuarantineRemainingMS int64   `json:"quarantine_remaining_ms,omitempty"`
 	EmptyStreamStreak     int     `json:"empty_stream_streak,omitempty"`
+	EOFTransportStreak    int     `json:"eof_transport_failure_streak,omitempty"`
 }
 
 func NewParticipantRequestLimiter(burst int, recoveryPerMinute int) *ParticipantRequestLimiter {
@@ -176,6 +188,9 @@ func (l *ParticipantRequestLimiter) applySettingsLocked(settings ParticipantThro
 	if settings.EmptyStreamQuarantineThreshold <= 0 {
 		settings.EmptyStreamQuarantineThreshold = defaults.EmptyStreamQuarantineThreshold
 	}
+	if settings.EOFTransportFailureThreshold <= 0 {
+		settings.EOFTransportFailureThreshold = defaults.EOFTransportFailureThreshold
+	}
 	l.burst = float64(settings.RequestBurst)
 	l.recoveryPerSecond = float64(settings.RecoveryPerMinute) / 60.0
 	l.httpThrottleQuarantine = time.Duration(settings.HTTPQuarantineMS) * time.Millisecond
@@ -183,6 +198,7 @@ func (l *ParticipantRequestLimiter) applySettingsLocked(settings ParticipantThro
 	l.emptyStreamQuarantine = time.Duration(settings.EmptyStreamQuarantineMS) * time.Millisecond
 	l.stalledWinnerQuarantine = time.Duration(settings.StalledWinnerQuarantineMS) * time.Millisecond
 	l.emptyStreamQuarantineThreshold = settings.EmptyStreamQuarantineThreshold
+	l.eofTransportFailureThreshold = settings.EOFTransportFailureThreshold
 	for _, state := range l.participants {
 		if state.tokens > l.burst {
 			state.tokens = l.burst
@@ -194,12 +210,12 @@ func (l *ParticipantRequestLimiter) applySettingsLocked(settings ParticipantThro
 // Time-based recovery since lastRefill is applied. If the participant has fully
 // recovered (tokens >= burst), the record is deleted from the store instead.
 func (l *ParticipantRequestLimiter) LoadState(key string, tokens float64, lastRefill time.Time) {
-	l.LoadStateWithQuarantine(key, tokens, lastRefill, 0, time.Time{}, 0)
+	l.LoadStateWithQuarantine(key, tokens, lastRefill, 0, time.Time{}, 0, 0)
 }
 
 // LoadStateWithQuarantine is like LoadState but supports persisted quarantine
 // and upgrades legacy 429/503 rows to a quarantine end time when needed.
-func (l *ParticipantRequestLimiter) LoadStateWithQuarantine(key string, tokens float64, lastRefill time.Time, status int, quarantineFromDB time.Time, emptyStreamStreak int) {
+func (l *ParticipantRequestLimiter) LoadStateWithQuarantine(key string, tokens float64, lastRefill time.Time, status int, quarantineFromDB time.Time, emptyStreamStreak int, eofTransportFailureStreak int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -208,10 +224,11 @@ func (l *ParticipantRequestLimiter) LoadStateWithQuarantine(key string, tokens f
 	if !quarantineFromDB.IsZero() {
 		if now.Before(quarantineFromDB) {
 			l.participants[key] = &participantRequestState{
-				tokens:            0,
-				lastRefill:        now,
-				quarantineUntil:   quarantineFromDB,
-				emptyStreamStreak: emptyStreamStreak,
+				tokens:                    0,
+				lastRefill:                now,
+				quarantineUntil:           quarantineFromDB,
+				emptyStreamStreak:         emptyStreamStreak,
+				eofTransportFailureStreak: eofTransportFailureStreak,
 			}
 			log.Printf("participant_limit_loaded_from_db participant_key=%s quarantine_until=%s", key, quarantineFromDB.Format(time.RFC3339))
 			return
@@ -230,7 +247,7 @@ func (l *ParticipantRequestLimiter) LoadStateWithQuarantine(key string, tokens f
 	if elapsed > 0 {
 		tokens += elapsed * l.recoveryPerSecond
 	}
-	if tokens >= l.burst && emptyStreamStreak == 0 {
+	if tokens >= l.burst && emptyStreamStreak == 0 && eofTransportFailureStreak == 0 {
 		if l.store != nil {
 			if err := l.store.DeleteParticipantThrottle(key); err != nil {
 				log.Printf("participant_throttle_cleanup_failed participant_key=%s error=%v", key, err)
@@ -240,7 +257,13 @@ func (l *ParticipantRequestLimiter) LoadStateWithQuarantine(key string, tokens f
 		return
 	}
 
-	st := &participantRequestState{tokens: tokens, lastRefill: now, quarantineUntil: time.Time{}, emptyStreamStreak: emptyStreamStreak}
+	st := &participantRequestState{
+		tokens:                    tokens,
+		lastRefill:                now,
+		quarantineUntil:           time.Time{},
+		emptyStreamStreak:         emptyStreamStreak,
+		eofTransportFailureStreak: eofTransportFailureStreak,
+	}
 	// Legacy rows from 429/503: time-to-full (token refill) approximates the old
 	// IsAvailable horizon; cap at 60m.
 	if (status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable) && tokens < l.burst {
@@ -305,7 +328,7 @@ func (l *ParticipantRequestLimiter) allow(participantKey string, now time.Time) 
 	}
 	l.refillLocked(state, now)
 	if state.tokens >= l.burst {
-		if state.emptyStreamStreak > 0 {
+		if state.emptyStreamStreak > 0 || state.eofTransportFailureStreak > 0 {
 			return true
 		}
 		if l.probationActiveLocked(state) {
@@ -360,6 +383,7 @@ func (l *ParticipantRequestLimiter) ObserveResultWithBody(participantKey, path s
 	l.applyQuarantineLocked(participantKey, now.Add(quarantineFor), now)
 	if st := l.participants[participantKey]; st != nil {
 		st.emptyStreamStreak = 0
+		st.eofTransportFailureStreak = 0
 	}
 
 	log.Printf("participant_limit_activated participant_key=%s status=%d path_kind=%s",
@@ -368,12 +392,10 @@ func (l *ParticipantRequestLimiter) ObserveResultWithBody(participantKey, path s
 	l.persistThrottledStateLocked(participantKey, l.participants[participantKey], statusCode)
 }
 
-// ObserveTransportFailure records that a request to this host never
-// received an HTTP response. Only inference-path failures
-// (/chat/completions) trigger a quarantine; failures on protocol-
-// internal paths (verify-timeout, gossip, etc.) are logged but do
-// not quarantine because a single flaky vote RPC should not remove
-// a host that is otherwise serving inferences normally.
+// ObserveTransportFailure records that a request to this host never received an
+// HTTP response. Only inference-path failures (/chat/completions) trigger
+// quarantine. EOF-style inference failures require consecutive strikes; other
+// inference transport failures still quarantine immediately.
 func (l *ParticipantRequestLimiter) ObserveTransportFailure(participantKey, path string, err error) {
 	if participantKey == "" {
 		return
@@ -390,13 +412,51 @@ func (l *ParticipantRequestLimiter) ObserveTransportFailure(participantKey, path
 	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	if isEOFTransportFailure(err) {
+		state := l.ensureStateLocked(participantKey, now)
+		l.clearExpiredQuarantineIfAnyLocked(participantKey, state, now)
+		state, ok := l.participants[participantKey]
+		if !ok {
+			state = l.ensureStateLocked(participantKey, now)
+		}
+		if l.inQuarantineLocked(state, now) {
+			return
+		}
+		state.eofTransportFailureStreak++
+		if state.eofTransportFailureStreak >= l.eofTransportFailureThreshold {
+			l.applyQuarantineLocked(participantKey, now.Add(l.transportFailureQuarantine), now)
+			state.eofTransportFailureStreak = 0
+			state.emptyStreamStreak = 0
+			log.Printf("participant_limit_eof_transport_quarantine participant_key=%s threshold=%d error=%q",
+				participantKey, l.eofTransportFailureThreshold, truncateError(err))
+			l.persistThrottledStateLocked(participantKey, state, participantStatusEOFTransport)
+			return
+		}
+		log.Printf("participant_limit_eof_transport_streak participant_key=%s streak=%d error=%q",
+			participantKey, state.eofTransportFailureStreak, truncateError(err))
+		l.persistThrottledStateLocked(participantKey, state, participantStatusEOFTransport)
+		return
+	}
+
 	l.applyQuarantineLocked(participantKey, now.Add(l.transportFailureQuarantine), now)
 	if st := l.participants[participantKey]; st != nil {
 		st.emptyStreamStreak = 0
+		st.eofTransportFailureStreak = 0
 	}
 	log.Printf("participant_limit_transport_failure participant_key=%s path_kind=%s error=%q",
 		participantKey, kind, truncateError(err))
 	l.persistThrottledStateLocked(participantKey, l.participants[participantKey], participantStatusTransport)
+}
+
+func isEOFTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "eof")
 }
 
 func truncateError(err error) string {
@@ -434,6 +494,7 @@ func (l *ParticipantRequestLimiter) ObserveEmptyStream(participantKey string) {
 	if state.emptyStreamStreak >= l.emptyStreamQuarantineThreshold {
 		l.applyQuarantineLocked(participantKey, now.Add(l.emptyStreamQuarantine), now)
 		state.emptyStreamStreak = 0
+		state.eofTransportFailureStreak = 0
 		log.Printf("participant_limit_empty_stream_quarantine participant_key=%s threshold=%d", participantKey, l.emptyStreamQuarantineThreshold)
 		l.persistThrottledStateLocked(participantKey, state, participantStatusEmptyStream)
 		return
@@ -457,11 +518,12 @@ func (l *ParticipantRequestLimiter) ObserveStalledWinner(participantKey string) 
 	state := l.ensureStateLocked(participantKey, now)
 	l.applyQuarantineLocked(participantKey, now.Add(l.stalledWinnerQuarantine), now)
 	state.emptyStreamStreak = 0
+	state.eofTransportFailureStreak = 0
 	log.Printf("participant_limit_stalled_winner_quarantine participant_key=%s", participantKey)
 	l.persistThrottledStateLocked(participantKey, state, participantStatusStalledWinner)
 }
 
-// ObserveSuccessfulInference clears any accumulated empty-stream streak and
+// ObserveSuccessfulInference clears accumulated soft-failure streaks and
 // advances post-quarantine probation after a good finished response.
 func (l *ParticipantRequestLimiter) ObserveSuccessfulInference(participantKey string) {
 	if participantKey == "" {
@@ -480,10 +542,11 @@ func (l *ParticipantRequestLimiter) ObserveSuccessfulInference(participantKey st
 	if !ok {
 		return
 	}
-	if state.emptyStreamStreak == 0 && state.probationSuccessesRemaining == 0 {
+	if state.emptyStreamStreak == 0 && state.eofTransportFailureStreak == 0 && state.probationSuccessesRemaining == 0 {
 		return
 	}
 	state.emptyStreamStreak = 0
+	state.eofTransportFailureStreak = 0
 	if state.probationSuccessesRemaining > 0 {
 		state.probationSuccessesRemaining--
 	}
@@ -517,6 +580,7 @@ func (l *ParticipantRequestLimiter) ClearQuarantine(participantKey string) bool 
 	state.lastRefill = now
 	state.quarantineUntil = time.Time{}
 	state.emptyStreamStreak = 0
+	state.eofTransportFailureStreak = 0
 	state.probationSuccessesRemaining = participantProbationSuccessesAfterQuarantine
 	l.persistDeleteLocked(participantKey)
 	log.Printf("participant_quarantine_cleared participant_key=%s", participantKey)
@@ -630,7 +694,7 @@ func (l *ParticipantRequestLimiter) Snapshot(participantKeys []string) map[strin
 		quarantined := l.inQuarantineLocked(state, now)
 		if !quarantined {
 			l.refillLocked(state, now)
-			if state.tokens >= l.burst && state.emptyStreamStreak == 0 {
+			if state.tokens >= l.burst && state.emptyStreamStreak == 0 && state.eofTransportFailureStreak == 0 {
 				if l.probationActiveLocked(state) {
 					snapshot := ParticipantThrottleSnapshot{
 						Tracked:              true,
@@ -659,7 +723,7 @@ func (l *ParticipantRequestLimiter) Snapshot(participantKeys []string) map[strin
 			}
 		}
 		blocked := quarantined || state.tokens < 1
-		available := !quarantined && (state.tokens >= l.burst || state.emptyStreamStreak > 0)
+		available := !quarantined && (state.tokens >= l.burst || state.emptyStreamStreak > 0 || state.eofTransportFailureStreak > 0)
 		snapshot := ParticipantThrottleSnapshot{
 			Tracked:              true,
 			Quarantined:          quarantined,
@@ -669,6 +733,7 @@ func (l *ParticipantRequestLimiter) Snapshot(participantKeys []string) map[strin
 			Tokens:               state.tokens,
 			Burst:                l.burst,
 			EmptyStreamStreak:    state.emptyStreamStreak,
+			EOFTransportStreak:   state.eofTransportFailureStreak,
 		}
 		if quarantined {
 			snapshot.QuarantineUntil = state.quarantineUntil.UTC().Format(time.RFC3339)
@@ -698,7 +763,7 @@ func (l *ParticipantRequestLimiter) persistThrottledStateLocked(key string, stat
 	if !state.quarantineUntil.IsZero() {
 		quar = state.quarantineUntil
 	}
-	if err := l.store.SaveParticipantThrottle(key, state.tokens, state.lastRefill, status, quar, state.emptyStreamStreak); err != nil {
+	if err := l.store.SaveParticipantThrottle(key, state.tokens, state.lastRefill, status, quar, state.emptyStreamStreak, state.eofTransportFailureStreak); err != nil {
 		log.Printf("participant_throttle_persist_failed participant_key=%s error=%v", key, err)
 	}
 }
@@ -798,7 +863,7 @@ func (l *ParticipantRequestLimiter) IsAvailable(participantKey string) bool {
 	}
 	l.refillLocked(state, now)
 	if state.tokens >= l.burst {
-		if state.emptyStreamStreak > 0 {
+		if state.emptyStreamStreak > 0 || state.eofTransportFailureStreak > 0 {
 			return true
 		}
 		if l.probationActiveLocked(state) {
@@ -868,6 +933,7 @@ func (l *ParticipantRequestLimiter) clearExpiredQuarantineIfAnyLocked(key string
 		state.tokens = l.burst
 		state.lastRefill = now
 		state.emptyStreamStreak = 0
+		state.eofTransportFailureStreak = 0
 		state.probationSuccessesRemaining = participantProbationSuccessesAfterQuarantine
 		l.persistDeleteLocked(key)
 		log.Printf("participant_quarantine_ended participant_key=%s", key)

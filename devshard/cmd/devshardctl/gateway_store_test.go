@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -82,18 +83,6 @@ func TestAdminAuthMiddlewareRequiresAdminKey(t *testing.T) {
 	}
 }
 
-func TestAdminFinalizeBypassesPublicAPIKeyAuth(t *testing.T) {
-	handler := adminAuthMiddleware("adminkey", bearerAuthMiddleware(map[string]struct{}{"publickey": {}}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})))
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/finalize", nil)
-	req.Header.Set("Authorization", "Bearer adminkey")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusNoContent, rec.Code)
-}
-
 func TestGatewayStoreUpdateSettings(t *testing.T) {
 	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
 	require.NoError(t, err)
@@ -118,12 +107,8 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 		MaxConcurrentRequests:   5,
 		MaxInputTokensInFlight:  500,
 		ModelLimits: []GatewayModelLimitSettings{
-			{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700, DefaultRequestMaxTokens: 3072, RequestMaxTokensCap: 4096},
-			{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300},
-		},
-		ModelAccess: []GatewayModelAccessSettings{
-			{ModelID: "Kimi/Rotate", Enabled: false, Message: "Kimi temporarily unavailable"},
-			{ModelID: "Qwen/Test", Enabled: true},
+			{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700, DefaultRequestMaxTokens: 3072, RequestMaxTokensCap: 4096, AccessMode: "api_key"},
+			{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300, AccessMode: "admin_only", AccessMessage: "Kimi temporarily unavailable"},
 		},
 		Disabled: GatewayDisabledSettings{
 			Enabled: true,
@@ -170,13 +155,9 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 	require.EqualValues(t, 5, state.Settings.MaxConcurrentRequests)
 	require.EqualValues(t, 500, state.Settings.MaxInputTokensInFlight)
 	require.Equal(t, []GatewayModelLimitSettings{
-		{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700, DefaultRequestMaxTokens: 3072, RequestMaxTokensCap: 4096},
-		{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300},
+		{ModelID: "Qwen/Test", MaxConcurrentRequests: 7, MaxInputTokensInFlight: 700, DefaultRequestMaxTokens: 3072, RequestMaxTokensCap: 4096, AccessMode: "api_key"},
+		{ModelID: "Kimi/Rotate", MaxConcurrentRequests: 3, MaxInputTokensInFlight: 300, AccessMode: "admin_only", AccessMessage: "Kimi temporarily unavailable"},
 	}, state.Settings.ModelLimits)
-	require.Equal(t, []GatewayModelAccessSettings{
-		{ModelID: "Kimi/Rotate", Enabled: false, Message: "Kimi temporarily unavailable"},
-		{ModelID: "Qwen/Test", Enabled: true},
-	}, state.Settings.ModelAccess)
 	require.True(t, state.Settings.Disabled.Enabled)
 	require.Equal(t, "please use ... base url", state.Settings.Disabled.Message)
 	require.Equal(t, "https://.../v1/chat/completions", state.Settings.Disabled.NewURL)
@@ -195,6 +176,45 @@ func TestGatewayStoreUpdateSettings(t *testing.T) {
 		Amount:        555,
 		PrivateKeyEnv: "KIMI_ROTATION_KEY",
 	}}, state.Settings.EscrowRotation.Models)
+}
+
+func TestGatewayStoreLoadsLegacyModelAccessIntoModelLimits(t *testing.T) {
+	store, err := NewGatewayStore(filepath.Join(t.TempDir(), "gateway.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, store.Close())
+	})
+	require.NoError(t, store.Initialize(GatewaySettings{
+		ChainREST:               "http://node:1317",
+		PublicAPI:               "http://api:9000",
+		DefaultModel:            "Qwen/Test",
+		DefaultRequestMaxTokens: 1000,
+		MaxConcurrentRequests:   2,
+		MaxInputTokensInFlight:  200,
+		ModelLimits: []GatewayModelLimitSettings{{
+			ModelID:               "Qwen/Test",
+			MaxConcurrentRequests: 7,
+		}},
+	}, nil))
+
+	legacyAccess, err := json.Marshal([]GatewayModelAccessSettings{{
+		ModelID: "Qwen/Test",
+		Enabled: false,
+		Message: "Qwen temporarily unavailable",
+	}})
+	require.NoError(t, err)
+	_, err = store.db.Exec(`UPDATE gateway_settings SET model_access_json = ? WHERE id = 1`, string(legacyAccess))
+	require.NoError(t, err)
+
+	state, ok, err := store.LoadState()
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []GatewayModelLimitSettings{{
+		ModelID:               "Qwen/Test",
+		MaxConcurrentRequests: 7,
+		AccessMode:            "admin_only",
+		AccessMessage:         "Qwen temporarily unavailable",
+	}}, state.Settings.ModelLimits)
 }
 
 func TestValidateGatewaySettingsRequiresRotationModels(t *testing.T) {

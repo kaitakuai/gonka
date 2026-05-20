@@ -257,6 +257,7 @@ type PerfTracker struct {
 	hosts             map[string]*hostRing
 	requests          requestRing
 	firstTokenBuckets map[string]*firstTokenBucketRing
+	contextLimits     map[string]uint64 // participant_key -> observed max context length
 	pairwise          *PairwiseTracker
 	store             *PerfStore
 }
@@ -265,6 +266,7 @@ func NewPerfTracker(store *PerfStore) *PerfTracker {
 	pt := &PerfTracker{
 		hosts:             make(map[string]*hostRing),
 		firstTokenBuckets: make(map[string]*firstTokenBucketRing),
+		contextLimits:     make(map[string]uint64),
 		pairwise:          NewPairwiseTracker(),
 		store:             store,
 	}
@@ -481,6 +483,36 @@ func (t *PerfTracker) FirstTokenFallbackDelay(model string, inputTokens uint64) 
 		return 0, false
 	}
 	return delay, true
+}
+
+// RecordContextLimit stores the observed maximum context length for a
+// participant, as reported by the host in a context-length error response.
+// Only updates if the new limit differs from the previously recorded value.
+func (t *PerfTracker) RecordContextLimit(participantKey string, maxTokens uint64) {
+	if t == nil || participantKey == "" || maxTokens == 0 {
+		return
+	}
+	t.mu.Lock()
+	prev, exists := t.contextLimits[participantKey]
+	if !exists || prev != maxTokens {
+		t.contextLimits[participantKey] = maxTokens
+		log.Printf("perf: recorded context_limit participant_key=%s max_tokens=%d prev=%d", participantKey, maxTokens, prev)
+	}
+	t.mu.Unlock()
+}
+
+// ContextLimits returns a snapshot of all observed host context length limits.
+func (t *PerfTracker) ContextLimits() map[string]uint64 {
+	if t == nil {
+		return nil
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	result := make(map[string]uint64, len(t.contextLimits))
+	for k, v := range t.contextLimits {
+		result[k] = v
+	}
+	return result
 }
 
 func (t *PerfTracker) PairwiseSummaries() []PairwiseSummary {

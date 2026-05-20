@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"unicode/utf8"
 )
 
 type chatRequest struct {
@@ -154,6 +157,7 @@ func readLimitedChatRequestBody(r *http.Request) ([]byte, error) {
 		return nil, badChatRequest("read body: %v", err)
 	}
 	if len(body) > MaxChatRequestBodySize {
+		logRequestStage(r.Context(), "chat_request_body_too_large", "body_bytes", len(body), "limit_bytes", MaxChatRequestBodySize)
 		return nil, &chatRequestFilterError{status: http.StatusRequestEntityTooLarge, message: "request body too large"}
 	}
 	return body, nil
@@ -168,11 +172,19 @@ func prepareChatRequestBodyWithTokenLimits(r *http.Request, limits outputTokenLi
 	if err != nil {
 		return nil, chatRequest{}, err
 	}
+	originalBody := append([]byte(nil), body...)
 	body, err = normalizeContent(body)
 	if err != nil {
+		captureFilterRejectedRequest(r, originalBody, err, "", "")
 		return nil, chatRequest{}, err
 	}
-	return normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits, routedModel)
+	logResponseFormatDiagnostics(r.Context(), body)
+	updatedBody, req, err := normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits, routedModel)
+	if err != nil {
+		captureFilterRejectedRequest(r, originalBody, err, chatRequestModel(body), "")
+		return nil, chatRequest{}, err
+	}
+	return updatedBody, req, nil
 }
 
 func normalizeChatRequest(body []byte) ([]byte, chatRequest, error) {
@@ -185,6 +197,64 @@ func normalizeChatRequestForModel(body []byte, routedModel string) ([]byte, chat
 
 func normalizeChatRequestForAuthAndLimits(body []byte, adminAuthenticated bool, limits outputTokenLimits, routedModel string) ([]byte, chatRequest, error) {
 	return defaultChatRequestPipeline().Normalize(body, adminAuthenticated, limits, routedModel)
+}
+
+func logResponseFormatDiagnostics(ctx context.Context, body []byte) {
+	document, err := decodeChatRequestDocument(body)
+	if err != nil {
+		return
+	}
+	responseFormat, ok := document.Object("response_format")
+	if !ok {
+		if document.Has("response_format") {
+			logRequestStage(ctx, "response_format_rejected_details", "reason", "not_object")
+		}
+		return
+	}
+	rawType, hasType := responseFormat["type"]
+	responseFormatType, typeIsString := rawType.(string)
+	if !hasType {
+		logRequestStage(ctx, "response_format_rejected_details", "reason", "missing_type", "fields", sortedObjectKeys(responseFormat))
+		return
+	}
+	if !typeIsString {
+		logRequestStage(ctx, "response_format_rejected_details", "reason", "non_string_type", "fields", sortedObjectKeys(responseFormat))
+		return
+	}
+	switch responseFormatType {
+	case "text", "json_object", "json_schema":
+		encoded, err := json.Marshal(responseFormat)
+		if err != nil {
+			logRequestStage(ctx, "response_format_rejected_details", "type", responseFormatType, "marshal_error", err)
+			return
+		}
+		logRequestStage(ctx, "response_format_rejected_details", "type", responseFormatType, "response_format", truncateUTF8String(string(encoded), MaxLoggedResponseFormatBytes))
+	default:
+		logRequestStage(ctx, "response_format_rejected_details", "reason", "unsupported_type", "type", responseFormatType)
+	}
+}
+
+func sortedObjectKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func truncateUTF8String(value string, maxBytes int) string {
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	if end == 0 {
+		end = maxBytes
+	}
+	return value[:end]
 }
 
 func defaultOutputTokenLimits() outputTokenLimits {
@@ -213,7 +283,7 @@ func capOutputTokens(value uint64, explicitlySet bool, bypassLimit bool, limits 
 }
 
 func unsupportedChatParameterMessage(name string) string {
-	return fmt.Sprintf("feature %q is temporarily unavailable", name)
+	return fmt.Sprintf("Chat completions parameter %q is currently rejected by the Gonka network. Some non-standard parameters can crash the vLLM engine on Gonka Host MLNodes, so the network rejects parameters that are not explicitly supported (see: https://github.com/gonka-ai/gonka/blob/dl/devshards-gateway-to-main/devshard/docs/supported-params.md). If you do not need this parameter, remove it from the request; if you need it, file a request at https://github.com/gonka-ai/gonka/issues", name)
 }
 
 func numericJSONValueAsUint64(value any) (uint64, bool) {

@@ -561,6 +561,7 @@ func (p *Proxy) handleDebugPerf(w http.ResponseWriter, r *http.Request) {
 		"hosts":                  stats,
 		"requests":               requests,
 		"pairwise":               p.perf.PairwiseSummaries(),
+		"context_limits":         p.perf.ContextLimits(),
 		"receipt_timeout_ms":     ReceiptTimeout.Milliseconds(),
 		"advantage_threshold":    ParallelAdvantageThreshold,
 		"unresponsive_threshold": UnresponsiveThreshold,

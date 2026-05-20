@@ -868,7 +868,7 @@ func TestLongResponseAfterContentSkipsParticipantFailureAccounting(t *testing.T)
 		inf.contentChunks.Store(1)
 		inf.outputChunks.Store(1)
 		env.proxy.redundancy.recordStalledWinnerFailureOnce(inf, defaultParams())
-		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams())
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams(), true)
 	}
 
 	require.False(t, limiter.IsBlocked(participantKey))
@@ -893,7 +893,7 @@ func TestLongNonStreamEmptyResponseRecordsTimingWithoutQuarantine(t *testing.T) 
 			sendTime:    time.Now().Add(-(longResponseFailureExemption + time.Second)),
 			receiptTime: time.Now().Add(-(longResponseFailureExemption + 900*time.Millisecond)),
 		}
-		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, params)
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, params, true)
 	}
 
 	require.False(t, limiter.IsBlocked(participantKey))
@@ -926,7 +926,7 @@ func TestFastNonStreamEmptyResponseRecordsParticipantFailure(t *testing.T) {
 		sendTime:    time.Now().Add(-time.Second),
 		receiptTime: time.Now().Add(-900 * time.Millisecond),
 	}
-	env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, params)
+	env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, params, true)
 
 	stats := env.proxy.redundancy.perf.Stats(0)
 	require.Equal(t, 1, stats.TotalSamples)
@@ -950,7 +950,7 @@ func TestErrorStreamSkipsParticipantFailureAccounting(t *testing.T) {
 		}
 		inf.outputChunks.Store(1)
 		env.proxy.redundancy.recordStalledWinnerFailureOnce(inf, defaultParams())
-		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams())
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams(), true)
 	}
 
 	require.False(t, limiter.IsBlocked(participantKey))
@@ -998,7 +998,7 @@ func TestRecordStartedAttemptSamplesRecordsFailedHostAttempts(t *testing.T) {
 			receiptTime: time.Now().Add(-900 * time.Millisecond),
 		}
 		inf.outputChunks.Store(1)
-		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams())
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams(), true)
 	}
 
 	stats := env.proxy.redundancy.perf.Stats(0)
@@ -1007,8 +1007,30 @@ func TestRecordStartedAttemptSamplesRecordsFailedHostAttempts(t *testing.T) {
 	require.True(t, limiter.IsBlocked(env.session.HostParticipantKey(0)))
 
 	unstarted := &inflight{hostIdx: 0, nonce: 99}
-	env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{unstarted}, defaultParams())
+	env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{unstarted}, defaultParams(), true)
 	require.Equal(t, emptyStreamQuarantineThreshold, env.proxy.redundancy.perf.Stats(0).TotalSamples)
+}
+
+func TestRecordStartedAttemptSamplesDoesNotCountEmptyStreamWhenRequestFailed(t *testing.T) {
+	env := setupTestProxyWithClients(t, []user.HostClient{streamContentThenStallClient{}})
+	limiter := NewParticipantRequestLimiter(10, 10)
+	env.proxy.redundancy.participantLimiter = limiter
+
+	for i := 0; i < emptyStreamQuarantineThreshold; i++ {
+		inf := &inflight{
+			hostIdx:     0,
+			nonce:       uint64(i + 1),
+			sendTime:    time.Now().Add(-time.Second),
+			receiptTime: time.Now().Add(-900 * time.Millisecond),
+		}
+		inf.outputChunks.Store(1)
+		env.proxy.redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams(), false)
+	}
+
+	stats := env.proxy.redundancy.perf.Stats(0)
+	require.Equal(t, emptyStreamQuarantineThreshold, stats.TotalSamples)
+	require.Zero(t, stats.ResponsiveRate)
+	require.False(t, limiter.IsBlocked(env.session.HostParticipantKey(0)))
 }
 
 func TestRunInference_CancelStillSettlesStartedAttempt(t *testing.T) {

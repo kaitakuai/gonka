@@ -11,21 +11,22 @@ import (
 )
 
 type GatewaySettings struct {
-	ChainREST               string                       `json:"chain_rest"`
-	PublicAPI               string                       `json:"public_api"`
-	DefaultModel            string                       `json:"default_model"`
-	DefaultRequestMaxTokens uint64                       `json:"default_request_max_tokens"`
-	RequestMaxTokensCap     uint64                       `json:"request_max_tokens_cap"`
-	MaxConcurrentRequests   int64                        `json:"max_concurrent_requests"`
-	MaxInputTokensInFlight  int64                        `json:"max_input_tokens_in_flight"`
-	ModelLimits             []GatewayModelLimitSettings  `json:"model_limits,omitempty"`
-	ModelAccess             []GatewayModelAccessSettings `json:"model_access,omitempty"`
-	TxGasLimit              uint64                       `json:"tx_gas_limit,omitempty"`
-	Disabled                GatewayDisabledSettings      `json:"disabled"`
-	ParticipantThrottle     ParticipantThrottleSettings  `json:"participant_throttle"`
-	Redundancy              RedundancySettings           `json:"redundancy"`
-	Perf                    PerfSettings                 `json:"perf"`
-	EscrowRotation          EscrowRotationSettings       `json:"escrow_rotation"`
+	ChainREST                      string                      `json:"chain_rest"`
+	PublicAPI                      string                      `json:"public_api"`
+	DefaultModel                   string                      `json:"default_model"`
+	DefaultRequestMaxTokens        uint64                      `json:"default_request_max_tokens"`
+	RequestMaxTokensCap            uint64                      `json:"request_max_tokens_cap"`
+	MaxConcurrentRequests          int64                       `json:"max_concurrent_requests"`
+	MaxConcurrentPer10000Weight    float64                     `json:"max_concurrent_requests_per_10000_weight"`
+	PoCMaxConcurrentPer10000Weight float64                     `json:"poc_max_concurrent_requests_per_10000_weight"`
+	MaxInputTokensInFlight         int64                       `json:"max_input_tokens_in_flight"`
+	ModelLimits                    []GatewayModelLimitSettings `json:"model_limits,omitempty"`
+	TxGasLimit                     uint64                      `json:"tx_gas_limit,omitempty"`
+	Disabled                       GatewayDisabledSettings     `json:"disabled"`
+	ParticipantThrottle            ParticipantThrottleSettings `json:"participant_throttle"`
+	Redundancy                     RedundancySettings          `json:"redundancy"`
+	Perf                           PerfSettings                `json:"perf"`
+	EscrowRotation                 EscrowRotationSettings      `json:"escrow_rotation"`
 }
 
 type GatewayModelLimitSettings struct {
@@ -34,6 +35,8 @@ type GatewayModelLimitSettings struct {
 	MaxInputTokensInFlight  int64  `json:"max_input_tokens_in_flight"`
 	DefaultRequestMaxTokens uint64 `json:"default_request_max_tokens,omitempty"`
 	RequestMaxTokensCap     uint64 `json:"request_max_tokens_cap,omitempty"`
+	AccessMode              string `json:"access_mode,omitempty"`
+	AccessMessage           string `json:"access_message,omitempty"`
 }
 
 type GatewayModelAccessSettings struct {
@@ -50,6 +53,7 @@ type ParticipantThrottleSettings struct {
 	EmptyStreamQuarantineMS        int64 `json:"empty_stream_quarantine_ms"`
 	StalledWinnerQuarantineMS      int64 `json:"stalled_winner_quarantine_ms"`
 	EmptyStreamQuarantineThreshold int   `json:"empty_stream_threshold"`
+	EOFTransportFailureThreshold   int   `json:"eof_transport_failure_threshold"`
 }
 
 type RedundancySettings struct {
@@ -90,6 +94,11 @@ type EscrowRotationModelSettings struct {
 	PrivateKeyEnv string `json:"private_key_env"`
 }
 
+const (
+	defaultMaxConcurrentPer10000Weight    = 5.0
+	defaultPoCMaxConcurrentPer10000Weight = 10.0
+)
+
 func DefaultGatewaySettingsTuning() (ParticipantThrottleSettings, RedundancySettings, PerfSettings) {
 	return DefaultParticipantThrottleSettings(), DefaultRedundancySettings(), PerfSettings{
 		SampleSize: 256,
@@ -104,6 +113,15 @@ func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 	}
 	if s.RequestMaxTokensCap == 0 {
 		s.RequestMaxTokensCap = 4_096
+	}
+	if s.MaxConcurrentPer10000Weight == 0 {
+		s.MaxConcurrentPer10000Weight = defaultMaxConcurrentPer10000Weight
+	}
+	if s.PoCMaxConcurrentPer10000Weight == 0 {
+		s.PoCMaxConcurrentPer10000Weight = s.MaxConcurrentPer10000Weight
+		if s.PoCMaxConcurrentPer10000Weight == defaultMaxConcurrentPer10000Weight {
+			s.PoCMaxConcurrentPer10000Weight = defaultPoCMaxConcurrentPer10000Weight
+		}
 	}
 	s.Disabled = s.Disabled.WithDefaults()
 	if s.ParticipantThrottle == (ParticipantThrottleSettings{}) {
@@ -145,7 +163,6 @@ func (s GatewaySettings) WithTuningDefaults() GatewaySettings {
 		model.PrivateKeyEnv = strings.TrimSpace(model.PrivateKeyEnv)
 	}
 	s.ModelLimits = normalizeGatewayModelLimits(s.ModelLimits)
-	s.ModelAccess = normalizeGatewayModelAccess(s.ModelAccess)
 	return s
 }
 
@@ -157,6 +174,8 @@ func normalizeGatewayModelLimits(limits []GatewayModelLimitSettings) []GatewayMo
 	seen := make(map[string]int, len(limits))
 	for _, limit := range limits {
 		limit.ModelID = strings.TrimSpace(limit.ModelID)
+		limit.AccessMode = normalizeGatewayAccessMode(limit.AccessMode)
+		limit.AccessMessage = strings.TrimSpace(limit.AccessMessage)
 		if limit.ModelID == "" {
 			continue
 		}
@@ -168,6 +187,65 @@ func normalizeGatewayModelLimits(limits []GatewayModelLimitSettings) []GatewayMo
 		normalized = append(normalized, limit)
 	}
 	return normalized
+}
+
+func normalizeGatewayAccessMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	mode = strings.ReplaceAll(mode, "-", "_")
+	mode = strings.ReplaceAll(mode, " ", "_")
+	switch mode {
+	case "":
+		return ""
+	case "open", "public", "none":
+		return string(gatewayAccessModeOpen)
+	case "api_key", "apikey", "api_keys", "api", "key":
+		return string(gatewayAccessModeAPIKey)
+	case "admin", "admin_only", "admin_key":
+		return string(gatewayAccessModeAdminOnly)
+	default:
+		return mode
+	}
+}
+
+func gatewayModelAccessModeLabel(mode string) string {
+	mode = normalizeGatewayAccessMode(mode)
+	if mode == "" {
+		return string(gatewayAccessModeAdminOnly)
+	}
+	return mode
+}
+
+func applyLegacyModelAccessToLimits(limits []GatewayModelLimitSettings, access []GatewayModelAccessSettings) []GatewayModelLimitSettings {
+	if len(access) == 0 {
+		return limits
+	}
+	limits = normalizeGatewayModelLimits(limits)
+	byModel := make(map[string]int, len(limits))
+	for i, limit := range limits {
+		byModel[limit.ModelID] = i
+	}
+	for _, entry := range normalizeGatewayModelAccess(access) {
+		mode := string(gatewayAccessModeOpen)
+		if !entry.Enabled {
+			mode = string(gatewayAccessModeAdminOnly)
+		}
+		if idx, ok := byModel[entry.ModelID]; ok {
+			if limits[idx].AccessMode == "" {
+				limits[idx].AccessMode = mode
+			}
+			if limits[idx].AccessMessage == "" {
+				limits[idx].AccessMessage = entry.Message
+			}
+			continue
+		}
+		byModel[entry.ModelID] = len(limits)
+		limits = append(limits, GatewayModelLimitSettings{
+			ModelID:       entry.ModelID,
+			AccessMode:    mode,
+			AccessMessage: entry.Message,
+		})
+	}
+	return normalizeGatewayModelLimits(limits)
 }
 
 func normalizeGatewayModelAccess(access []GatewayModelAccessSettings) []GatewayModelAccessSettings {
@@ -224,6 +302,8 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			default_request_max_tokens INTEGER NOT NULL,
 			request_max_tokens_cap INTEGER NOT NULL DEFAULT 4096,
 			max_concurrent_requests INTEGER NOT NULL DEFAULT 512,
+			max_concurrent_requests_per_10000_weight REAL NOT NULL DEFAULT 5.0,
+			poc_max_concurrent_requests_per_10000_weight REAL NOT NULL DEFAULT 10.0,
 			max_input_tokens_in_flight INTEGER NOT NULL,
 			model_limits_json TEXT NOT NULL DEFAULT '',
 			model_access_json TEXT NOT NULL DEFAULT '',
@@ -235,6 +315,7 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 			participant_empty_stream_quarantine_ms INTEGER NOT NULL DEFAULT 1800000,
 			participant_stalled_winner_quarantine_ms INTEGER NOT NULL DEFAULT 1800000,
 			participant_empty_stream_threshold INTEGER NOT NULL DEFAULT 3,
+			participant_eof_transport_failure_threshold INTEGER NOT NULL DEFAULT 3,
 			redundancy_receipt_timeout_ms INTEGER NOT NULL DEFAULT 5000,
 			redundancy_first_token_timeout_floor_ms INTEGER NOT NULL DEFAULT 1000,
 			redundancy_per_input_token_first_token_lag_ms INTEGER NOT NULL DEFAULT 10,
@@ -300,6 +381,14 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate gateway max token cap: %w", err)
 	}
+	if err := ensureGatewaySettingsColumn(db, "max_concurrent_requests_per_10000_weight", "REAL NOT NULL DEFAULT 5.0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway weight concurrency: %w", err)
+	}
+	if err := ensureGatewaySettingsColumn(db, "poc_max_concurrent_requests_per_10000_weight", "REAL NOT NULL DEFAULT 10.0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate gateway poc weight concurrency: %w", err)
+	}
 	if err := ensureGatewaySettingsTuningColumns(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate gateway tuning settings: %w", err)
@@ -361,6 +450,10 @@ func NewGatewayStore(path string) (*GatewayStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate participant throttle streak: %w", err)
 	}
+	if err := ensureColumn(db, "participant_throttle_state", "eof_transport_failure_streak", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate participant throttle eof streak: %w", err)
+	}
 
 	return &GatewayStore{db: db}, nil
 }
@@ -376,11 +469,13 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 	var state GatewayState
 	row := s.db.QueryRow(`
 		SELECT chain_rest, public_api, default_model, default_request_max_tokens, request_max_tokens_cap,
-		       max_concurrent_requests, max_input_tokens_in_flight, model_limits_json, model_access_json, tx_gas_limit,
+		       max_concurrent_requests, max_concurrent_requests_per_10000_weight,
+		       poc_max_concurrent_requests_per_10000_weight, max_input_tokens_in_flight,
+		       model_limits_json, model_access_json, tx_gas_limit,
 		       participant_request_burst, participant_recovery_per_minute,
 		       participant_http_quarantine_ms, participant_transport_failure_quarantine_ms,
 		       participant_empty_stream_quarantine_ms, participant_stalled_winner_quarantine_ms,
-		       participant_empty_stream_threshold,
+		       participant_empty_stream_threshold, participant_eof_transport_failure_threshold,
 		       redundancy_receipt_timeout_ms, redundancy_first_token_timeout_floor_ms,
 		       redundancy_per_input_token_first_token_lag_ms, redundancy_inter_chunk_stall_timeout_ms,
 		       redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
@@ -406,6 +501,8 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.DefaultRequestMaxTokens,
 		&state.Settings.RequestMaxTokensCap,
 		&state.Settings.MaxConcurrentRequests,
+		&state.Settings.MaxConcurrentPer10000Weight,
+		&state.Settings.PoCMaxConcurrentPer10000Weight,
 		&state.Settings.MaxInputTokensInFlight,
 		&modelLimitsJSON,
 		&modelAccessJSON,
@@ -417,6 +514,7 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		&state.Settings.ParticipantThrottle.EmptyStreamQuarantineMS,
 		&state.Settings.ParticipantThrottle.StalledWinnerQuarantineMS,
 		&state.Settings.ParticipantThrottle.EmptyStreamQuarantineThreshold,
+		&state.Settings.ParticipantThrottle.EOFTransportFailureThreshold,
 		&state.Settings.Redundancy.ReceiptTimeoutMS,
 		&state.Settings.Redundancy.FirstTokenTimeoutFloorMS,
 		&state.Settings.Redundancy.PerInputTokenFirstTokenLagMS,
@@ -460,9 +558,11 @@ func (s *GatewayStore) LoadState() (GatewayState, bool, error) {
 		}
 	}
 	if strings.TrimSpace(modelAccessJSON) != "" {
-		if err := json.Unmarshal([]byte(modelAccessJSON), &state.Settings.ModelAccess); err != nil {
+		var legacyModelAccess []GatewayModelAccessSettings
+		if err := json.Unmarshal([]byte(modelAccessJSON), &legacyModelAccess); err != nil {
 			return GatewayState{}, false, fmt.Errorf("load gateway model access: %w", err)
 		}
+		state.Settings.ModelLimits = applyLegacyModelAccessToLimits(state.Settings.ModelLimits, legacyModelAccess)
 	}
 	state.Settings.Disabled.Enabled = disabledEnabled != 0
 	state.Settings = state.Settings.WithTuningDefaults()
@@ -523,11 +623,13 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 	if _, err := tx.Exec(`
 		INSERT INTO gateway_settings (
 			id, chain_rest, public_api, default_model, default_request_max_tokens, request_max_tokens_cap,
-			max_concurrent_requests, max_input_tokens_in_flight, model_limits_json, model_access_json, tx_gas_limit,
+			max_concurrent_requests, max_concurrent_requests_per_10000_weight,
+			poc_max_concurrent_requests_per_10000_weight, max_input_tokens_in_flight,
+			model_limits_json, model_access_json, tx_gas_limit,
 			participant_request_burst, participant_recovery_per_minute,
 			participant_http_quarantine_ms, participant_transport_failure_quarantine_ms,
 			participant_empty_stream_quarantine_ms, participant_stalled_winner_quarantine_ms,
-			participant_empty_stream_threshold,
+			participant_empty_stream_threshold, participant_eof_transport_failure_threshold,
 			redundancy_receipt_timeout_ms, redundancy_first_token_timeout_floor_ms,
 			redundancy_per_input_token_first_token_lag_ms, redundancy_inter_chunk_stall_timeout_ms,
 			redundancy_non_stream_response_floor_ms, redundancy_per_input_token_response_lag_ms,
@@ -540,16 +642,18 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 			escrow_rotation_enabled, escrow_rotation_pre_poc_blocks, escrow_rotation_models_json,
 			gateway_disabled_enabled, gateway_disabled_message, gateway_disabled_new_url,
 			updated_at
-		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.TrimSpace(settings.ChainREST),
 		strings.TrimSpace(settings.PublicAPI),
 		strings.TrimSpace(settings.DefaultModel),
 		settings.DefaultRequestMaxTokens,
 		settings.RequestMaxTokensCap,
 		settings.MaxConcurrentRequests,
+		settings.MaxConcurrentPer10000Weight,
+		settings.PoCMaxConcurrentPer10000Weight,
 		settings.MaxInputTokensInFlight,
 		mustMarshalGatewayModelLimits(settings.ModelLimits),
-		mustMarshalGatewayModelAccess(settings.ModelAccess),
+		"",
 		settings.TxGasLimit,
 		settings.ParticipantThrottle.RequestBurst,
 		settings.ParticipantThrottle.RecoveryPerMinute,
@@ -558,6 +662,7 @@ func (s *GatewayStore) Initialize(settings GatewaySettings, devshards []GatewayD
 		settings.ParticipantThrottle.EmptyStreamQuarantineMS,
 		settings.ParticipantThrottle.StalledWinnerQuarantineMS,
 		settings.ParticipantThrottle.EmptyStreamQuarantineThreshold,
+		settings.ParticipantThrottle.EOFTransportFailureThreshold,
 		settings.Redundancy.ReceiptTimeoutMS,
 		settings.Redundancy.FirstTokenTimeoutFloorMS,
 		settings.Redundancy.PerInputTokenFirstTokenLagMS,
@@ -605,6 +710,8 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    default_request_max_tokens = ?,
 		    request_max_tokens_cap = ?,
 		    max_concurrent_requests = ?,
+		    max_concurrent_requests_per_10000_weight = ?,
+		    poc_max_concurrent_requests_per_10000_weight = ?,
 		    max_input_tokens_in_flight = ?,
 		    model_limits_json = ?,
 		    model_access_json = ?,
@@ -616,6 +723,7 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		    participant_empty_stream_quarantine_ms = ?,
 		    participant_stalled_winner_quarantine_ms = ?,
 		    participant_empty_stream_threshold = ?,
+		    participant_eof_transport_failure_threshold = ?,
 		    redundancy_receipt_timeout_ms = ?,
 		    redundancy_first_token_timeout_floor_ms = ?,
 		    redundancy_per_input_token_first_token_lag_ms = ?,
@@ -648,9 +756,11 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		settings.DefaultRequestMaxTokens,
 		settings.RequestMaxTokensCap,
 		settings.MaxConcurrentRequests,
+		settings.MaxConcurrentPer10000Weight,
+		settings.PoCMaxConcurrentPer10000Weight,
 		settings.MaxInputTokensInFlight,
 		mustMarshalGatewayModelLimits(settings.ModelLimits),
-		mustMarshalGatewayModelAccess(settings.ModelAccess),
+		"",
 		settings.TxGasLimit,
 		settings.ParticipantThrottle.RequestBurst,
 		settings.ParticipantThrottle.RecoveryPerMinute,
@@ -659,6 +769,7 @@ func (s *GatewayStore) UpdateSettings(settings GatewaySettings) error {
 		settings.ParticipantThrottle.EmptyStreamQuarantineMS,
 		settings.ParticipantThrottle.StalledWinnerQuarantineMS,
 		settings.ParticipantThrottle.EmptyStreamQuarantineThreshold,
+		settings.ParticipantThrottle.EOFTransportFailureThreshold,
 		settings.Redundancy.ReceiptTimeoutMS,
 		settings.Redundancy.FirstTokenTimeoutFloorMS,
 		settings.Redundancy.PerInputTokenFirstTokenLagMS,
@@ -873,15 +984,16 @@ func (s *GatewayStore) DeleteDevshard(id string) error {
 
 // ParticipantThrottleRow represents a persisted reactive throttle state for one host.
 type ParticipantThrottleRow struct {
-	Key               string
-	Tokens            float64
-	LastRefillAt      time.Time
-	Status            int
-	QuarantineUntil   time.Time // wall-clock end of unified quarantine; zero if unset
-	EmptyStreamStreak int
+	Key                       string
+	Tokens                    float64
+	LastRefillAt              time.Time
+	Status                    int
+	QuarantineUntil           time.Time // wall-clock end of unified quarantine; zero if unset
+	EmptyStreamStreak         int
+	EOFTransportFailureStreak int
 }
 
-func (s *GatewayStore) SaveParticipantThrottle(key string, tokens float64, lastRefillAt time.Time, status int, quarantineUntil time.Time, emptyStreamStreak int) error {
+func (s *GatewayStore) SaveParticipantThrottle(key string, tokens float64, lastRefillAt time.Time, status int, quarantineUntil time.Time, emptyStreamStreak int, eofTransportFailureStreak int) error {
 	if s == nil || s.db == nil {
 		return nil
 	}
@@ -891,9 +1003,9 @@ func (s *GatewayStore) SaveParticipantThrottle(key string, tokens float64, lastR
 	}
 	_, err := s.db.Exec(`
 		INSERT OR REPLACE INTO participant_throttle_state
-			(participant_key, tokens, last_refill_at, last_throttle_status, quarantine_until_utc, empty_stream_streak)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		key, tokens, lastRefillAt.UTC().Format(time.RFC3339Nano), status, quarStr, emptyStreamStreak)
+			(participant_key, tokens, last_refill_at, last_throttle_status, quarantine_until_utc, empty_stream_streak, eof_transport_failure_streak)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		key, tokens, lastRefillAt.UTC().Format(time.RFC3339Nano), status, quarStr, emptyStreamStreak, eofTransportFailureStreak)
 	if err != nil {
 		return fmt.Errorf("save participant throttle %s: %w", key, err)
 	}
@@ -918,6 +1030,7 @@ func (s *GatewayStore) LoadParticipantThrottles() ([]ParticipantThrottleRow, err
 	rows, err := s.db.Query(`
 		SELECT participant_key, tokens, last_refill_at, last_throttle_status,
 		       IFNULL(empty_stream_streak, 0) AS empty_stream_streak,
+		       IFNULL(eof_transport_failure_streak, 0) AS eof_transport_failure_streak,
 		       IFNULL(quarantine_until_utc, '') AS quarantine_until_utc
 		FROM participant_throttle_state`)
 	if err != nil {
@@ -929,7 +1042,7 @@ func (s *GatewayStore) LoadParticipantThrottles() ([]ParticipantThrottleRow, err
 	for rows.Next() {
 		var row ParticipantThrottleRow
 		var lastRefillStr, quarantineStr string
-		if err := rows.Scan(&row.Key, &row.Tokens, &lastRefillStr, &row.Status, &row.EmptyStreamStreak, &quarantineStr); err != nil {
+		if err := rows.Scan(&row.Key, &row.Tokens, &lastRefillStr, &row.Status, &row.EmptyStreamStreak, &row.EOFTransportFailureStreak, &quarantineStr); err != nil {
 			return nil, fmt.Errorf("scan participant throttle: %w", err)
 		}
 		row.LastRefillAt, err = time.Parse(time.RFC3339Nano, lastRefillStr)
@@ -980,18 +1093,6 @@ func mustMarshalGatewayModelLimits(limits []GatewayModelLimitSettings) string {
 	return string(b)
 }
 
-func mustMarshalGatewayModelAccess(access []GatewayModelAccessSettings) string {
-	access = normalizeGatewayModelAccess(access)
-	if len(access) == 0 {
-		return ""
-	}
-	b, err := json.Marshal(access)
-	if err != nil {
-		panic(err)
-	}
-	return string(b)
-}
-
 func ensureGatewaySettingsColumn(db *sql.DB, columnName, columnDDL string) error {
 	return ensureColumn(db, "gateway_settings", columnName, columnDDL)
 }
@@ -1008,6 +1109,7 @@ func ensureGatewaySettingsTuningColumns(db *sql.DB) error {
 		{"participant_empty_stream_quarantine_ms", "INTEGER NOT NULL DEFAULT 1800000"},
 		{"participant_stalled_winner_quarantine_ms", "INTEGER NOT NULL DEFAULT 1800000"},
 		{"participant_empty_stream_threshold", "INTEGER NOT NULL DEFAULT 3"},
+		{"participant_eof_transport_failure_threshold", "INTEGER NOT NULL DEFAULT 3"},
 		{"redundancy_receipt_timeout_ms", "INTEGER NOT NULL DEFAULT 5000"},
 		{"redundancy_first_token_timeout_floor_ms", "INTEGER NOT NULL DEFAULT 1000"},
 		{"redundancy_per_input_token_first_token_lag_ms", "INTEGER NOT NULL DEFAULT 10"},

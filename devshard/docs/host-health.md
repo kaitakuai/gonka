@@ -20,9 +20,10 @@ rotation but is effectively skipped.
 |---|---|---|---|
 | HTTP 429 or 503 | 60 min | any | Host reported overload or rate limit |
 | HTTP 404 on inference | 30 min | `/chat/completions` | Escrow not registered on host |
-| Transport failure on inference | 30 min | `/chat/completions` | Dial timeout, connection refused, TLS error |
+| Non-EOF transport failure on inference | 30 min | `/chat/completions` | Dial timeout, connection refused, TLS error |
+| 3 consecutive EOF transport failures on inference | 30 min | `/chat/completions` | EOF-style stream/read failures. Streak resets on quarantine or on a successful inference. |
 | Transport failure on non-inference | none | `/verify-timeout`, `/gossip/*`, etc. | Logged but not quarantined — a flaky vote RPC should not remove an otherwise healthy inference host |
-| 3 consecutive empty streams | 30 min | inference result | Host returns receipt but zero content chunks, three times in a row. Streak resets on quarantine or on a successful inference. |
+| 3 consecutive empty streams | 30 min | inference result | Host returns receipt but zero content chunks, three times in a row. Empty streams are only counted when the overall request succeeded via another attempt. Streak resets on quarantine or on a successful inference. |
 | Stalled winner | 30 min | inference result | Host won the race, emitted content, then went silent long enough to trigger the inter-chunk stall timeout (1 min). Immediate quarantine, no streak. |
 
 ### Quarantine behavior
@@ -31,7 +32,7 @@ rotation but is effectively skipped.
 - The longer of overlapping quarantines wins (e.g., a 503 during transport quarantine extends to 60 min).
 - State is persisted to `gateway.db` and survives container restarts.
 - When quarantine expires and tokens recover to full burst, the host is removed from tracking entirely (persistent record deleted).
-- A successful inference (`ObserveSuccessfulInference`) clears the empty-stream streak but does not end an active quarantine early.
+- A successful inference (`ObserveSuccessfulInference`) clears empty-stream and EOF streaks but does not end an active quarantine early.
 
 ### Admin override
 
@@ -114,9 +115,11 @@ The two systems are independent and can overlap:
 ### Quarantine
 
 - `participant_limit_activated` — 429/503 quarantine
-- `participant_limit_transport_failure` — inference transport failure quarantine
+- `participant_limit_transport_failure` — non-EOF inference transport failure quarantine
+- `participant_limit_eof_transport_streak` — EOF inference transport failure streak increment
+- `participant_limit_eof_transport_quarantine` — 3-strike EOF inference transport failure quarantine
 - `participant_transport_failure_ignored` — non-inference transport failure (no quarantine)
-- `participant_limit_empty_stream_quarantine` — 3-strike empty stream
+- `participant_limit_empty_stream_quarantine` — 3-strike empty stream on requests that succeeded via another attempt
 - `participant_limit_stalled_winner_quarantine` — stalled winner
 - `participant_quarantine_cleared` — admin override via unquarantine endpoint
 - `participant_quarantine_ended` — natural expiry

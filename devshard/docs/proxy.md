@@ -147,9 +147,10 @@ Admin endpoint. Returns the full session state and requires
 
 Admin endpoint. Updates persisted gateway settings. Global request/token caps
 remain the fallback, and `model_limits` overrides them per model before the
-gateway applies the model's current capacity scale factor. `model_access`
-temporarily enables or disables non-admin inference access for a model without
-removing its devshards or changing on-chain state.
+gateway applies the model's current capacity scale factor. `model_limits` also
+controls per-model inference access with `access_mode`: `open`, `api_key`, or
+`admin_only`. If a model has no `access_mode` configured, it defaults to
+`admin_only`.
 
 ```bash
 curl -X POST http://localhost:8080/v1/admin/settings \
@@ -162,38 +163,37 @@ curl -X POST http://localhost:8080/v1/admin/settings \
       {
         "model_id": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8",
         "max_concurrent_requests": 20,
-        "max_input_tokens_in_flight": 200000
+        "max_input_tokens_in_flight": 200000,
+        "access_mode": "api_key"
       },
       {
         "model_id": "moonshotai/Kimi-K2-Instruct",
         "max_concurrent_requests": 8,
-        "max_input_tokens_in_flight": 80000
-      }
-    ],
-    "model_access": [
-      {
-        "model_id": "moonshotai/Kimi-K2-Instruct",
-        "enabled": false,
-        "message": "Kimi is temporarily unavailable"
+        "max_input_tokens_in_flight": 80000,
+        "access_mode": "admin_only",
+        "access_message": "Kimi is temporarily unavailable"
       }
     ]
   }'
 ```
 
-When a model is disabled through `model_access`, `/v1/chat/completions` and
-`/devshard/{id}/v1/chat/completions` return `503` with the configured message.
-Admin endpoints remain available so operators can re-enable the model:
+When a model uses `access_mode: "api_key"`, `/v1/chat/completions` and
+`/devshard/{id}/v1/chat/completions` require either a configured
+`DEVSHARD_API_KEYS` bearer token or the admin bearer token. When a model uses
+`access_mode: "admin_only"`, only the admin bearer token can run inference.
+Set `access_mode: "open"` to allow unauthenticated inference for that model:
 
 ```bash
 curl -X POST http://localhost:8080/v1/admin/settings \
   -H "Authorization: Bearer $DEVSHARD_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model_access":[{"model_id":"moonshotai/Kimi-K2-Instruct","enabled":true}]}'
+  -d '{"model_limits":[{"model_id":"moonshotai/Kimi-K2-Instruct","access_mode":"open"}]}'
 ```
 
-`/v1/status` reports `access_enabled`, `active_devshards`,
-`routable_devshards`, and `routable` per model. Disabled models have
-`current_weight`, `scale_factor`, and current limiter caps set to `0`.
+`/v1/status` is always public and reports `access_mode`, `access_enabled`,
+`active_devshards`, `routable_devshards`, and `routable` per model. Access mode
+does not zero `current_weight`, `scale_factor`, or limiter caps; those values
+continue to reflect effective gateway capacity.
 
 ### POST /v1/admin/escrows
 
@@ -342,7 +342,10 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-The `api_key` is required by the SDK but ignored by the proxy.
+The `api_key` is required by the SDK. It is ignored for models with
+`access_mode: "open"` and must match one of `DEVSHARD_API_KEYS` for models with
+`access_mode: "api_key"`. Models with `access_mode: "admin_only"` require
+`DEVSHARD_ADMIN_API_KEY`.
 
 ## Finalization and settlement
 

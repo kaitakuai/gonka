@@ -250,7 +250,7 @@ func TestGatewayDisabledStateReturnsRedirectPayload(t *testing.T) {
 	require.False(t, forwarded)
 }
 
-func TestGatewayModelAccessDisablesPooledAndDirectChat(t *testing.T) {
+func TestGatewayModelAccessAdminOnlyDeniesPooledAndDirectChat(t *testing.T) {
 	var forwarded bool
 	rt := &devshardRuntime{
 		id:                    "12",
@@ -269,10 +269,10 @@ func TestGatewayModelAccessDisablesPooledAndDirectChat(t *testing.T) {
 	g := NewGateway([]*devshardRuntime{rt, other}, NewGatewayLimiter(10, 1000), "Kimi/Test")
 	g.settings = GatewaySettings{
 		DefaultModel: "Kimi/Test",
-		ModelAccess: []GatewayModelAccessSettings{{
-			ModelID: "Kimi/Test",
-			Enabled: false,
-			Message: "Kimi is temporarily unavailable",
+		ModelLimits: []GatewayModelLimitSettings{{
+			ModelID:       "Kimi/Test",
+			AccessMode:    "admin_only",
+			AccessMessage: "Kimi is temporarily unavailable",
 		}},
 	}.WithTuningDefaults()
 	g.capacity.SetEscrowMembership("12", map[string]int{"host-k": 1})
@@ -285,7 +285,7 @@ func TestGatewayModelAccessDisablesPooledAndDirectChat(t *testing.T) {
 	rec := httptest.NewRecorder()
 	g.handlePooledChat(rec, req)
 
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	require.Contains(t, rec.Body.String(), "Kimi is temporarily unavailable")
 	require.False(t, forwarded)
 
@@ -294,7 +294,7 @@ func TestGatewayModelAccessDisablesPooledAndDirectChat(t *testing.T) {
 	rec = httptest.NewRecorder()
 	g.handleDevshard(rec, req)
 
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	require.Contains(t, rec.Body.String(), "Kimi is temporarily unavailable")
 	require.False(t, forwarded)
 
@@ -308,17 +308,18 @@ func TestGatewayModelAccessDisablesPooledAndDirectChat(t *testing.T) {
 		Capacity gatewayCapacityStatus `json:"capacity"`
 	}
 	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &body))
-	require.InDelta(t, 0.0, body.Capacity.Models["Kimi/Test"].CurrentWeight, 1e-9)
+	require.InDelta(t, 50.0, body.Capacity.Models["Kimi/Test"].CurrentWeight, 1e-9)
 	require.InDelta(t, 50.0, body.Capacity.Models["Kimi/Test"].FullWeight, 1e-9)
-	require.InDelta(t, 0.0, body.Capacity.Models["Kimi/Test"].ScaleFactor, 1e-9)
-	require.False(t, body.Capacity.Models["Kimi/Test"].AccessEnabled)
+	require.InDelta(t, 1.0, body.Capacity.Models["Kimi/Test"].ScaleFactor, 1e-9)
+	require.True(t, body.Capacity.Models["Kimi/Test"].AccessEnabled)
+	require.Equal(t, "admin_only", body.Capacity.Models["Kimi/Test"].AccessMode)
 	require.Equal(t, "Kimi is temporarily unavailable", body.Capacity.Models["Kimi/Test"].AccessMessage)
-	require.False(t, body.Capacity.Models["Kimi/Test"].Routable)
+	require.True(t, body.Capacity.Models["Kimi/Test"].Routable)
 	require.Equal(t, 1, body.Capacity.Models["Kimi/Test"].ActiveDevshards)
-	require.Equal(t, 0, body.Capacity.Models["Kimi/Test"].RoutableDevshards)
+	require.Equal(t, 1, body.Capacity.Models["Kimi/Test"].RoutableDevshards)
 }
 
-func TestGatewayModelAccessAllowsAdminAuthenticatedInference(t *testing.T) {
+func TestGatewayModelAccessAdminOnlyAllowsAdminAuthenticatedInference(t *testing.T) {
 	var forwarded int
 	rt := &devshardRuntime{
 		id:                    "12",
@@ -332,10 +333,10 @@ func TestGatewayModelAccessAllowsAdminAuthenticatedInference(t *testing.T) {
 	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(10, 1000), "Kimi/Test")
 	g.settings = GatewaySettings{
 		DefaultModel: "Kimi/Test",
-		ModelAccess: []GatewayModelAccessSettings{{
-			ModelID: "Kimi/Test",
-			Enabled: false,
-			Message: "Kimi is temporarily unavailable",
+		ModelLimits: []GatewayModelLimitSettings{{
+			ModelID:       "Kimi/Test",
+			AccessMode:    "admin_only",
+			AccessMessage: "Kimi is temporarily unavailable",
 		}},
 	}.WithTuningDefaults()
 	g.capacity.SetEscrowMembership("12", map[string]int{"host-k": 1})
@@ -353,7 +354,7 @@ func TestGatewayModelAccessAllowsAdminAuthenticatedInference(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer user-key")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
 	require.Contains(t, rec.Body.String(), "Kimi is temporarily unavailable")
 	require.Equal(t, 0, forwarded)
 
@@ -372,6 +373,143 @@ func TestGatewayModelAccessAllowsAdminAuthenticatedInference(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNoContent, rec.Code)
 	require.Equal(t, 2, forwarded)
+}
+
+func TestGatewayModelAccessAPIKeyAllowsClientAuthenticatedInference(t *testing.T) {
+	var forwarded int
+	rt := &devshardRuntime{
+		id:                    "12",
+		model:                 "Kimi/Test",
+		participantSlotCounts: map[string]int{"host-k": 1},
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded++
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(10, 1000), "Kimi/Test")
+	g.settings = GatewaySettings{
+		DefaultModel: "Kimi/Test",
+		ModelLimits: []GatewayModelLimitSettings{{
+			ModelID:    "Kimi/Test",
+			AccessMode: "api_key",
+		}},
+	}.WithTuningDefaults()
+
+	handler := buildGatewayHandler(g, runtimeOptions{
+		apiKeys:     map[string]struct{}{"user-key": {}},
+		adminAPIKey: "admin-key",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+	require.Contains(t, rec.Body.String(), "requires an API key")
+	require.Equal(t, 0, forwarded)
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer user-key")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, 1, forwarded)
+}
+
+func TestGatewayAPIKeyLogFieldsUsesLastEightCharacters(t *testing.T) {
+	g := NewGateway(nil, NewGatewayLimiter(0, 0), "Kimi/Test")
+	g.apiKeys = map[string]struct{}{"client-key-12345678": {}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer client-key-12345678")
+	require.Equal(t, []any{"api_key_suffix", "12345678", "api_key_kind", "api"}, g.apiKeyLogFields(req))
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer unknown-key-87654321")
+	require.Equal(t, []any{"api_key_suffix", "87654321", "api_key_kind", "unknown"}, g.apiKeyLogFields(req))
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	handler := adminAuthMiddleware("admin-key-abcdefgh", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		require.Equal(t, []any{"api_key_suffix", "abcdefgh", "api_key_kind", "admin"}, g.apiKeyLogFields(r))
+	}))
+	req.Header.Set("Authorization", "Bearer admin-key-abcdefgh")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+}
+
+func TestGatewayModelAccessDefaultsToAdminOnly(t *testing.T) {
+	var forwarded int
+	rt := &devshardRuntime{
+		id:                    "12",
+		model:                 "Kimi/Test",
+		participantSlotCounts: map[string]int{"host-k": 1},
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded++
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	other := &devshardRuntime{
+		id:                    "13",
+		model:                 "Qwen/Test",
+		participantSlotCounts: map[string]int{"host-q": 1},
+	}
+	g := NewGateway([]*devshardRuntime{rt, other}, NewGatewayLimiter(10, 1000), "Kimi/Test")
+	handler := buildGatewayHandler(g, runtimeOptions{adminAPIKey: "admin-key"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code)
+	require.Contains(t, rec.Body.String(), "requires an admin API key")
+	require.Equal(t, 0, forwarded)
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Authorization", "Bearer admin-key")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, 1, forwarded)
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/v1/status", nil)
+	statusRec := httptest.NewRecorder()
+	g.handlePooledStatus(statusRec, statusReq)
+	require.Equal(t, http.StatusOK, statusRec.Code)
+	var body struct {
+		Capacity gatewayCapacityStatus `json:"capacity"`
+	}
+	require.NoError(t, json.Unmarshal(statusRec.Body.Bytes(), &body))
+	require.Equal(t, "admin_only", body.Capacity.Models["Kimi/Test"].AccessMode)
+}
+
+func TestGatewayModelAccessOpenAllowsUnauthenticatedInference(t *testing.T) {
+	var forwarded int
+	rt := &devshardRuntime{
+		id:                    "12",
+		model:                 "Kimi/Test",
+		participantSlotCounts: map[string]int{"host-k": 1},
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			forwarded++
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(10, 1000), "Kimi/Test")
+	g.settings = GatewaySettings{
+		DefaultModel: "Kimi/Test",
+		ModelLimits: []GatewayModelLimitSettings{{
+			ModelID:    "Kimi/Test",
+			AccessMode: "open",
+		}},
+	}.WithTuningDefaults()
+	handler := buildGatewayHandler(g, runtimeOptions{adminAPIKey: "admin-key"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Kimi/Test","messages":[{"role":"user","content":"hello"}]}`))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, 1, forwarded)
 }
 
 func TestGatewayModelsEndpointListsActiveModels(t *testing.T) {
@@ -905,6 +1043,189 @@ func TestGatewayHandlePooledChatSetsChosenDevshardHeader(t *testing.T) {
 	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
 }
 
+func TestGatewayPooledChatCachesNonStreamingResponseWithFreshRequestID(t *testing.T) {
+	var calls atomic.Int32
+	rt := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if rid, ok := requestLogFromContext(r.Context()); ok {
+				w.Header().Set("X-Request-Id", rid)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-original","choices":[{"message":{"role":"assistant","content":"hello"}}]}`))
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
+	body := `{"model":"Qwen/Test","messages":[{"role":"user","content":"hello"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	firstBody := rec.Body.String()
+	firstRequestID := rec.Header().Get("X-Request-Id")
+	require.NotEmpty(t, firstRequestID)
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, firstBody, rec.Body.String())
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+	require.NotEmpty(t, rec.Header().Get("X-Request-Id"))
+	require.NotEqual(t, firstRequestID, rec.Header().Get("X-Request-Id"))
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestGatewayPooledChatCachesStreamingResponseWithFreshRequestID(t *testing.T) {
+	var calls atomic.Int32
+	rt := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if rid, ok := requestLogFromContext(r.Context()); ok {
+				w.Header().Set("X-Request-Id", rid)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, `data: {"id":"chatcmpl-original","object":"chat.completion.chunk","choices":[{"delta":{"content":"hello"},"finish_reason":null}]}`+"\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
+	body := `{"model":"Qwen/Test","stream":true,"messages":[{"role":"user","content":"hello"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	firstBody := rec.Body.String()
+	firstRequestID := rec.Header().Get("X-Request-Id")
+	require.NotEmpty(t, firstRequestID)
+	require.Contains(t, rec.Header().Get("Content-Type"), "text/event-stream")
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, firstBody, rec.Body.String())
+	require.Contains(t, rec.Header().Get("Content-Type"), "text/event-stream")
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+	require.NotEmpty(t, rec.Header().Get("X-Request-Id"))
+	require.NotEqual(t, firstRequestID, rec.Header().Get("X-Request-Id"))
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestGatewayPooledChatCachesErrorResponseWithFreshRequestID(t *testing.T) {
+	var calls atomic.Int32
+	rt := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if rid, ok := requestLogFromContext(r.Context()); ok {
+				w.Header().Set("X-Request-Id", rid)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"upstream failed"}}`))
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
+	body := `{"model":"Qwen/Test","messages":[{"role":"user","content":"hello"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	firstBody := rec.Body.String()
+	firstRequestID := rec.Header().Get("X-Request-Id")
+	require.NotEmpty(t, firstRequestID)
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	g.handlePooledChat(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Equal(t, firstBody, rec.Body.String())
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+	require.NotEmpty(t, rec.Header().Get("X-Request-Id"))
+	require.NotEqual(t, firstRequestID, rec.Header().Get("X-Request-Id"))
+	require.EqualValues(t, 1, calls.Load())
+}
+
+func TestGatewayChatCacheSharedAcrossDifferentEscrowRoutes(t *testing.T) {
+	var calls12 atomic.Int32
+	var calls44 atomic.Int32
+	rt12 := &devshardRuntime{
+		id:    "12",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls12.Add(1)
+			if rid, ok := requestLogFromContext(r.Context()); ok {
+				w.Header().Set("X-Request-Id", rid)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-12","choices":[{"message":{"role":"assistant","content":"from escrow 12"}}]}`))
+		}),
+	}
+	rt44 := &devshardRuntime{
+		id:    "44",
+		model: "Qwen/Test",
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls44.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-44","choices":[{"message":{"role":"assistant","content":"from escrow 44"}}]}`))
+		}),
+	}
+	g := NewGateway([]*devshardRuntime{rt12, rt44}, NewGatewayLimiter(0, 0), "Qwen/Test")
+	g.settings.ModelLimits = []GatewayModelLimitSettings{{ModelID: "Qwen/Test", AccessMode: string(gatewayAccessModeOpen)}}
+	body := `{"model":"Qwen/Test","messages":[{"role":"user","content":"hello"}]}`
+
+	req := httptest.NewRequest(http.MethodPost, "/devshard/12/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	g.handleDevshard(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	firstBody := rec.Body.String()
+	firstRequestID := rec.Header().Get("X-Request-Id")
+	require.NotEmpty(t, firstRequestID)
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+
+	req = httptest.NewRequest(http.MethodPost, "/devshard/44/v1/chat/completions", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	g.handleDevshard(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, firstBody, rec.Body.String())
+	require.Equal(t, "12", rec.Header().Get("X-Devshard-ID"))
+	require.NotEmpty(t, rec.Header().Get("X-Request-Id"))
+	require.NotEqual(t, firstRequestID, rec.Header().Get("X-Request-Id"))
+	require.EqualValues(t, 1, calls12.Load())
+	require.EqualValues(t, 0, calls44.Load())
+}
+
 func TestGatewayHandlePooledChatRejectsUnsupportedModel(t *testing.T) {
 	var forwarded bool
 	rt := &devshardRuntime{
@@ -1427,6 +1748,35 @@ func TestParticipantRequestLimiterTransportFailureOnVerifyTimeoutDoesNotQuaranti
 	require.True(t, limiter.IsBlocked("infer-host"), "inference transport failure must quarantine")
 }
 
+func TestParticipantRequestLimiterEOFTransportFailureQuarantinesAfterThreeConsecutive(t *testing.T) {
+	limiter := NewParticipantRequestLimiter(10, 10)
+	now := time.Now()
+
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	require.False(t, limiter.IsBlocked("eof-host"))
+
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	require.False(t, limiter.IsBlocked("eof-host"))
+
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	require.True(t, limiter.IsBlocked("eof-host"))
+	require.True(t, limiter.allow("eof-host", now.Add(transportFailureQuarantine+time.Second)))
+}
+
+func TestParticipantRequestLimiterSuccessfulInferenceResetsEOFTransportFailureStreak(t *testing.T) {
+	limiter := NewParticipantRequestLimiter(10, 10)
+
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	limiter.ObserveSuccessfulInference("eof-host")
+
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	require.False(t, limiter.IsBlocked("eof-host"))
+	limiter.ObserveTransportFailure("eof-host", "/sessions/1/chat/completions", fmt.Errorf("read stream: EOF"))
+	require.True(t, limiter.IsBlocked("eof-host"))
+}
+
 func TestParticipantRequestLimiterInferenceRouteFailureUsesShortQuarantine(t *testing.T) {
 	limiter := NewParticipantRequestLimiter(10, 10)
 	t0 := time.Now()
@@ -1633,7 +1983,7 @@ func TestParticipantRequestLimiterLoadStateDeletesFullyRecovered(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { store.Close() })
 
-	require.NoError(t, store.SaveParticipantThrottle("shared-host", 0, time.Now().Add(-time.Hour), 503, time.Time{}, 0))
+	require.NoError(t, store.SaveParticipantThrottle("shared-host", 0, time.Now().Add(-time.Hour), 503, time.Time{}, 0, 0))
 
 	limiter := NewParticipantRequestLimiter(10, 10)
 	limiter.SetStore(store)
@@ -1780,7 +2130,7 @@ func TestAdminSettingsUpdatesLimiterAndDefaultTokens(t *testing.T) {
 	}, t.TempDir(), store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/settings",
-		strings.NewReader(`{"chain_rest":"http://node:2317","public_api":"http://api:9900","default_model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","max_concurrent_requests":7,"max_input_tokens_in_flight":700,"default_request_max_tokens":3072,"request_max_tokens_cap":4096,"tx_gas_limit":700000,"model_access":[{"model_id":"moonshotai/Kimi-K2.6","enabled":false,"message":"Kimi temporarily unavailable"}],"disabled":{"enabled":true,"message":"please use ... base url","new_url":"https://.../v1/chat/completions"},"participant_throttle":{"request_burst":42,"recovery_per_minute":7,"http_quarantine_ms":1100,"transport_failure_quarantine_ms":1200,"empty_stream_quarantine_ms":1300,"stalled_winner_quarantine_ms":1400,"empty_stream_threshold":2},"redundancy":{"receipt_timeout_ms":1500,"first_token_timeout_floor_ms":1600,"per_input_token_first_token_lag_ms":17,"inter_chunk_stall_timeout_ms":1800,"non_stream_response_floor_ms":1900,"per_input_token_response_lag_ms":20,"secondary_wait_after_winner_ms":2100,"parallel_advantage_threshold":0.4,"unresponsive_threshold":0.8}}`))
+		strings.NewReader(`{"chain_rest":"http://node:2317","public_api":"http://api:9900","default_model":"Qwen/Qwen3-235B-A22B-Instruct-2507-FP8","max_concurrent_requests":7,"max_input_tokens_in_flight":700,"default_request_max_tokens":3072,"request_max_tokens_cap":4096,"tx_gas_limit":700000,"model_limits":[{"model_id":"moonshotai/Kimi-K2.6","access_mode":"admin_only","access_message":"Kimi temporarily unavailable"}],"disabled":{"enabled":true,"message":"please use ... base url","new_url":"https://.../v1/chat/completions"},"participant_throttle":{"request_burst":42,"recovery_per_minute":7,"http_quarantine_ms":1100,"transport_failure_quarantine_ms":1200,"empty_stream_quarantine_ms":1300,"stalled_winner_quarantine_ms":1400,"empty_stream_threshold":2},"redundancy":{"receipt_timeout_ms":1500,"first_token_timeout_floor_ms":1600,"per_input_token_first_token_lag_ms":17,"inter_chunk_stall_timeout_ms":1800,"non_stream_response_floor_ms":1900,"per_input_token_response_lag_ms":20,"secondary_wait_after_winner_ms":2100,"parallel_advantage_threshold":0.4,"unresponsive_threshold":0.8}}`))
 	rec := httptest.NewRecorder()
 	g.handleAdminSettings(rec, req)
 
@@ -1803,11 +2153,11 @@ func TestAdminSettingsUpdatesLimiterAndDefaultTokens(t *testing.T) {
 	require.EqualValues(t, 7, state.Settings.MaxConcurrentRequests)
 	require.EqualValues(t, 700, state.Settings.MaxInputTokensInFlight)
 	require.EqualValues(t, 700000, state.Settings.TxGasLimit)
-	require.Equal(t, []GatewayModelAccessSettings{{
-		ModelID: "moonshotai/Kimi-K2.6",
-		Enabled: false,
-		Message: "Kimi temporarily unavailable",
-	}}, state.Settings.ModelAccess)
+	require.Equal(t, []GatewayModelLimitSettings{{
+		ModelID:       "moonshotai/Kimi-K2.6",
+		AccessMode:    "admin_only",
+		AccessMessage: "Kimi temporarily unavailable",
+	}}, state.Settings.ModelLimits)
 	require.True(t, state.Settings.Disabled.Enabled)
 	require.Equal(t, "please use ... base url", state.Settings.Disabled.Message)
 	require.Equal(t, "https://.../v1/chat/completions", state.Settings.Disabled.NewURL)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 )
@@ -63,6 +64,16 @@ type LimiterModelSnapshot struct {
 	CapacityCapInputTokens        int64   `json:"capacity_cap_input_tokens"`
 	CurrentCapacityCapInputTokens int64   `json:"current_capacity_cap_input_tokens"`
 	ScaleFactor                   float64 `json:"scale_factor"`
+	CurrentWeight                 float64 `json:"current_weight,omitempty"`
+	BaselineWeight                float64 `json:"baseline_weight,omitempty"`
+	MaxConcurrentPer10000Weight   float64 `json:"max_concurrent_requests_per_10000_weight,omitempty"`
+}
+
+type LimiterModelCapacity struct {
+	ScaleFactor                 float64
+	CurrentWeight               float64
+	BaselineWeight              float64
+	MaxConcurrentPer10000Weight float64
 }
 
 func NewGatewayLimiter(maxConcurrent, maxInputTokens int64) *GatewayLimiter {
@@ -92,6 +103,14 @@ func (l *GatewayLimiter) Snapshot() LimiterSnapshot {
 }
 
 func (l *GatewayLimiter) SnapshotWithModelScales(scales map[string]float64) LimiterSnapshot {
+	capacities := make(map[string]LimiterModelCapacity, len(scales))
+	for model, scale := range scales {
+		capacities[model] = LimiterModelCapacity{ScaleFactor: scale}
+	}
+	return l.SnapshotWithModelCapacities(capacities)
+}
+
+func (l *GatewayLimiter) SnapshotWithModelCapacities(capacities map[string]LimiterModelCapacity) LimiterSnapshot {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	snap := LimiterSnapshot{
@@ -103,31 +122,34 @@ func (l *GatewayLimiter) SnapshotWithModelScales(scales map[string]float64) Limi
 		EffectiveMaxInputTokens: l.effectiveMaxInputTokens,
 		ScaleFactor:             l.currentScale,
 	}
-	if len(scales) == 0 {
+	if len(capacities) == 0 {
 		return snap
 	}
-	snap.Models = make(map[string]LimiterModelSnapshot, len(scales))
-	for model, scale := range scales {
+	snap.Models = make(map[string]LimiterModelSnapshot, len(capacities))
+	for model, capacity := range capacities {
 		model = strings.TrimSpace(model)
 		if model == "" {
 			continue
 		}
 		counter := l.models[model]
 		limits := l.limitsForModelLocked(model)
-		effectiveMaxConcurrent := scaleClampLimit(limits.maxConcurrent, scale)
-		effectiveMaxInputTokens := scaleClampLimit(limits.maxInputTokens, scale)
+		effectiveMaxConcurrent, capacityCapRequests := l.concurrentLimitsForCapacityLocked(model, limits, capacity)
+		effectiveMaxInputTokens := scaleClampLimit(limits.maxInputTokens, capacity.ScaleFactor)
 		snap.Models[model] = LimiterModelSnapshot{
 			InFlightRequests:              counter.inFlightRequests,
 			InFlightInputTokens:           counter.inFlightInputToks,
-			MaxConcurrent:                 limits.maxConcurrent,
+			MaxConcurrent:                 capacityCapRequests,
 			MaxInputTokens:                limits.maxInputTokens,
 			EffectiveMaxConcurrent:        effectiveMaxConcurrent,
 			EffectiveMaxInputTokens:       effectiveMaxInputTokens,
-			CapacityCapRequests:           limits.maxConcurrent,
+			CapacityCapRequests:           capacityCapRequests,
 			CurrentCapacityCapRequests:    effectiveMaxConcurrent,
 			CapacityCapInputTokens:        limits.maxInputTokens,
 			CurrentCapacityCapInputTokens: effectiveMaxInputTokens,
-			ScaleFactor:                   scale,
+			ScaleFactor:                   capacity.ScaleFactor,
+			CurrentWeight:                 capacity.CurrentWeight,
+			BaselineWeight:                capacity.BaselineWeight,
+			MaxConcurrentPer10000Weight:   capacity.MaxConcurrentPer10000Weight,
 		}
 	}
 	return snap
@@ -225,7 +247,7 @@ func (l *GatewayLimiter) Acquire(inputTokens int64) error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.acquireLocked("", inputTokens, l.currentScale)
+	return l.acquireLocked("", inputTokens, LimiterModelCapacity{ScaleFactor: l.currentScale})
 }
 
 // AcquireForModel uses an independent in-flight counter for model while
@@ -233,24 +255,29 @@ func (l *GatewayLimiter) Acquire(inputTokens int64) error {
 // The supplied scale is usually W_current(model) / W_ref(model), so each
 // model gets its own scaled request/token budget.
 func (l *GatewayLimiter) AcquireForModel(model string, inputTokens int64, scale float64) error {
+	return l.AcquireForModelWithCapacity(model, inputTokens, LimiterModelCapacity{ScaleFactor: scale})
+}
+
+func (l *GatewayLimiter) AcquireForModelWithCapacity(model string, inputTokens int64, capacity LimiterModelCapacity) error {
 	if inputTokens <= 0 {
 		inputTokens = 1
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.acquireLocked(model, inputTokens, scale)
+	return l.acquireLocked(model, inputTokens, capacity)
 }
 
-func (l *GatewayLimiter) acquireLocked(model string, inputTokens int64, scale float64) error {
+func (l *GatewayLimiter) acquireLocked(model string, inputTokens int64, capacity LimiterModelCapacity) error {
 	model = strings.TrimSpace(model)
 	if l.models == nil {
 		l.models = map[string]limiterModelCounter{}
 	}
 	counter := l.models[model]
 	limits := l.limitsForModelLocked(model)
-	effectiveMaxConcurrent := scaleClampLimit(limits.maxConcurrent, scale)
-	effectiveMaxInputTokens := scaleClampLimit(limits.maxInputTokens, scale)
-	if limits.maxConcurrent > 0 && counter.inFlightRequests+1 > effectiveMaxConcurrent {
+	effectiveMaxConcurrent, _ := l.concurrentLimitsForCapacityLocked(model, limits, capacity)
+	effectiveMaxInputTokens := scaleClampLimit(limits.maxInputTokens, capacity.ScaleFactor)
+	concurrentLimited := limits.maxConcurrent > 0 || dynamicConcurrencyEnabled(capacity)
+	if concurrentLimited && counter.inFlightRequests+1 > effectiveMaxConcurrent {
 		return fmt.Errorf("rate limit exceeded: too many concurrent requests")
 	}
 	if limits.maxInputTokens > 0 && counter.inFlightInputToks+inputTokens > effectiveMaxInputTokens {
@@ -263,6 +290,35 @@ func (l *GatewayLimiter) acquireLocked(model string, inputTokens int64, scale fl
 	l.inFlightRequests++
 	l.inFlightInputToks += inputTokens
 	return nil
+}
+
+func (l *GatewayLimiter) concurrentLimitsForCapacityLocked(model string, limits limiterModelLimits, capacity LimiterModelCapacity) (effective, baseline int64) {
+	if dynamicConcurrencyEnabled(capacity) {
+		baseline = weightConcurrencyLimit(capacity.BaselineWeight, capacity.MaxConcurrentPer10000Weight)
+		effective = weightConcurrencyLimit(capacity.CurrentWeight, capacity.MaxConcurrentPer10000Weight)
+		if effective > baseline {
+			effective = baseline
+		}
+		return effective, baseline
+	}
+	baseline = limits.maxConcurrent
+	effective = scaleClampLimit(limits.maxConcurrent, capacity.ScaleFactor)
+	return effective, baseline
+}
+
+func dynamicConcurrencyEnabled(capacity LimiterModelCapacity) bool {
+	return capacity.MaxConcurrentPer10000Weight > 0 && capacity.BaselineWeight > 0
+}
+
+func weightConcurrencyLimit(weight, per10000 float64) int64 {
+	if weight <= 0 || per10000 <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) || math.IsNaN(per10000) || math.IsInf(per10000, 0) {
+		return 0
+	}
+	limit := math.Floor(weight * per10000 / 10000)
+	if limit > float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(limit)
 }
 
 func (l *GatewayLimiter) limitsForModelLocked(model string) limiterModelLimits {

@@ -49,6 +49,8 @@ type Gateway struct {
 	store                 *GatewayStore
 	perf                  *PerfTracker
 	perfStore             *PerfStore
+	chatCache             *chatResponseCache
+	apiKeys               map[string]struct{}
 	baseStorageDir        string
 	rotatorStop           chan struct{}
 	rotatorDone           chan struct{}
@@ -133,6 +135,7 @@ type gatewayModelCapacityStatus struct {
 	RoutableDevshards int     `json:"routable_devshards"`
 	Routable          bool    `json:"routable"`
 	AccessEnabled     bool    `json:"access_enabled"`
+	AccessMode        string  `json:"access_mode"`
 	AccessMessage     string  `json:"access_message,omitempty"`
 }
 
@@ -171,6 +174,22 @@ func (e *ModelTemporarilyUnavailableError) Error() string {
 		return fmt.Sprintf("model %q is temporarily unavailable", model)
 	}
 	return "model is temporarily unavailable"
+}
+
+type ModelAccessDeniedError struct {
+	Model      string
+	Message    string
+	StatusCode int
+}
+
+func (e *ModelAccessDeniedError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if msg := strings.TrimSpace(e.Message); msg != "" {
+		return msg
+	}
+	return "model access denied"
 }
 
 func newRuntimeMux(proxy *Proxy) http.Handler {
@@ -430,6 +449,7 @@ func NewGateway(runtimes []*devshardRuntime, limiter *GatewayLimiter, defaultMod
 		participantLimiter: sharedParticipantRequestLimiter,
 		metrics:            NewDevshardMetrics(),
 		capacity:           NewCapacityState(),
+		chatCache:          newChatResponseCache(chatResponseCacheTTL),
 		settings: GatewaySettings{
 			DefaultModel: defaultModel,
 		},
@@ -615,45 +635,114 @@ func (g *Gateway) refreshCapacityScale() {
 	g.limiter.ApplyScaleFactor(g.capacity.ScaleFactorAcrossModels())
 }
 
-func (g *Gateway) modelAccess(model string) (GatewayModelAccessSettings, bool) {
+func (g *Gateway) modelLimitSettings(model string) (GatewayModelLimitSettings, bool) {
 	model = strings.TrimSpace(model)
 	if g == nil || model == "" {
-		return GatewayModelAccessSettings{}, false
+		return GatewayModelLimitSettings{}, false
 	}
 	g.mu.Lock()
-	settings := append([]GatewayModelAccessSettings(nil), g.settings.ModelAccess...)
+	settings := append([]GatewayModelLimitSettings(nil), g.settings.ModelLimits...)
 	g.mu.Unlock()
 	for _, entry := range settings {
 		if strings.TrimSpace(entry.ModelID) == model {
 			entry.ModelID = model
-			entry.Message = strings.TrimSpace(entry.Message)
+			entry.AccessMode = normalizeGatewayAccessMode(entry.AccessMode)
+			entry.AccessMessage = strings.TrimSpace(entry.AccessMessage)
 			return entry, true
 		}
 	}
-	return GatewayModelAccessSettings{}, false
+	return GatewayModelLimitSettings{}, false
 }
 
 func (g *Gateway) modelAccessError(r *http.Request, model string) error {
 	if requestHasAdminAuth(r) {
 		return nil
 	}
-	entry, ok := g.modelAccess(model)
-	if !ok || entry.Enabled {
+	entry, ok := g.modelLimitSettings(model)
+	if !ok {
+		message := fmt.Sprintf("model %q requires an admin API key", model)
+		return &ModelAccessDeniedError{Model: model, Message: message, StatusCode: http.StatusUnauthorized}
+	}
+	switch gatewayModelAccessModeLabel(entry.AccessMode) {
+	case string(gatewayAccessModeOpen):
+		return nil
+	case string(gatewayAccessModeAPIKey):
+		if g.requestHasAPIKey(r) {
+			return nil
+		}
+		message := entry.AccessMessage
+		if message == "" {
+			message = fmt.Sprintf("model %q requires an API key", model)
+		}
+		return &ModelAccessDeniedError{Model: model, Message: message, StatusCode: http.StatusUnauthorized}
+	case string(gatewayAccessModeAdminOnly):
+		message := entry.AccessMessage
+		if message == "" {
+			message = fmt.Sprintf("model %q requires an admin API key", model)
+		}
+		return &ModelAccessDeniedError{Model: model, Message: message, StatusCode: http.StatusUnauthorized}
+	default:
 		return nil
 	}
-	message := entry.Message
-	if strings.TrimSpace(message) == "" {
-		message = fmt.Sprintf("model %q is temporarily unavailable", model)
-	}
-	return &ModelTemporarilyUnavailableError{Model: model, Message: message}
 }
 
-func (g *Gateway) modelAccessStatus(model string) (bool, string) {
-	entry, ok := g.modelAccess(model)
+func (g *Gateway) modelAccessStatus(model string) (bool, string, string) {
+	entry, ok := g.modelLimitSettings(model)
 	if !ok {
-		return true, ""
+		return true, string(gatewayAccessModeAdminOnly), ""
 	}
-	return entry.Enabled, strings.TrimSpace(entry.Message)
+	return true, gatewayModelAccessModeLabel(entry.AccessMode), strings.TrimSpace(entry.AccessMessage)
+}
+
+func (g *Gateway) requestHasAPIKey(r *http.Request) bool {
+	if g == nil || r == nil {
+		return false
+	}
+	key, ok := bearerToken(r)
+	if !ok {
+		return false
+	}
+	g.mu.Lock()
+	_, ok = g.apiKeys[key]
+	g.mu.Unlock()
+	return ok
+}
+
+func bearerToken(r *http.Request) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", false
+	}
+	key := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	return key, key != ""
+}
+
+func apiKeySuffix(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) <= 8 {
+		return key
+	}
+	return key[len(key)-8:]
+}
+
+func (g *Gateway) apiKeyLogFields(r *http.Request) []any {
+	if suffix, ok := requestAdminAPIKeySuffix(r); ok {
+		return []any{"api_key_suffix", suffix, "api_key_kind", "admin"}
+	}
+	key, ok := bearerToken(r)
+	if !ok {
+		return nil
+	}
+	kind := "unknown"
+	g.mu.Lock()
+	if _, valid := g.apiKeys[key]; valid {
+		kind = "api"
+	}
+	g.mu.Unlock()
+	return []any{"api_key_suffix", apiKeySuffix(key), "api_key_kind", kind}
 }
 
 func (g *Gateway) statusModels(runtimes []*devshardRuntime) []string {
@@ -698,7 +787,7 @@ func (g *Gateway) gatewayModelRuntimeStatuses(runtimes []*devshardRuntime) map[s
 		if rt.active.Load() {
 			status.active++
 		}
-		if ok, _ := rt.acceptsNewInferences(); ok && g.modelAccessError(nil, model) == nil {
+		if ok, _ := rt.acceptsNewInferences(); ok {
 			status.routable++
 		}
 		statuses[model] = status
@@ -723,6 +812,71 @@ func (g *Gateway) limiterModelScales(models []string, runtimeStatuses map[string
 		scales[model] = g.capacity.ScaleFactorForModel(model)
 	}
 	return scales
+}
+
+func (g *Gateway) limiterModelCapacities(models []string, runtimeStatuses map[string]gatewayModelRuntimeStatus) map[string]LimiterModelCapacity {
+	if g == nil || g.capacity == nil || len(models) == 0 {
+		return nil
+	}
+	capacities := make(map[string]LimiterModelCapacity, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		capacity := g.limiterCapacityForModel(model)
+		if runtimeStatuses[model].routable == 0 {
+			capacity.ScaleFactor = 0
+			capacity.CurrentWeight = 0
+		}
+		capacities[model] = capacity
+	}
+	return capacities
+}
+
+func (g *Gateway) limiterCapacityForModel(model string) LimiterModelCapacity {
+	if g == nil || g.capacity == nil {
+		return LimiterModelCapacity{ScaleFactor: 1}
+	}
+	snapshot := g.capacity.Snapshot()
+	perWeight := g.currentMaxConcurrentPer10000Weight()
+	if snapshot.ObservedCurrentWeightKey == 0 && snapshot.ObservedFullWeightKey == 0 {
+		perWeight = 0
+	}
+	return LimiterModelCapacity{
+		ScaleFactor:                 g.capacity.ScaleFactorForModel(model),
+		CurrentWeight:               g.capacity.TotalWeightForModel(model),
+		BaselineWeight:              g.capacity.BaselineWeightForModel(model),
+		MaxConcurrentPer10000Weight: perWeight,
+	}
+}
+
+func (g *Gateway) currentMaxConcurrentPer10000Weight() float64 {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	settings := g.settings.WithTuningDefaults()
+	g.mu.Unlock()
+	if g.pocOrConfirmationPoCActive() {
+		return settings.PoCMaxConcurrentPer10000Weight
+	}
+	return settings.MaxConcurrentPer10000Weight
+}
+
+func (g *Gateway) pocOrConfirmationPoCActive() bool {
+	if g != nil && g.phaseGate != nil {
+		switch g.phaseGate.Snapshot().BlockReason {
+		case "poc", "confirmation_poc":
+			return true
+		}
+	}
+	switch currentPoCPhaseReason() {
+	case "poc", "confirmation_poc":
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *Gateway) capacityStatus(models []string, runtimeStatuses map[string]gatewayModelRuntimeStatus) gatewayCapacityStatus {
@@ -767,8 +921,8 @@ func (g *Gateway) capacityStatus(models []string, runtimeStatuses map[string]gat
 			total := g.capacity.TotalWeightForModel(model)
 			baseline := g.capacity.BaselineWeightForModel(model)
 			runtimeStatus := runtimeStatuses[model]
-			accessEnabled, accessMessage := g.modelAccessStatus(model)
-			if !accessEnabled || runtimeStatus.routable == 0 {
+			accessEnabled, accessMode, accessMessage := g.modelAccessStatus(model)
+			if runtimeStatus.routable == 0 {
 				total = 0
 			}
 			modelLost := baseline - total
@@ -776,7 +930,7 @@ func (g *Gateway) capacityStatus(models []string, runtimeStatuses map[string]gat
 				modelLost = 0
 			}
 			scale := g.capacity.ScaleFactorForModel(model)
-			if !accessEnabled || runtimeStatus.routable == 0 {
+			if runtimeStatus.routable == 0 {
 				scale = 0
 			}
 			modelAvailablePercent := scale * 100
@@ -798,6 +952,7 @@ func (g *Gateway) capacityStatus(models []string, runtimeStatuses map[string]gat
 				RoutableDevshards: runtimeStatus.routable,
 				Routable:          runtimeStatus.routable > 0,
 				AccessEnabled:     accessEnabled,
+				AccessMode:        accessMode,
 				AccessMessage:     accessMessage,
 			}
 		}
@@ -881,7 +1036,7 @@ func (g *Gateway) handlePooledStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"mode":      "gateway",
 		"devshards": statuses,
-		"limiter":   g.limiter.SnapshotWithModelScales(g.limiterModelScales(models, modelRuntimeStatuses)),
+		"limiter":   g.limiter.SnapshotWithModelCapacities(g.limiterModelCapacities(models, modelRuntimeStatuses)),
 		"capacity":  g.capacityStatus(models, modelRuntimeStatuses),
 		"runtimes":  len(runtimes),
 	})
@@ -912,7 +1067,9 @@ func (g *Gateway) handlePooledChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), chatRequestErrorStatus(err, http.StatusBadRequest))
 		return
 	}
-	logRequestStage(ctx, "gateway_request_received", "model", firstNonEmpty(model, g.settings.DefaultModel), "input_tokens", inputTokens)
+	fields := []any{"model", firstNonEmpty(model, g.settings.DefaultModel), "input_tokens", inputTokens}
+	fields = append(fields, g.apiKeyLogFields(r)...)
+	logRequestStage(ctx, "gateway_request_received", fields...)
 	requestModel := firstNonEmpty(model, g.settings.DefaultModel)
 	if err := g.modelAccessError(r, requestModel); err != nil {
 		logRequestStage(ctx, "gateway_model_temporarily_unavailable", "model", requestModel, "error", err)
@@ -920,10 +1077,19 @@ func (g *Gateway) handlePooledChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cacheKey := chatCacheKey(requestModel, body)
+	stream := chatRequestStream(body)
+	if entry, ok := g.chatCache.Get(cacheKey, time.Now()); ok {
+		logRequestStage(ctx, "gateway_cache_hit", "escrow", entry.EscrowID, "model", requestModel, "stream", stream)
+		serveCachedChatResponse(w, r, entry)
+		return
+	}
+	logRequestStage(ctx, "gateway_cache_miss", "model", requestModel, "stream", stream)
+
 	if capacityAwareLimitsEnabled() || !relaxedPoCBypassActive() {
 		g.refreshCapacityScale()
 		limitModel := requestModel
-		if err := g.limiter.AcquireForModel(limitModel, inputTokens, g.capacity.ScaleFactorForModel(limitModel)); err != nil {
+		if err := g.limiter.AcquireForModelWithCapacity(limitModel, inputTokens, g.limiterCapacityForModel(limitModel)); err != nil {
 			g.metrics.RecordLimitRejection(limiterReasonLabel(err))
 			logRequestStage(ctx, "gateway_limiter_rejected", "reason", limiterReasonLabel(err), "input_tokens", inputTokens)
 			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusTooManyRequests)
@@ -947,7 +1113,12 @@ func (g *Gateway) handlePooledChat(w http.ResponseWriter, r *http.Request) {
 	defer g.releaseRuntime(rt, inputTokens)
 	logRequestStage(ctx, "gateway_runtime_selected", "escrow", rt.id)
 
-	g.serveChatToRuntime(rt, "/v1/chat/completions", body, w, r)
+	if capture := g.serveChatToRuntime(rt, "/v1/chat/completions", body, w, r); capture != nil {
+		if entry, ok := capture.cacheEntry(rt.id, stream); ok {
+			g.chatCache.Set(cacheKey, entry, time.Now())
+			logRequestStage(ctx, "gateway_cache_stored", "escrow", rt.id, "model", requestModel, "stream", stream, "bytes", len(entry.Body))
+		}
+	}
 }
 
 func (g *Gateway) handleDevshard(w http.ResponseWriter, r *http.Request) {
@@ -959,7 +1130,9 @@ func (g *Gateway) handleDevshard(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	logRequestStage(ctx, "gateway_devshard_request_received", "escrow", devshardID, "path", innerPath)
+	fields := []any{"escrow", devshardID, "path", innerPath}
+	fields = append(fields, g.apiKeyLogFields(r)...)
+	logRequestStage(ctx, "gateway_devshard_request_received", fields...)
 
 	g.mu.Lock()
 	rt, ok := g.runtimes[devshardID]
@@ -993,9 +1166,17 @@ func (g *Gateway) handleDevshard(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), gatewayStatusCodeForError(err))
 			return
 		}
+		cacheKey := chatCacheKey(limitModel, body)
+		stream := chatRequestStream(body)
+		if entry, ok := g.chatCache.Get(cacheKey, time.Now()); ok {
+			logRequestStage(ctx, "gateway_devshard_cache_hit", "escrow", entry.EscrowID, "model", limitModel, "stream", stream)
+			serveCachedChatResponse(w, r, entry)
+			return
+		}
+		logRequestStage(ctx, "gateway_devshard_cache_miss", "escrow", devshardID, "model", limitModel, "stream", stream)
 		if capacityAwareLimitsEnabled() || !relaxedPoCBypassActive() {
 			g.refreshCapacityScale()
-			if err := g.limiter.AcquireForModel(limitModel, inputTokens, g.capacity.ScaleFactorForModel(limitModel)); err != nil {
+			if err := g.limiter.AcquireForModelWithCapacity(limitModel, inputTokens, g.limiterCapacityForModel(limitModel)); err != nil {
 				g.metrics.RecordLimitRejection(limiterReasonLabel(err))
 				logRequestStage(ctx, "gateway_devshard_limiter_rejected", "escrow", devshardID, "reason", limiterReasonLabel(err), "input_tokens", inputTokens)
 				http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusTooManyRequests)
@@ -1011,7 +1192,12 @@ func (g *Gateway) handleDevshard(w http.ResponseWriter, r *http.Request) {
 		defer g.releaseRuntime(rt, inputTokens)
 		logRequestStage(ctx, "gateway_devshard_runtime_selected", "escrow", devshardID, "input_tokens", inputTokens)
 
-		g.serveChatToRuntime(rt, innerPath, body, w, r)
+		if capture := g.serveChatToRuntime(rt, innerPath, body, w, r); capture != nil {
+			if entry, ok := capture.cacheEntry(rt.id, stream); ok {
+				g.chatCache.Set(cacheKey, entry, time.Now())
+				logRequestStage(ctx, "gateway_devshard_cache_stored", "escrow", rt.id, "model", limitModel, "stream", stream, "bytes", len(entry.Body))
+			}
+		}
 		return
 	}
 	if innerPath == "/v1/finalize" && r.Method == http.MethodPost {
@@ -1074,14 +1260,16 @@ func (g *Gateway) markDevshardInactiveAfterFinalize(id string, rt *devshardRunti
 	}
 }
 
-func (g *Gateway) serveChatToRuntime(rt *devshardRuntime, path string, body []byte, w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) serveChatToRuntime(rt *devshardRuntime, path string, body []byte, w http.ResponseWriter, r *http.Request) *gatewayChatCacheCapture {
 	req := cloneRequestWithBody(r, body)
 	req.URL.Path = path
 	req.URL.RawPath = path
 	req.RequestURI = path
 	w.Header().Set("X-Devshard-ID", rt.id)
 	logRequestStage(req.Context(), "gateway_request_forwarded", "escrow", rt.id, "path", path)
-	rt.handler.ServeHTTP(w, req)
+	capture := &gatewayChatCacheCapture{ResponseWriter: w}
+	rt.handler.ServeHTTP(capture, req)
+	return capture
 }
 
 func (g *Gateway) reserveRuntimeForModel(requestModel string, inputTokens int64) (*devshardRuntime, error) {
@@ -1403,6 +1591,13 @@ func gatewayStatusCodeForError(err error) int {
 	if errors.As(err, &unavailableModelErr) {
 		return http.StatusServiceUnavailable
 	}
+	var accessDeniedErr *ModelAccessDeniedError
+	if errors.As(err, &accessDeniedErr) {
+		if accessDeniedErr.StatusCode != 0 {
+			return accessDeniedErr.StatusCode
+		}
+		return http.StatusUnauthorized
+	}
 	if isParticipantRateLimitError(err) {
 		return http.StatusTooManyRequests
 	}
@@ -1468,15 +1663,19 @@ func (g *Gateway) parseChatReservation(r *http.Request, defaultModel string) ([]
 	if err != nil {
 		return nil, "", 0, err
 	}
+	originalBody := append([]byte(nil), body...)
 	body, err = normalizeContent(body)
 	if err != nil {
+		captureFilterRejectedRequest(r, originalBody, err, "", "")
 		return nil, "", 0, err
 	}
+	logResponseFormatDiagnostics(r.Context(), body)
 	model := chatRequestModel(body)
 	routedModel := firstNonEmpty(model, defaultModel)
 	limits := g.outputTokenLimitsForModel(routedModel)
 	updatedBody, req, err := normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits, routedModel)
 	if err != nil {
+		captureFilterRejectedRequest(r, originalBody, err, model, "")
 		return nil, "", 0, err
 	}
 
@@ -1568,21 +1767,22 @@ type adminSettleEscrowRequest struct {
 }
 
 type adminSettingsRequest struct {
-	ChainREST               *string                          `json:"chain_rest,omitempty"`
-	PublicAPI               *string                          `json:"public_api,omitempty"`
-	DefaultModel            *string                          `json:"default_model,omitempty"`
-	MaxConcurrentRequests   *int64                           `json:"max_concurrent_requests,omitempty"`
-	MaxInputTokensInFlight  *int64                           `json:"max_input_tokens_in_flight,omitempty"`
-	ModelLimits             *[]GatewayModelLimitSettings     `json:"model_limits,omitempty"`
-	ModelAccess             *[]GatewayModelAccessSettings    `json:"model_access,omitempty"`
-	DefaultRequestMaxTokens *uint64                          `json:"default_request_max_tokens,omitempty"`
-	RequestMaxTokensCap     *uint64                          `json:"request_max_tokens_cap,omitempty"`
-	TxGasLimit              *uint64                          `json:"tx_gas_limit,omitempty"`
-	Disabled                *adminGatewayDisabledRequest     `json:"disabled,omitempty"`
-	ParticipantThrottle     *adminParticipantThrottleRequest `json:"participant_throttle,omitempty"`
-	Redundancy              *adminRedundancyRequest          `json:"redundancy,omitempty"`
-	Perf                    *adminPerfRequest                `json:"perf,omitempty"`
-	EscrowRotation          *adminEscrowRotationRequest      `json:"escrow_rotation,omitempty"`
+	ChainREST                      *string                          `json:"chain_rest,omitempty"`
+	PublicAPI                      *string                          `json:"public_api,omitempty"`
+	DefaultModel                   *string                          `json:"default_model,omitempty"`
+	MaxConcurrentRequests          *int64                           `json:"max_concurrent_requests,omitempty"`
+	MaxConcurrentPer10000Weight    *float64                         `json:"max_concurrent_requests_per_10000_weight,omitempty"`
+	PoCMaxConcurrentPer10000Weight *float64                         `json:"poc_max_concurrent_requests_per_10000_weight,omitempty"`
+	MaxInputTokensInFlight         *int64                           `json:"max_input_tokens_in_flight,omitempty"`
+	ModelLimits                    *[]GatewayModelLimitSettings     `json:"model_limits,omitempty"`
+	DefaultRequestMaxTokens        *uint64                          `json:"default_request_max_tokens,omitempty"`
+	RequestMaxTokensCap            *uint64                          `json:"request_max_tokens_cap,omitempty"`
+	TxGasLimit                     *uint64                          `json:"tx_gas_limit,omitempty"`
+	Disabled                       *adminGatewayDisabledRequest     `json:"disabled,omitempty"`
+	ParticipantThrottle            *adminParticipantThrottleRequest `json:"participant_throttle,omitempty"`
+	Redundancy                     *adminRedundancyRequest          `json:"redundancy,omitempty"`
+	Perf                           *adminPerfRequest                `json:"perf,omitempty"`
+	EscrowRotation                 *adminEscrowRotationRequest      `json:"escrow_rotation,omitempty"`
 }
 
 type adminGatewayDisabledRequest struct {
@@ -1655,7 +1855,7 @@ func (g *Gateway) handleAdminState(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
 			"settings":  g.settings,
 			"devshards": []GatewayDevshardState{},
-			"limiter":   g.limiter.SnapshotWithModelScales(g.limiterModelScales(models, modelRuntimeStatuses)),
+			"limiter":   g.limiter.SnapshotWithModelCapacities(g.limiterModelCapacities(models, modelRuntimeStatuses)),
 			"capacity":  g.capacityStatus(models, modelRuntimeStatuses),
 		})
 		return
@@ -1682,7 +1882,7 @@ func (g *Gateway) handleAdminState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"settings":  state.Settings,
 		"devshards": views,
-		"limiter":   g.limiter.SnapshotWithModelScales(g.limiterModelScales(models, modelRuntimeStatuses)),
+		"limiter":   g.limiter.SnapshotWithModelCapacities(g.limiterModelCapacities(models, modelRuntimeStatuses)),
 		"capacity":  g.capacityStatus(models, modelRuntimeStatuses),
 	})
 }
@@ -1719,14 +1919,17 @@ func (g *Gateway) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 		if req.MaxConcurrentRequests != nil {
 			settings.MaxConcurrentRequests = *req.MaxConcurrentRequests
 		}
+		if req.MaxConcurrentPer10000Weight != nil {
+			settings.MaxConcurrentPer10000Weight = *req.MaxConcurrentPer10000Weight
+		}
+		if req.PoCMaxConcurrentPer10000Weight != nil {
+			settings.PoCMaxConcurrentPer10000Weight = *req.PoCMaxConcurrentPer10000Weight
+		}
 		if req.MaxInputTokensInFlight != nil {
 			settings.MaxInputTokensInFlight = *req.MaxInputTokensInFlight
 		}
 		if req.ModelLimits != nil {
 			settings.ModelLimits = normalizeGatewayModelLimits(*req.ModelLimits)
-		}
-		if req.ModelAccess != nil {
-			settings.ModelAccess = normalizeGatewayModelAccess(*req.ModelAccess)
 		}
 		if req.DefaultRequestMaxTokens != nil {
 			settings.DefaultRequestMaxTokens = *req.DefaultRequestMaxTokens
@@ -1969,6 +2172,10 @@ func validateGatewaySettings(settings GatewaySettings) error {
 		return fmt.Errorf("request_max_tokens_cap must be > 0")
 	case settings.DefaultRequestMaxTokens > settings.RequestMaxTokensCap:
 		return fmt.Errorf("default_request_max_tokens must be <= request_max_tokens_cap")
+	case settings.MaxConcurrentPer10000Weight < 0:
+		return fmt.Errorf("max_concurrent_requests_per_10000_weight must be >= 0")
+	case settings.PoCMaxConcurrentPer10000Weight < 0:
+		return fmt.Errorf("poc_max_concurrent_requests_per_10000_weight must be >= 0")
 	}
 	p := settings.ParticipantThrottle
 	switch {
@@ -2042,6 +2249,11 @@ func validateGatewaySettings(settings GatewaySettings) error {
 		case limit.MaxInputTokensInFlight < 0:
 			return fmt.Errorf("model_limits.max_input_tokens_in_flight must be >= 0")
 		}
+		switch gatewayModelAccessModeLabel(limit.AccessMode) {
+		case string(gatewayAccessModeOpen), string(gatewayAccessModeAPIKey), string(gatewayAccessModeAdminOnly):
+		default:
+			return fmt.Errorf("model_limits.access_mode must be open, api_key, or admin_only for model_id %q", modelID)
+		}
 		effectiveTokenLimits := outputTokenLimits{
 			DefaultMaxTokens: settings.DefaultRequestMaxTokens,
 			MaxTokensCap:     settings.RequestMaxTokensCap,
@@ -2059,17 +2271,6 @@ func validateGatewaySettings(settings GatewaySettings) error {
 			return fmt.Errorf("model_limits contains duplicate model_id %q", modelID)
 		}
 		seenLimitModels[modelID] = struct{}{}
-	}
-	seenAccessModels := make(map[string]struct{}, len(settings.ModelAccess))
-	for _, access := range settings.ModelAccess {
-		modelID := strings.TrimSpace(access.ModelID)
-		if modelID == "" {
-			return fmt.Errorf("model_access.model_id is required")
-		}
-		if _, ok := seenAccessModels[modelID]; ok {
-			return fmt.Errorf("model_access contains duplicate model_id %q", modelID)
-		}
-		seenAccessModels[modelID] = struct{}{}
 	}
 	rotation := settings.EscrowRotation
 	if rotation.Enabled {

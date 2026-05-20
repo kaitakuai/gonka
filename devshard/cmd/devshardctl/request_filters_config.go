@@ -2,10 +2,11 @@ package main
 
 // Body / request-level caps.
 const (
-	MaxChatRequestBodySize = 10 * 1024 * 1024
-	MaxChatRequestChoices  = 5
-	MaxTemperature         = 2.0
-	MaxRepetitionPenalty   = 2.0
+	MaxChatRequestBodySize       = 10 * 1024 * 1024
+	MaxLoggedResponseFormatBytes = 2048 * 1024
+	MaxChatRequestChoices        = 5
+	MaxTemperature               = 2.0
+	MaxRepetitionPenalty         = 2.0
 )
 
 // MaxRequestNestingDepth bounds JSON nesting before we hand the bytes to encoding/json.
