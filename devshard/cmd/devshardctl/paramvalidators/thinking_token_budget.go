@@ -1,14 +1,13 @@
 package paramvalidators
 
+// ThinkingTokenBudgetDefaultsValidator injects a default `thinking_token_budget` derived
+// from `max_tokens` when the client did not supply one. Model routing is the catalog's
+// concern — wrap this validator in a ModelScopedParameterHandler.
 type ThinkingTokenBudgetDefaultsValidator struct {
 	DefaultDivisor uint64
-	Models         []string
 }
 
 func (v ThinkingTokenBudgetDefaultsValidator) Validate(vctx ValidatorContext) error {
-	if !v.matchesModel(vctx.RoutedModel) {
-		return nil
-	}
 	if _, exists := vctx.Document["thinking_token_budget"]; exists {
 		return nil
 	}
@@ -22,13 +21,4 @@ func (v ThinkingTokenBudgetDefaultsValidator) Validate(vctx ValidatorContext) er
 	}
 	vctx.Document["thinking_token_budget"] = value
 	return nil
-}
-
-func (v ThinkingTokenBudgetDefaultsValidator) matchesModel(routedModel string) bool {
-	for _, m := range v.Models {
-		if m == routedModel {
-			return true
-		}
-	}
-	return false
 }

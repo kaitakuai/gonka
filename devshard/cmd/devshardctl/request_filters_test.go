@@ -1474,6 +1474,7 @@ func TestNormalizeChatRequestAcceptsOpenAIObservabilityFields(t *testing.T) {
 		"user":"alice",
 		"metadata":{"trace_id":"abc","span_id":"def"},
 		"parallel_tool_calls":false,
+		"stream":true,
 		"stream_options":{"include_usage":true}
 	}`)
 	out, _, err := normalizeChatRequest(body)
@@ -1494,6 +1495,7 @@ func TestNormalizeChatRequestAcceptsOpenAIObservabilityFields(t *testing.T) {
 func TestNormalizeChatRequestStripsContinuousUsageStats(t *testing.T) {
 	body := []byte(`{
 		"messages":[{"role":"user","content":"hi"}],
+		"stream":true,
 		"stream_options":{"include_usage":true,"continuous_usage_stats":true}
 	}`)
 	out, _, err := normalizeChatRequest(body)
@@ -1510,6 +1512,7 @@ func TestNormalizeChatRequestStripsContinuousUsageStats(t *testing.T) {
 func TestNormalizeChatRequestDropsEmptiedStreamOptions(t *testing.T) {
 	body := []byte(`{
 		"messages":[{"role":"user","content":"hi"}],
+		"stream":true,
 		"stream_options":{"continuous_usage_stats":true}
 	}`)
 	out, _, err := normalizeChatRequest(body)
@@ -1518,6 +1521,28 @@ func TestNormalizeChatRequestDropsEmptiedStreamOptions(t *testing.T) {
 	var raw map[string]any
 	require.NoError(t, json.Unmarshal(out, &raw))
 	require.NotContains(t, raw, "stream_options")
+}
+
+// stream_options is meaningless without streaming — gateway strips it silently when
+// `stream` is not `true` (absent, false, or non-bool). Prevents clients from accidentally
+// shipping a streaming-only option on a non-streaming request.
+func TestNormalizeChatRequestStripsStreamOptionsWhenStreamFalseOrAbsent(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "stream absent", body: `{"messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}`},
+		{name: "stream false", body: `{"messages":[{"role":"user","content":"hi"}],"stream":false,"stream_options":{"include_usage":true}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, "stream_options")
+		})
+	}
 }
 
 // Pipeline-level coverage of MetadataValidator: too many keys / oversize values are

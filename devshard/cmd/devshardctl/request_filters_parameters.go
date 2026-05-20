@@ -648,10 +648,12 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					Models:           []string{kimiK26ModelID},
 					UnmatchedHandler: StripParameterHandler{},
 				}).
-				withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
-					Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
-						DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
-						Models:         []string{kimiK26ModelID},
+				withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
+					Models: []string{kimiK26ModelID},
+					Handler: DocumentValidatorHandler{
+						Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
+							DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
+						},
 					},
 				}).
 				withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: kimiThinkingTokenBudgetMax}).
@@ -695,7 +697,10 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 			// of being forwarded as a no-op carrier under the 10 MiB body cap.
 			newParameter("user").
 				withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
-					Validator: paramvalidators.UserValidator{},
+					Validator: paramvalidators.StringFieldValidator{
+						FieldName:     "user",
+						DefaultMaxLen: UserMaxLen,
+					},
 				}),
 			// metadata: OpenAI bounds it to 16 keys × 64-char keys × 512-char string values;
 			// we enforce the same bounds at the gateway boundary as a free defensive cap.
@@ -732,7 +737,10 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
 					Models: []string{kimiK26ModelID},
 					Handler: DocumentValidatorHandler{
-						Validator: paramvalidators.SafetyIdentifierValidator{},
+						Validator: paramvalidators.StringFieldValidator{
+							FieldName:     "safety_identifier",
+							DefaultMaxLen: SafetyIdentifierMaxLen,
+						},
 					},
 					UnmatchedHandler: StripParameterHandler{},
 				}),
