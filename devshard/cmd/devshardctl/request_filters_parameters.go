@@ -173,6 +173,7 @@ func (h ForceLiteralParameterHandler) Apply(ctx *RequestFilterContext, parameter
 	return nil
 }
 
+
 // ModelScopedParameterHandler runs Handler only when ctx.RoutedModel matches one of Models
 // (exact, case-sensitive).
 type ModelScopedParameterHandler struct {
@@ -652,6 +653,15 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					MaxNodes: 128,
 				},
 			}),
+		newParameter("thinking_token_budget").
+			withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
+				Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
+					DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
+					Models:         []string{kimiK26ModelID},
+				},
+			}).
+			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: kimiThinkingTokenBudgetMax}).
+			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
 		newParameter("tools").
 			withRule(RequestFilterStagePreValidation, DocumentValidatorHandler{
 				Validator: paramvalidators.ToolsValidator{
