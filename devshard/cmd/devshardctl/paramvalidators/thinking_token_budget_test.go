@@ -1,6 +1,7 @@
 package paramvalidators
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -18,7 +19,7 @@ func TestThinkingTokenBudgetDefaultsValidator(t *testing.T) {
 	t.Run("preserves client value when present", func(t *testing.T) {
 		doc := parseDocument(t, `{"max_tokens":4096,"thinking_token_budget":500}`)
 		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
-		require.EqualValues(t, float64(500), doc["thinking_token_budget"])
+		require.Equal(t, json.Number("500"), doc["thinking_token_budget"])
 	})
 
 	t.Run("splits in half regardless of size", func(t *testing.T) {
@@ -54,8 +55,8 @@ func TestThinkingTokenBudgetDefaultsValidator(t *testing.T) {
 		require.False(t, exists)
 	})
 
-	t.Run("zero divisor saturates at max_tokens", func(t *testing.T) {
-		vZero := ThinkingTokenBudgetDefaultsValidator{DefaultDivisor: 0, MinValue: 256, Models: []string{"kimi-model"}}
+	t.Run("zero divisor uses max_tokens", func(t *testing.T) {
+		vZero := ThinkingTokenBudgetDefaultsValidator{DefaultDivisor: 0, Models: []string{"kimi-model"}}
 		doc := parseDocument(t, `{"max_tokens":4096}`)
 		require.NoError(t, vZero.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
 		require.EqualValues(t, 4096, doc["thinking_token_budget"])
