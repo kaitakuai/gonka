@@ -15,6 +15,12 @@ const MaxRepetitionPenalty = 2.0
 const kimiK26ModelID = "moonshotai/Kimi-K2.6"
 const emptyToolResultContent = "<empty tool result>"
 
+const (
+	KimiThinkingTokenBudgetDefaultDivisor uint64 = 2
+	KimiThinkingTokenBudgetMin            uint64 = 256
+	KimiThinkingTokenBudgetMax            uint64 = 96_000
+)
+
 type chatRequest struct {
 	Model               string `json:"model"`
 	Stream              bool   `json:"stream"`
