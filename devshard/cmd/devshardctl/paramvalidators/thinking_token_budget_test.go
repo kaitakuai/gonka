@@ -1,0 +1,57 @@
+package paramvalidators
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestThinkingTokenBudgetDefaultsValidator(t *testing.T) {
+	v := ThinkingTokenBudgetDefaultsValidator{DefaultDivisor: 2, MinValue: 256, Models: []string{"kimi-model"}}
+
+	t.Run("injects default for scoped model when absent", func(t *testing.T) {
+		doc := parseDocument(t, `{"max_tokens":4096}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		require.EqualValues(t, 2048, doc["thinking_token_budget"])
+	})
+
+	t.Run("preserves client value when present", func(t *testing.T) {
+		doc := parseDocument(t, `{"max_tokens":4096,"thinking_token_budget":500}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		require.EqualValues(t, float64(500), doc["thinking_token_budget"])
+	})
+
+	t.Run("applies min floor when default is below it", func(t *testing.T) {
+		doc := parseDocument(t, `{"max_tokens":400}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		require.EqualValues(t, 256, doc["thinking_token_budget"])
+	})
+
+	t.Run("no injection for non-scoped models", func(t *testing.T) {
+		doc := parseDocument(t, `{"max_tokens":4096}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "other-model"}))
+		_, exists := doc["thinking_token_budget"]
+		require.False(t, exists)
+	})
+
+	t.Run("skips when max_tokens absent", func(t *testing.T) {
+		doc := parseDocument(t, `{}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		_, exists := doc["thinking_token_budget"]
+		require.False(t, exists)
+	})
+
+	t.Run("skips when max_tokens is zero", func(t *testing.T) {
+		doc := parseDocument(t, `{"max_tokens":0}`)
+		require.NoError(t, v.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		_, exists := doc["thinking_token_budget"]
+		require.False(t, exists)
+	})
+
+	t.Run("zero divisor saturates at max_tokens", func(t *testing.T) {
+		vZero := ThinkingTokenBudgetDefaultsValidator{DefaultDivisor: 0, MinValue: 256, Models: []string{"kimi-model"}}
+		doc := parseDocument(t, `{"max_tokens":4096}`)
+		require.NoError(t, vZero.Validate(ValidatorContext{Document: doc, RoutedModel: "kimi-model"}))
+		require.EqualValues(t, 4096, doc["thinking_token_budget"])
+	})
+}

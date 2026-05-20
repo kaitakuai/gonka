@@ -53,6 +53,7 @@ Anything not on this whitelist does not reach the model. That is the contract.
 **Pipeline / forced**:
 - `max_tokens` / `max_completion_tokens` — defaults + caps via `applyOutputTokenLimits`
 - `min_tokens` — conditional strip + clamp
+- `thinking_token_budget` — `paramvalidators.ThinkingTokenBudgetDefaultsValidator` injects `max_tokens / 2` (floor 256) for `moonshotai/Kimi-K2.6` when the client omits the field; `CapUintParameterHandler{Max: 96_000}` and `ClampUintToFieldParameterHandler{MaxField: "max_tokens"}` apply to every request regardless of model. Without the default, Kimi-K2.6 routinely consumes the entire `max_tokens` budget inside `<think>...</think>` and returns `finish_reason=length` with empty content at the current 4k cap; the divisor of 2 / floor of 256 / ceiling of 96 000 (Moonshot HLE/AIME budget) were picked from live B200 measurements.
 - `logprobs` / `top_logprobs` — forced
 - `messages` contract — `defaultChatMessageProcessor.ValidateDocument`
 - Body-level: `MaxRequestNestingDepth=32`, `MaxChatRequestBodySize=10 MiB`

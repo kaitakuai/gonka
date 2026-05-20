@@ -173,13 +173,6 @@ func (h ForceLiteralParameterHandler) Apply(ctx *RequestFilterContext, parameter
 	return nil
 }
 
-type CustomParameterHandler struct {
-	ApplyFunc func(*RequestFilterContext, VLLMParameter) error
-}
-
-func (h CustomParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
-	return h.ApplyFunc(ctx, parameter)
-}
 
 // ModelScopedParameterHandler runs Handler only when ctx.RoutedModel matches one of Models
 // (exact, case-sensitive).
@@ -661,22 +654,12 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 				},
 			}),
 		newParameter("thinking_token_budget").
-			withRule(RequestFilterStagePostLimits, ModelScopedParameterHandler{
-				Models: []string{kimiK26ModelID},
-				Handler: CustomParameterHandler{ApplyFunc: func(ctx *RequestFilterContext, p VLLMParameter) error {
-					if _, exists := ctx.Document.Get(p.Name); exists {
-						return nil
-					}
-					if ctx.Request.MaxTokens == 0 {
-						return nil
-					}
-					v := ctx.Request.MaxTokens / kimiThinkingTokenBudgetDefaultDivisor
-					if v < kimiThinkingTokenBudgetMin {
-						v = kimiThinkingTokenBudgetMin
-					}
-					ctx.Document.Set(p.Name, v)
-					return nil
-				}},
+			withRule(RequestFilterStagePostLimits, DocumentValidatorHandler{
+				Validator: paramvalidators.ThinkingTokenBudgetDefaultsValidator{
+					DefaultDivisor: kimiThinkingTokenBudgetDefaultDivisor,
+					MinValue:       kimiThinkingTokenBudgetMin,
+					Models:         []string{kimiK26ModelID},
+				},
 			}).
 			withRule(RequestFilterStagePostLimits, CapUintParameterHandler{Max: kimiThinkingTokenBudgetMax}).
 			withRule(RequestFilterStagePostLimits, ClampUintToFieldParameterHandler{MaxField: "max_tokens"}),
