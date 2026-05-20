@@ -1608,13 +1608,13 @@ func TestNormalizeChatRequestKimiThinkingTokenBudgetNotInjectedForOtherModels(t 
 	require.NotContains(t, string(body), `thinking_token_budget`)
 }
 
-func TestNormalizeChatRequestThinkingTokenBudgetClampedForAllModels(t *testing.T) {
+func TestNormalizeChatRequestThinkingTokenBudgetStrippedForOtherModelsEvenIfClientSet(t *testing.T) {
 	body, _, err := normalizeChatRequestForModel(
 		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":4096,"thinking_token_budget":200000}`),
 		"some/other-model",
 	)
 	require.NoError(t, err)
-	require.Contains(t, string(body), `"thinking_token_budget":4096`)
+	require.NotContains(t, string(body), `thinking_token_budget`)
 }
 
 // safety_identifier is forwarded to Kimi K2.6 (Moonshot consumes it for abuse tracking)
