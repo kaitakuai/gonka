@@ -63,6 +63,9 @@ const (
 	ResponseFormatMaxNameLen    = 64
 	ResponseFormatMaxPatternLen = 512
 
+	UserMaxLen             = 512
+	SafetyIdentifierMaxLen = 512
+
 	kimiThinkingTokenBudgetDefaultDivisor uint64 = 2
 	kimiThinkingTokenBudgetMax            uint64 = 96_000
 )

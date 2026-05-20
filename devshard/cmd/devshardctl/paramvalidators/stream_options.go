@@ -25,15 +25,22 @@ var streamOptionsWhitelist = map[string]struct{}{
 }
 
 // StreamOptionsValidator enforces a strict sub-field whitelist on the OpenAI
-// `stream_options` object. The validator mutates ValidatorContext.Document in place, both
-// rejecting malformed wrappers and rewriting the object to contain only whitelisted keys.
-// If the rewrite leaves the object empty, the field is dropped from the document entirely
-// so it does not reach the upstream as `{}`.
+// `stream_options` object. The validator mutates ValidatorContext.Document in place: it
+// rejects malformed wrappers, strips the field entirely when `stream` is not exactly
+// `true` (the field is meaningless without streaming per the OpenAI spec, and clients
+// that send it alongside `stream:false` or omit `stream` are misusing the API), and
+// otherwise rewrites the object to contain only whitelisted keys. If the rewrite leaves
+// the object empty, the field is dropped from the document so it does not reach the
+// upstream as `{}`.
 type StreamOptionsValidator struct{}
 
 func (v StreamOptionsValidator) Validate(vctx ValidatorContext) error {
 	raw, exists := vctx.Document["stream_options"]
 	if !exists {
+		return nil
+	}
+	if stream, _ := vctx.Document["stream"].(bool); !stream {
+		delete(vctx.Document, "stream_options")
 		return nil
 	}
 	obj, ok := raw.(map[string]any)
