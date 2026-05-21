@@ -90,6 +90,9 @@ func (p ChatRequestPipeline) Normalize(body []byte, adminAuthenticated bool, lim
 	if err := p.parameters.Apply(RequestFilterStagePreValidation, ctx); err != nil {
 		return nil, chatRequest{}, err
 	}
+	if err := p.messages.NormalizeDocument(&ctx.Document); err != nil {
+		return nil, chatRequest{}, err
+	}
 	if err := p.messages.ValidateDocument(&ctx.Document); err != nil {
 		return nil, chatRequest{}, err
 	}
@@ -173,11 +176,6 @@ func prepareChatRequestBodyWithTokenLimits(r *http.Request, limits outputTokenLi
 		return nil, chatRequest{}, err
 	}
 	originalBody := append([]byte(nil), body...)
-	body, err = normalizeContent(body)
-	if err != nil {
-		captureFilterRejectedRequest(r, originalBody, err, "", "")
-		return nil, chatRequest{}, err
-	}
 	logResponseFormatDiagnostics(r.Context(), body)
 	updatedBody, req, err := normalizeChatRequestForAuthAndLimits(body, requestHasAdminAuth(r), limits, routedModel)
 	if err != nil {

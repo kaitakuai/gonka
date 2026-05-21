@@ -1664,11 +1664,6 @@ func (g *Gateway) parseChatReservation(r *http.Request, defaultModel string) ([]
 		return nil, "", 0, err
 	}
 	originalBody := append([]byte(nil), body...)
-	body, err = normalizeContent(body)
-	if err != nil {
-		captureFilterRejectedRequest(r, originalBody, err, "", "")
-		return nil, "", 0, err
-	}
 	logResponseFormatDiagnostics(r.Context(), body)
 	model := chatRequestModel(body)
 	routedModel := firstNonEmpty(model, defaultModel)
