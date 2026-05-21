@@ -739,7 +739,7 @@ func (e *Redundancy) pairwiseParticipantAvailable(participantKey string) bool {
 	if participantKey == "" {
 		return false
 	}
-	if shouldUseProbeForParticipant(participantKey) {
+	if shouldUseProbeForParticipant(e.model, participantKey) {
 		return false
 	}
 	if e != nil {
@@ -778,15 +778,17 @@ func (e *Redundancy) participantKeyForHost(hostIdx int) string {
 
 // inflight tracks one in-flight inference and its timing.
 type inflight struct {
-	prepared        *user.PreparedInference
-	hostIdx         int
-	hostID          string
-	nonce           uint64
-	escrowID        string
-	sendTime        time.Time
-	escalated       bool
-	probe           bool
-	excludePairwise bool
+	prepared                   *user.PreparedInference
+	hostIdx                    int
+	hostID                     string
+	nonce                      uint64
+	escrowID                   string
+	sendTime                   time.Time
+	escalated                  bool
+	probe                      bool
+	excludePairwise            bool
+	startedBeforePoCGeneration bool
+	phaseTransitionAborted     bool
 
 	receiptOnce sync.Once
 	receiptTime time.Time
@@ -1337,6 +1339,7 @@ func (e *Redundancy) startInflight(ctx context.Context, inf *inflight, race *rac
 	// fallback never fires). Setting sendTime here makes the invariant hold
 	// before awaitRace can observe the attempt.
 	inf.sendTime = time.Now()
+	inf.startedBeforePoCGeneration = !currentPoCGenerationActive()
 	go e.monitorInflight(ctx, inf, race)
 
 	go func() {
@@ -1404,6 +1407,12 @@ func (e *Redundancy) startInflight(ctx context.Context, inf *inflight, race *rac
 				"response_body_sample", responseBodySample,
 				"response_body_sample_truncated", responseSampleTruncated,
 				"request_flags", requestFlagsForLog(params),
+			)
+		}
+		if e.markPhaseTransitionAbort(inf) {
+			logInferenceStage(ctx, inf.escrowID, inf.nonce, "phase_transition_aborted",
+				"host", inf.hostID,
+				"poc_reason", currentPoCPhaseReason(),
 			)
 		}
 	}()
@@ -1792,6 +1801,7 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 					if escalationTimer != nil {
 						stopTimer(escalationTimer)
 					}
+					e.markPhaseTransitionAbort(inf)
 					e.recordWinnerTerminalFailureOnce(inf, params, w)
 					go e.finishRaceWhenPendingDone(settleCtx, attempts, params, decision, w, raceFinishOptions{
 						forceTreatAsFailure:  true,
@@ -1799,6 +1809,15 @@ func (e *Redundancy) awaitRace(streamCtx, settleCtx context.Context, attempts []
 					})
 					logRequestStage(settleCtx, "winner_failed_after_content", "escrow", e.devshardID, "winner_nonce", w, "error", err)
 					return err
+				}
+			}
+			if w == 0 && e.markPhaseTransitionAbort(inf) && phaseTransitionAbortRetryable(inf) {
+				e.reincludePhaseTransitionAbortParticipant(inf, triedParticipants)
+				if len(attempts) < maxAttempts {
+					if next := e.startAdditionalInflight(streamCtx, settleCtx, race, params, "phase_transition_retry", inf, "phase_transition_aborted", triedParticipants); next != nil {
+						attempts = append(attempts, next)
+						e.watchInflightDone(next, doneCh)
+					}
 				}
 			}
 		case <-escalationC:
@@ -2355,6 +2374,45 @@ func isFailedStreamAttempt(inf *inflight) bool {
 	return isEmptyStreamAttempt(inf) || isErrorStreamAttempt(inf)
 }
 
+func (e *Redundancy) markPhaseTransitionAbort(inf *inflight) bool {
+	if inf == nil || inf.probe || inf.phaseTransitionAborted {
+		return inf != nil && inf.phaseTransitionAborted
+	}
+	if !inf.startedBeforePoCGeneration || !currentPoCGenerationActive() {
+		return false
+	}
+	if isErrorStreamAttempt(inf) || e.attemptHasMsgFinish(inf) {
+		return false
+	}
+	if !isEmptyStreamAttempt(inf) && inf.err == nil && inf.contentChunks.Load() == 0 {
+		return false
+	}
+	inf.phaseTransitionAborted = true
+	inf.excludePairwise = true
+	return true
+}
+
+func (e *Redundancy) attemptHasMsgFinish(inf *inflight) bool {
+	if inf == nil {
+		return false
+	}
+	if inf.resp != nil && user.HasMsgFinish(inf.resp.Mempool, inf.nonce) {
+		return true
+	}
+	return e != nil && e.session != nil && e.session.IsNonceFinished(inf.nonce)
+}
+
+func phaseTransitionAbortRetryable(inf *inflight) bool {
+	return inf != nil && inf.phaseTransitionAborted && inf.contentChunks.Load() == 0
+}
+
+func (e *Redundancy) reincludePhaseTransitionAbortParticipant(inf *inflight, triedParticipants map[string]bool) {
+	if e == nil || e.session == nil || inf == nil || !inf.phaseTransitionAborted || triedParticipants == nil {
+		return
+	}
+	delete(triedParticipants, e.session.HostParticipantKey(inf.hostIdx))
+}
+
 func isErrorStreamAttempt(inf *inflight) bool {
 	return inf != nil && inf.errorSource != ""
 }
@@ -2490,12 +2548,18 @@ func (e *Redundancy) recordStartedAttemptSamples(attempts []*inflight, params us
 		if inf == nil || inf.probe || inf.sendTime.IsZero() {
 			continue
 		}
+		if inf.phaseTransitionAborted {
+			continue
+		}
 		e.recordSampleOnce(inf, params, requestSucceeded)
 	}
 }
 
 func (e *Redundancy) recordStalledWinnerFailureOnce(inf *inflight, params user.InferenceParams) {
 	if inf == nil {
+		return
+	}
+	if inf.phaseTransitionAborted {
 		return
 	}
 	if isErrorStreamAttempt(inf) {
@@ -2643,6 +2707,11 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 				logInferenceStage(ctx, inf.escrowID, inf.nonce, "poc_probe_failed_no_timeout", "host", inf.hostID, "poc_reason", currentPoCPhaseReason())
 				continue
 			}
+			if inf.phaseTransitionAborted {
+				logInferenceStage(ctx, inf.escrowID, inf.nonce, "timeout_skipped",
+					"host", inf.hostID, "reason", "phase_transition_aborted")
+				continue
+			}
 			if isErrorStreamAttempt(inf) {
 				logInferenceStage(ctx, inf.escrowID, inf.nonce, "timeout_skipped",
 					"host", inf.hostID, "reason", "error_stream_without_finish")
@@ -2709,6 +2778,9 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 		if inf.probe {
 			continue
 		}
+		if inf.phaseTransitionAborted {
+			continue
+		}
 		e.recordSampleOnce(inf, params, true)
 		involvement = append(involvement, e.buildInvolvement(inf, winnerNonce, params))
 	}
@@ -2736,6 +2808,11 @@ func (e *Redundancy) finishRaceOutcome(ctx context.Context, attempts []*inflight
 				for _, inf := range failed {
 					if inf.probe {
 						logInferenceStage(bgCtx, inf.escrowID, inf.nonce, "poc_probe_failed_no_timeout", "host", inf.hostID, "poc_reason", currentPoCPhaseReason())
+						continue
+					}
+					if inf.phaseTransitionAborted {
+						logInferenceStage(bgCtx, inf.escrowID, inf.nonce, "timeout_skipped",
+							"host", inf.hostID, "reason", "phase_transition_aborted")
 						continue
 					}
 					if isErrorStreamAttempt(inf) {
@@ -2887,6 +2964,9 @@ func (e *Redundancy) buildInvolvement(inf *inflight, winnerNonce uint64, params 
 
 func (e *Redundancy) recordSample(inf *inflight, params user.InferenceParams, requestSucceeded bool) {
 	if inf.probe {
+		return
+	}
+	if inf.phaseTransitionAborted {
 		return
 	}
 	// Long non-stream responses that end empty around the client timeout are

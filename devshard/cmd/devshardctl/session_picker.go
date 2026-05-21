@@ -330,7 +330,7 @@ func (p *sessionPicker) run() {
 			// (host cannot serve user traffic at all right now)
 			// whereas throttle is a reactive, host-level signal that
 			// will be subsumed by the PoC label until the phase ends.
-			if shouldUseProbeForParticipant(b.ParticipantKey) {
+			if shouldUseProbeForParticipant(p.model, b.ParticipantKey) {
 				ghost = ghostPoC
 				return ghostProbeParams(p.model), true, nil
 			}
@@ -492,7 +492,7 @@ func (p *sessionPicker) computeAvailableParticipants() map[string]bool {
 		if key == "" {
 			continue
 		}
-		if shouldUseProbeForParticipant(key) {
+		if shouldUseProbeForParticipant(p.model, key) {
 			continue
 		}
 		if p.throttleBlocked != nil && p.throttleBlocked(key) {

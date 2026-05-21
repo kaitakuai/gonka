@@ -367,17 +367,17 @@ func (g *ChainPhaseGate) refresh() {
 	}
 	snapshot := deriveChainPhaseSnapshot(resp)
 	active, _ := rawPoCBlockingState(snapshot.EpochPhase, snapshot.ConfirmationPoCPhase)
-	wasActive, _ := rawPoCBlockingState(previous.EpochPhase, previous.ConfirmationPoCPhase)
 
 	capacityState, scaleHook := g.capacitySinks()
 
 	// We need participants info for two purposes:
-	//   (a) the relaxed-PoC preserved-set update (only on active edge)
+	//   (a) the relaxed-PoC preserved-set update (on active edge and
+	//       active phase/anchor changes)
 	//   (b) feeding CapacityState weights + preserved set (every refresh,
 	//       when attached) so W(e)/W_tot/W_ref reflect the latest chain
 	//       observation.
 	// Combine the fetches so we never double-poll the chain.
-	needPreservedFetch := active && relaxedPoCModeEnabled() && !wasActive
+	needPreservedFetch := active && relaxedPoCModeEnabled() && shouldRefreshPoCPreservedParticipants(previous, snapshot)
 	if needPreservedFetch || capacityState != nil {
 		state, perr := g.fetchParticipantsState(
 			active,
@@ -389,7 +389,7 @@ func (g *ChainPhaseGate) refresh() {
 			g.logPreservedParticipantFetchFailure(snapshot, perr)
 		} else {
 			if needPreservedFetch {
-				setPoCPreservedParticipants(state.preserved)
+				setPoCPreservedParticipantsByModel(state.preservedByModel)
 				g.logPreservedParticipantsLoaded(snapshot, state.preserved, state.excluded)
 			}
 			if capacityState != nil {
@@ -413,7 +413,7 @@ func (g *ChainPhaseGate) refresh() {
 		}
 	}
 	if !active {
-		setPoCPreservedParticipants(nil)
+		setPoCPreservedParticipantsByModel(nil)
 	}
 
 	if capacityState != nil && scaleHook != nil {
@@ -457,10 +457,11 @@ func (g *ChainPhaseGate) fetchEpochInfo() (*chainEpochInfoResponse, error) {
 // outside PoC every ML node contributes, while during active PoC only
 // preserved ML nodes contribute.
 type participantsState struct {
-	preserved      []string
-	excluded       []string
-	weights        map[string]float64
-	weightsByModel map[string]map[string]float64
+	preserved        []string
+	preservedByModel map[string][]string
+	excluded         []string
+	weights          map[string]float64
+	weightsByModel   map[string]map[string]float64
 }
 
 func (g *ChainPhaseGate) fetchPreservedParticipantKeys() ([]string, []string, error) {
@@ -503,10 +504,12 @@ func (g *ChainPhaseGate) fetchParticipantsState(pocActive bool, expectedSnapshot
 	}
 
 	state := &participantsState{
-		weights:        make(map[string]float64, len(payload.ActiveParticipants.Participants)),
-		weightsByModel: make(map[string]map[string]float64),
+		preservedByModel: make(map[string][]string),
+		weights:          make(map[string]float64, len(payload.ActiveParticipants.Participants)),
+		weightsByModel:   make(map[string]map[string]float64),
 	}
 	seenPreserved := make(map[string]struct{}, len(payload.ActiveParticipants.Participants))
+	seenPreservedByModel := make(map[string]map[string]struct{})
 	seenExcluded := make(map[string]struct{}, len(payload.ActiveParticipants.Participants))
 	for _, participant := range payload.ActiveParticipants.Participants {
 		key := strings.TrimSpace(participant.Index)
@@ -527,6 +530,18 @@ func (g *ChainPhaseGate) fetchParticipantsState(pocActive bool, expectedSnapshot
 			}
 			modelWeights[key] = weight
 		}
+		for _, model := range preservedModelsForParticipant(participant, preservedSnapshot, preservation) {
+			modelSet := seenPreservedByModel[model]
+			if modelSet == nil {
+				modelSet = map[string]struct{}{}
+				seenPreservedByModel[model] = modelSet
+			}
+			if _, ok := modelSet[key]; ok {
+				continue
+			}
+			modelSet[key] = struct{}{}
+			state.preservedByModel[model] = append(state.preservedByModel[model], key)
+		}
 		if !participantHasPreservedNode(participant, preservedSnapshot, preservation) {
 			if _, ok := seenExcluded[key]; ok {
 				continue
@@ -540,6 +555,9 @@ func (g *ChainPhaseGate) fetchParticipantsState(pocActive bool, expectedSnapshot
 		}
 		seenPreserved[key] = struct{}{}
 		state.preserved = append(state.preserved, key)
+	}
+	for model := range state.preservedByModel {
+		sort.Strings(state.preservedByModel[model])
 	}
 	return state, nil
 }
@@ -628,8 +646,7 @@ func newPreservedSnapshotState(snapshot *chainPreservedNodesSnapshot) *preserved
 }
 
 func (g *ChainPhaseGate) storeSnapshot(snapshot ChainPhaseSnapshot) {
-	active, reason := rawPoCBlockingState(snapshot.EpochPhase, snapshot.ConfirmationPoCPhase)
-	setPoCPhaseState(active, reason)
+	setPoCPhaseStateFromSnapshot(snapshot)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.snapshot = snapshot
@@ -879,6 +896,27 @@ func rawPoCBlockingState(epochPhase, confirmationPhase string) (bool, string) {
 	return false, ""
 }
 
+func shouldRefreshPoCPreservedParticipants(previous, next ChainPhaseSnapshot) bool {
+	previousActive, _ := rawPoCBlockingState(previous.EpochPhase, previous.ConfirmationPoCPhase)
+	nextActive, _ := rawPoCBlockingState(next.EpochPhase, next.ConfirmationPoCPhase)
+	if !nextActive {
+		return false
+	}
+	if !previousActive {
+		return true
+	}
+	return previous.BlockReason != next.BlockReason ||
+		previous.EpochPhase != next.EpochPhase ||
+		previous.ConfirmationPoCPhase != next.ConfirmationPoCPhase ||
+		previous.confirmationPoCTriggerHeight != next.confirmationPoCTriggerHeight ||
+		previous.pocStartBlockHeight != next.pocStartBlockHeight
+}
+
+func isPoCGenerationSnapshot(snapshot ChainPhaseSnapshot) bool {
+	return snapshot.EpochPhase == epochPhasePoCGenerate ||
+		snapshot.ConfirmationPoCPhase == confirmationPoCGeneration
+}
+
 func preservedSnapshotAnchor(snapshot ChainPhaseSnapshot) int64 {
 	switch snapshot.BlockReason {
 	case "confirmation_poc":
@@ -912,6 +950,30 @@ func participantHasPreservedNode(participant chainActiveParticipant, snapshot *p
 		}
 	}
 	return false
+}
+
+func preservedModelsForParticipant(participant chainActiveParticipant, snapshot *preservedSnapshotState, preservation preservationMode) []string {
+	seen := make(map[string]struct{}, len(participant.Models))
+	var models []string
+	for i, rawModel := range participant.Models {
+		model := strings.TrimSpace(rawModel)
+		if model == "" || i >= len(participant.MLNodes) {
+			continue
+		}
+		for _, node := range participant.MLNodes[i].MLNodes {
+			if !nodePreserved(participant.Index, model, node, snapshot, preservation) {
+				continue
+			}
+			if _, ok := seen[model]; ok {
+				continue
+			}
+			seen[model] = struct{}{}
+			models = append(models, model)
+			break
+		}
+	}
+	sort.Strings(models)
+	return models
 }
 
 // participantWeight returns the raw poc_weight CapacityState should ingest

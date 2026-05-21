@@ -18,8 +18,9 @@ var (
 	currentPoCMode            = pocRequestModeOff
 	currentPoCActive          bool
 	currentPoCReason          string
+	currentPoCGeneration      bool
 	currentPoCPreservedLoaded bool
-	currentPoCPreservedKeys   = map[string]struct{}{}
+	currentPoCPreservedModels = map[string]map[string]struct{}{}
 	pocProbePromptBody        = []byte(`{"messages":[{"role":"user","content":"."}],"max_tokens":1}`)
 )
 
@@ -40,8 +41,9 @@ func ConfigurePoCRequestMode(raw string) {
 	if mode == pocRequestModeOff {
 		currentPoCActive = false
 		currentPoCReason = ""
+		currentPoCGeneration = false
 		currentPoCPreservedLoaded = false
-		currentPoCPreservedKeys = map[string]struct{}{}
+		currentPoCPreservedModels = map[string]map[string]struct{}{}
 	}
 }
 
@@ -59,27 +61,51 @@ func setPoCPhaseState(active bool, reason string) {
 	pocModeMu.Lock()
 	defer pocModeMu.Unlock()
 	currentPoCActive = active
+	currentPoCGeneration = false
 	if active {
 		currentPoCReason = strings.TrimSpace(reason)
 		return
 	}
 	currentPoCReason = ""
 	currentPoCPreservedLoaded = false
-	currentPoCPreservedKeys = map[string]struct{}{}
+	currentPoCPreservedModels = map[string]map[string]struct{}{}
 }
 
-func setPoCPreservedParticipants(keys []string) {
-	next := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		key = strings.TrimSpace(key)
-		if key == "" {
+func setPoCPhaseStateFromSnapshot(snapshot ChainPhaseSnapshot) {
+	active, reason := rawPoCBlockingState(snapshot.EpochPhase, snapshot.ConfirmationPoCPhase)
+	pocModeMu.Lock()
+	defer pocModeMu.Unlock()
+	currentPoCActive = active
+	currentPoCGeneration = active && isPoCGenerationSnapshot(snapshot)
+	if active {
+		currentPoCReason = strings.TrimSpace(reason)
+		return
+	}
+	currentPoCReason = ""
+	currentPoCPreservedLoaded = false
+	currentPoCPreservedModels = map[string]map[string]struct{}{}
+}
+
+func setPoCPreservedParticipantsByModel(byModel map[string][]string) {
+	nextByModel := make(map[string]map[string]struct{}, len(byModel))
+	for model, modelKeys := range byModel {
+		model = strings.TrimSpace(model)
+		if model == "" {
 			continue
 		}
-		next[key] = struct{}{}
+		modelSet := make(map[string]struct{}, len(modelKeys))
+		for _, key := range modelKeys {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			modelSet[key] = struct{}{}
+		}
+		nextByModel[model] = modelSet
 	}
 	pocModeMu.Lock()
 	defer pocModeMu.Unlock()
-	currentPoCPreservedKeys = next
+	currentPoCPreservedModels = nextByModel
 	currentPoCPreservedLoaded = true
 }
 
@@ -89,7 +115,8 @@ func poCPreservedParticipantsLoaded() bool {
 	return currentPoCPreservedLoaded
 }
 
-func isPoCPreservedParticipant(key string) bool {
+func isPoCPreservedParticipantForModel(model, key string) bool {
+	model = strings.TrimSpace(model)
 	key = strings.TrimSpace(key)
 	pocModeMu.RLock()
 	defer pocModeMu.RUnlock()
@@ -102,7 +129,14 @@ func isPoCPreservedParticipant(key string) bool {
 	if !currentPoCPreservedLoaded {
 		return true
 	}
-	_, ok := currentPoCPreservedKeys[key]
+	if model == "" {
+		return false
+	}
+	modelSet, ok := currentPoCPreservedModels[model]
+	if !ok {
+		return false
+	}
+	_, ok = modelSet[key]
 	return ok
 }
 
@@ -118,20 +152,27 @@ func currentPoCPhaseReason() string {
 	return currentPoCReason
 }
 
+func currentPoCGenerationActive() bool {
+	pocModeMu.RLock()
+	defer pocModeMu.RUnlock()
+	return currentPoCMode == pocRequestModeRelaxed && currentPoCGeneration
+}
+
 // shouldUseProbeForParticipant is the PoC-bypass policy decision keyed on
-// a participant identifier. Callers in the Session.PrepareInferenceFn
-// chooser pass the key from the HostBinding (the chooser runs under
-// Session.mu, so calling Session.HostParticipantKey there would deadlock).
+// the request model and participant identifier. Callers in the
+// Session.PrepareInferenceFn chooser pass the key from the HostBinding (the
+// chooser runs under Session.mu, so calling Session.HostParticipantKey there
+// would deadlock).
 //
 // Placed here rather than on *Redundancy because it consults only PoC
 // globals defined in this file -- the receiver-as-namespace pattern was
 // misleading.
-func shouldUseProbeForParticipant(participantKey string) bool {
+func shouldUseProbeForParticipant(model, participantKey string) bool {
 	if !relaxedPoCBypassActive() {
 		return false
 	}
 	if !poCPreservedParticipantsLoaded() {
 		return false
 	}
-	return !isPoCPreservedParticipant(participantKey)
+	return !isPoCPreservedParticipantForModel(model, participantKey)
 }

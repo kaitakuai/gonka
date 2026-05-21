@@ -456,6 +456,9 @@ func TestChainPhaseGateUsesPreservedSnapshotDuringPoC(t *testing.T) {
 	state, err := gate.fetchParticipantsState(true, 123, false)
 	require.NoError(t, err)
 	require.Equal(t, []string{"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"}, state.preserved)
+	require.Equal(t, map[string][]string{
+		"Model/A": []string{"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1"},
+	}, state.preservedByModel)
 	require.Equal(t, []string{"gonka1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2"}, state.excluded)
 	require.Equal(t, map[string]float64{
 		"gonka1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1": 60,
@@ -467,6 +470,27 @@ func TestChainPhaseGateUsesPreservedSnapshotDuringPoC(t *testing.T) {
 			"gonka1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2": 0,
 		},
 	}, state.weightsByModel)
+}
+
+func TestShouldRefreshPoCPreservedParticipantsOnConfirmationGenerationTransition(t *testing.T) {
+	previous := ChainPhaseSnapshot{
+		EpochPhase:           epochPhaseInference,
+		ConfirmationPoCPhase: confirmationPoCGracePeriod,
+		BlockReason:          "confirmation_poc",
+	}
+	next := ChainPhaseSnapshot{
+		EpochPhase:           epochPhaseInference,
+		ConfirmationPoCPhase: confirmationPoCGeneration,
+		BlockReason:          "confirmation_poc",
+	}
+
+	require.True(t, shouldRefreshPoCPreservedParticipants(previous, next))
+	require.False(t, shouldRefreshPoCPreservedParticipants(next, next))
+	require.True(t, shouldRefreshPoCPreservedParticipants(ChainPhaseSnapshot{}, previous))
+	require.False(t, shouldRefreshPoCPreservedParticipants(previous, ChainPhaseSnapshot{
+		EpochPhase:           epochPhaseInference,
+		ConfirmationPoCPhase: confirmationPoCInactive,
+	}))
 }
 
 func TestChainPhaseGateFallsBackToTimeslotAllocationWhenPreservedSnapshotMissing(t *testing.T) {

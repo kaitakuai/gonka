@@ -142,6 +142,83 @@ func TestSseChunkHasContent(t *testing.T) {
 	}
 }
 
+func TestPhaseTransitionAbortReincludesParticipantAndSkipsSamples(t *testing.T) {
+	setPoCModeForTest(t, pocRequestModeRelaxed)
+
+	env := setupTestProxy(t, 2, nil, true)
+	env.proxy.redundancy.picker.stop()
+	redundancy := env.proxy.redundancy
+	hostIdx := 1
+	participantKey := env.session.HostParticipantKey(hostIdx)
+
+	inf := &inflight{
+		hostIdx:                    hostIdx,
+		hostID:                     env.session.HostLabel(hostIdx),
+		nonce:                      1,
+		escrowID:                   "escrow-test",
+		sendTime:                   time.Now().Add(-time.Second),
+		receiptTime:                time.Now().Add(-900 * time.Millisecond),
+		startedBeforePoCGeneration: true,
+		done:                       make(chan struct{}),
+		receiptCh:                  make(chan struct{}),
+		firstTokenCh:               make(chan struct{}),
+	}
+
+	setPoCPhaseStateFromSnapshot(ChainPhaseSnapshot{
+		EpochPhase:           epochPhaseInference,
+		ConfirmationPoCPhase: confirmationPoCGeneration,
+		BlockReason:          "confirmation_poc",
+	})
+
+	require.True(t, redundancy.markPhaseTransitionAbort(inf))
+	require.True(t, inf.phaseTransitionAborted)
+	require.True(t, inf.excludePairwise)
+
+	tried := map[string]bool{participantKey: true}
+	redundancy.reincludePhaseTransitionAbortParticipant(inf, tried)
+	require.False(t, tried[participantKey])
+
+	redundancy.recordStartedAttemptSamples([]*inflight{inf}, defaultParams(), false)
+	require.Empty(t, redundancy.perf.AllStats())
+}
+
+func TestPhaseTransitionAbortAfterContentSkipsPenaltyButDoesNotRetry(t *testing.T) {
+	setPoCModeForTest(t, pocRequestModeRelaxed)
+
+	env := setupTestProxy(t, 2, nil, true)
+	env.proxy.redundancy.picker.stop()
+	redundancy := env.proxy.redundancy
+
+	inf := &inflight{
+		hostIdx:                    1,
+		hostID:                     env.session.HostLabel(1),
+		nonce:                      1,
+		escrowID:                   "escrow-test",
+		sendTime:                   time.Now().Add(-time.Second),
+		receiptTime:                time.Now().Add(-900 * time.Millisecond),
+		startedBeforePoCGeneration: true,
+		err:                        errSimulatedWinnerTransport,
+		done:                       make(chan struct{}),
+		receiptCh:                  make(chan struct{}),
+		firstTokenCh:               make(chan struct{}),
+	}
+	inf.contentChunks.Store(1)
+
+	setPoCPhaseStateFromSnapshot(ChainPhaseSnapshot{
+		EpochPhase:           epochPhaseInference,
+		ConfirmationPoCPhase: confirmationPoCGeneration,
+		BlockReason:          "confirmation_poc",
+	})
+
+	require.True(t, redundancy.markPhaseTransitionAbort(inf))
+	require.True(t, inf.phaseTransitionAborted)
+	require.True(t, inf.excludePairwise)
+	require.False(t, phaseTransitionAbortRetryable(inf))
+
+	redundancy.recordStalledWinnerFailureOnce(inf, defaultParams())
+	require.Empty(t, redundancy.perf.AllStats())
+}
+
 // TestSseChunkContentSource locks in the forensic classification used for
 // short-content winner diagnostics. The label in the log identifies which
 // field carried the first content event; `""` means none of the accepted

@@ -1221,7 +1221,7 @@ func TestRunInference_RelaxedPoCSilentlyBurnsNonceForUnresponsiveHost(t *testing
 	// Preserve only host 0. Host 1 is PoC-required: real requests
 	// must skip it, AND in the new uniform-silent-probe regime the
 	// picker must NOT send any probe traffic to it either.
-	setPoCPreservedParticipants([]string{env.session.HostParticipantKey(0)})
+	setPoCPreservedParticipantsByModel(map[string][]string{"llama": []string{env.session.HostParticipantKey(0)}})
 
 	var buf bytes.Buffer
 	err := env.proxy.redundancy.RunInference(context.Background(), defaultParams(), &buf)
@@ -1257,7 +1257,7 @@ func TestRunInference_RelaxedPoCImmediatelyEscalatesProbeChainToPreservedHost(t 
 	// Preserve only host 0 so nonces 1 and 2 are silently burned past
 	// the PoC-required hosts and the real request lands on host 0
 	// when nonce 3 binds to it.
-	setPoCPreservedParticipants([]string{env.session.HostParticipantKey(0)})
+	setPoCPreservedParticipantsByModel(map[string][]string{"llama": []string{env.session.HostParticipantKey(0)}})
 
 	var buf bytes.Buffer
 	err := env.proxy.redundancy.RunInference(context.Background(), defaultParams(), &buf)
@@ -1295,7 +1295,7 @@ func TestRunInference_RelaxedPoCProbeOnlyRequestsFailAndSkipPerfRecording(t *tes
 	})
 
 	// Empty preserved set means every host is treated as a probe.
-	setPoCPreservedParticipants([]string{})
+	setPoCPreservedParticipantsByModel(map[string][]string{"llama": []string{}})
 
 	// New design: real requests are NEVER dispatched to PoC-required
 	// hosts. With every host PoC-required, the picker's exhaustion

@@ -314,7 +314,7 @@ func TestPicker_PoCFlipDropsQueuedRequest(t *testing.T) {
 	// Enable relaxed PoC so shouldUseProbeForParticipant can return
 	// true for unpreserved participants.
 	setPoCModeForTest(t, pocRequestModeRelaxed)
-	t.Cleanup(func() { setPoCPreservedParticipants(nil) })
+	t.Cleanup(func() { setPoCPreservedParticipantsByModel(nil) })
 
 	env := setupTestProxy(t, 3, nil, true)
 	env.proxy.phaseGate = &ChainPhaseGate{}
@@ -325,7 +325,7 @@ func TestPicker_PoCFlipDropsQueuedRequest(t *testing.T) {
 	})
 	// Initially: every participant preserved (no host is PoC).
 	keys := env.session.ParticipantKeys()
-	setPoCPreservedParticipants(keys)
+	setPoCPreservedParticipantsByModel(map[string][]string{"llama": keys})
 	env.proxy.redundancy.picker.stop()
 
 	ghost := &fakeGhost{}
@@ -352,7 +352,7 @@ func TestPicker_PoCFlipDropsQueuedRequest(t *testing.T) {
 			remaining = append(remaining, k)
 		}
 	}
-	setPoCPreservedParticipants(remaining)
+	setPoCPreservedParticipantsByModel(map[string][]string{"llama": remaining})
 	p.wakeUp() // force re-evaluation
 
 	res := waitReply(t, req, 2*time.Second)
@@ -497,7 +497,7 @@ func TestPicker_ThrottledHost_BurnsGhostNoSend(t *testing.T) {
 // PoC until the phase ends).
 func TestPicker_PoCWinsOverThrottle(t *testing.T) {
 	setPoCModeForTest(t, pocRequestModeRelaxed)
-	t.Cleanup(func() { setPoCPreservedParticipants(nil) })
+	t.Cleanup(func() { setPoCPreservedParticipantsByModel(nil) })
 
 	env := setupTestProxy(t, 3, nil, true)
 	env.proxy.phaseGate = &ChainPhaseGate{}
@@ -515,7 +515,7 @@ func TestPicker_PoCWinsOverThrottle(t *testing.T) {
 			preserved = append(preserved, k)
 		}
 	}
-	setPoCPreservedParticipants(preserved)
+	setPoCPreservedParticipantsByModel(map[string][]string{"llama": preserved})
 	env.proxy.redundancy.picker.stop()
 
 	// Also mark slot 1 as throttled. Both gates would fire; the
@@ -539,6 +539,48 @@ func TestPicker_PoCWinsOverThrottle(t *testing.T) {
 		"PoC must take precedence over throttle so the log label reflects the phase-level cause")
 	require.Equal(t, 0, ghost.kindCount(ghostThrottled),
 		"throttled branch must NOT fire when PoC already fired for this host")
+}
+
+func TestPicker_PoCFilteringIsModelAware(t *testing.T) {
+	setPoCModeForTest(t, pocRequestModeRelaxed)
+	t.Cleanup(func() { setPoCPreservedParticipantsByModel(nil) })
+
+	env := setupTestProxy(t, 3, nil, true)
+	env.proxy.phaseGate = &ChainPhaseGate{}
+	env.proxy.phaseGate.storeSnapshot(ChainPhaseSnapshot{
+		EpochPhase:      epochPhasePoCGenerate,
+		RequestsBlocked: false,
+		BlockReason:     "poc",
+	})
+	keys := env.session.ParticipantKeys()
+	host1Key := env.session.HostParticipantKey(1)
+	var llamaPreserved []string
+	for _, key := range keys {
+		if key != host1Key {
+			llamaPreserved = append(llamaPreserved, key)
+		}
+	}
+	setPoCPreservedParticipantsByModel(map[string][]string{
+		"llama":       llamaPreserved,
+		"other-model": keys,
+	})
+	env.proxy.redundancy.picker.stop()
+
+	ghost := &fakeGhost{}
+	p := newSessionPicker(env.session, "llama", ghost.dispatch, nil)
+	p.start()
+	t.Cleanup(p.stop)
+
+	req := defaultPickerRequest()
+	p.submit(req)
+
+	res := waitReply(t, req, 2*time.Second)
+	require.NoError(t, res.err)
+	require.False(t, res.isProbe)
+	require.NotEqual(t, 1, res.prepared.HostIdx(),
+		"host 1 is preserved for another model, but not for llama")
+	require.GreaterOrEqual(t, ghost.kindCount(ghostPoC), 1,
+		"first llama nonce on host 1 should burn a PoC ghost")
 }
 
 // TestPicker_NilThrottleChecker_NoOp: a nil throttleChecker is the
