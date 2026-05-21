@@ -43,7 +43,7 @@ func defaultChatMessageProcessor() ChatMessageProcessor {
 		{Role: MessageRoleSystem, DisallowedFields: []string{"tool_calls", "tool_call_id", "function_call"}, ContentRule: MessageContentRequired},
 		{Role: MessageRoleUser, DisallowedFields: []string{"tool_calls", "tool_call_id", "function_call"}, ContentRule: MessageContentRequired},
 		{Role: MessageRoleAssistant, DisallowedFields: []string{"tool_call_id"}, ContentRule: MessageContentOptionalWithCalls},
-		{Role: MessageRoleTool, DisallowedFields: []string{"tool_calls", "function_call", "name"}, RequireToolCallID: true, ContentRule: MessageContentRequired},
+		{Role: MessageRoleTool, DisallowedFields: []string{"tool_calls", "function_call"}, RequireToolCallID: true, ContentRule: MessageContentRequired},
 		{Role: MessageRoleFunction, DisallowedFields: []string{"tool_calls", "tool_call_id", "function_call"}, RequireName: true, ContentRule: MessageContentRequired},
 	}
 	byRole := make(map[string]MessageRolePolicy, len(policies))
@@ -53,22 +53,6 @@ func defaultChatMessageProcessor() ChatMessageProcessor {
 	return ChatMessageProcessor{roles: byRole}
 }
 
-// normalizeContent performs compatibility rewrites that make legacy/client-variant payloads pass the stricter validator below.
-func normalizeContent(body []byte) ([]byte, error) {
-	document, err := decodeChatRequestDocument(body)
-	if err != nil {
-		return nil, err
-	}
-	if err := defaultMessageProcessor.NormalizeDocument(document); err != nil {
-		return nil, err
-	}
-	updatedBody, err := document.Marshal()
-	if err != nil {
-		return nil, err
-	}
-	return updatedBody, nil
-}
-
 // NormalizeDocument only fixes shapes we intentionally accept, for example empty tool content or text-part arrays.
 func (p ChatMessageProcessor) NormalizeDocument(document *ChatRequestDocument) error {
 	messages, ok := document.Array("messages")
@@ -76,6 +60,14 @@ func (p ChatMessageProcessor) NormalizeDocument(document *ChatRequestDocument) e
 		return nil
 	}
 	changed := false
+	if filtered, dropped := p.dropOrphanToolMessages(messages); dropped {
+		messages = filtered
+		changed = true
+	}
+	if filtered, dropped := p.dropEmptyAssistantTurns(messages); dropped {
+		messages = filtered
+		changed = true
+	}
 	for index, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
 		if !ok {
@@ -86,6 +78,9 @@ func (p ChatMessageProcessor) NormalizeDocument(document *ChatRequestDocument) e
 			changed = true
 		}
 		if p.normalizeEmptyContent(message, role) {
+			changed = true
+		}
+		if p.normalizeStripLegacyToolName(message, role) {
 			changed = true
 		}
 		content, exists := message["content"]
@@ -111,6 +106,96 @@ func (p ChatMessageProcessor) NormalizeDocument(document *ChatRequestDocument) e
 	return nil
 }
 
+// Drops role:"tool" entries whose tool_call_id has no matching prior assistant.tool_call.
+// Mirrors ValidateDocument's pending-set accounting so survivors pass the strict check.
+func (p ChatMessageProcessor) dropOrphanToolMessages(messages []any) ([]any, bool) {
+	pending := map[string]struct{}{}
+	filtered := make([]any, 0, len(messages))
+	dropped := false
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		role, _ := msg["role"].(string)
+		switch role {
+		case string(MessageRoleAssistant):
+			if calls, ok := msg["tool_calls"].([]any); ok {
+				for _, rawCall := range calls {
+					call, ok := rawCall.(map[string]any)
+					if !ok {
+						continue
+					}
+					if id, ok := call["id"].(string); ok && id != "" {
+						pending[id] = struct{}{}
+					}
+				}
+			}
+		case string(MessageRoleTool):
+			if id, ok := msg["tool_call_id"].(string); ok && id != "" {
+				if _, matched := pending[id]; !matched {
+					dropped = true
+					continue
+				}
+				delete(pending, id)
+			}
+		}
+		filtered = append(filtered, raw)
+	}
+	return filtered, dropped
+}
+
+// Drops role:"assistant" messages with no content and no tool_calls/function_call —
+// informationless placeholders left by session-resume serializers.
+func (p ChatMessageProcessor) dropEmptyAssistantTurns(messages []any) ([]any, bool) {
+	filtered := make([]any, 0, len(messages))
+	dropped := false
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		if role, _ := msg["role"].(string); role == string(MessageRoleAssistant) && isAssistantTurnEmpty(msg) {
+			dropped = true
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	return filtered, dropped
+}
+
+func isAssistantTurnEmpty(msg map[string]any) bool {
+	if raw, exists := msg["tool_calls"]; exists && raw != nil {
+		if calls, ok := raw.([]any); ok && len(calls) > 0 {
+			return false
+		}
+	}
+	if raw, exists := msg["function_call"]; exists && raw != nil {
+		if fc, ok := raw.(map[string]any); ok && len(fc) > 0 {
+			return false
+		}
+	}
+	content, exists := msg["content"]
+	if !exists || content == nil {
+		return true
+	}
+	return isEmptyContent(content)
+}
+
+// Strips legacy `name` from role:"tool" messages (artifact of the old role:"function" API).
+func (p ChatMessageProcessor) normalizeStripLegacyToolName(message map[string]any, role string) bool {
+	if role != string(MessageRoleTool) {
+		return false
+	}
+	if _, exists := message["name"]; !exists {
+		return false
+	}
+	delete(message, "name")
+	return true
+}
+
 func (p ChatMessageProcessor) normalizeMissingContent(message map[string]any, role string) bool {
 	if _, exists := message["content"]; exists {
 		return false
@@ -122,7 +207,8 @@ func (p ChatMessageProcessor) normalizeMissingContent(message map[string]any, ro
 	return false
 }
 
-// Empty assistant content is allowed only when a call payload is present; empty tool content is normalized to a sentinel string.
+// Empty assistant content (string/array/null) is allowed only when a call payload is present;
+// empty tool content is normalized to a sentinel string.
 func (p ChatMessageProcessor) normalizeEmptyContent(message map[string]any, role string) bool {
 	content, exists := message["content"]
 	if !exists {
@@ -135,8 +221,7 @@ func (p ChatMessageProcessor) normalizeEmptyContent(message map[string]any, role
 		}
 		return false
 	}
-	stringContent, ok := content.(string)
-	if !ok || strings.TrimSpace(stringContent) != "" {
+	if !isEmptyContent(content) {
 		return false
 	}
 	switch role {
@@ -154,6 +239,17 @@ func (p ChatMessageProcessor) normalizeEmptyContent(message map[string]any, role
 		return true
 	}
 	return false
+}
+
+func isEmptyContent(content any) bool {
+	switch v := content.(type) {
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []any:
+		return len(v) == 0
+	default:
+		return false
+	}
 }
 
 // ValidateDocument enforces the OpenAI-compatible message contract and makes sure tool responses match earlier assistant tool_calls.
@@ -237,6 +333,11 @@ func validateToolCallsField(message map[string]any, messageIndex int) ([]string,
 	if !exists {
 		return nil, false, nil
 	}
+	// Treat explicit null as absent (some SDKs serialize empty slots that way).
+	if rawToolCalls == nil {
+		delete(message, "tool_calls")
+		return nil, false, nil
+	}
 	toolCalls, ok := rawToolCalls.([]any)
 	if !ok {
 		return nil, true, badChatRequest("messages[%d].tool_calls must be an array", messageIndex)
@@ -284,6 +385,10 @@ func validateToolCallsField(message map[string]any, messageIndex int) ([]string,
 func validateFunctionCallField(message map[string]any, messageIndex int) (bool, error) {
 	rawFunctionCall, exists := message["function_call"]
 	if !exists {
+		return false, nil
+	}
+	if rawFunctionCall == nil {
+		delete(message, "function_call")
 		return false, nil
 	}
 	functionCall, ok := rawFunctionCall.(map[string]any)

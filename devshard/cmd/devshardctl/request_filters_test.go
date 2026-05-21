@@ -786,8 +786,8 @@ func TestNormalizeChatRequestStripsOutOfRangeLogitBias(t *testing.T) {
 	require.NotContains(t, raw, "logit_bias")
 }
 
-func TestNormalizeContentRejectsInvalidJSON(t *testing.T) {
-	_, err := normalizeContent([]byte(`{"messages":[`))
+func TestNormalizeChatRequestRejectsInvalidJSON(t *testing.T) {
+	_, _, err := normalizeChatRequest([]byte(`{"messages":[`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "parse request")
 }
@@ -1289,6 +1289,465 @@ func TestPrepareChatRequestBodyNormalizesEmptyToolContent(t *testing.T) {
 			require.Equal(t, emptyToolResultContent, tool["content"])
 		})
 	}
+}
+
+// Explicit JSON `null` for `tool_calls` / `function_call` is treated as field-absent.
+// Several OpenAI-SDK serializers emit null for empty slots; rejecting was a false-positive.
+func TestNormalizeChatRequestTreatsNullToolCallsAndFunctionCallAsAbsent(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "tool_calls null on assistant",
+			body: `{"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"hello","tool_calls":null}
+			]}`,
+		},
+		{
+			name: "function_call null on assistant",
+			body: `{"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"hello","function_call":null}
+			]}`,
+		},
+		{
+			name: "both null on assistant",
+			body: `{"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"hello","tool_calls":null,"function_call":null}
+			]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			messages := raw["messages"].([]any)
+			assistant := messages[1].(map[string]any)
+			require.NotContains(t, assistant, "tool_calls")
+			require.NotContains(t, assistant, "function_call")
+		})
+	}
+}
+
+// `name` on role:"tool" messages is a legacy artifact of the role:"function" API and many
+// SDKs still emit it; gateway silently strips so the request reaches vLLM in the modern
+// shape without surfacing a 400 to the client.
+func TestNormalizeChatRequestStripsLegacyNameFromToolMessages(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"what is 2+2?"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"calc","arguments":"{\"a\":2,\"b\":2}"}}]},
+		{"role":"tool","name":"calc","content":"4","tool_call_id":"call_1"}
+	]}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	messages := raw["messages"].([]any)
+	tool := messages[2].(map[string]any)
+	require.NotContains(t, tool, "name")
+	require.Equal(t, "4", tool["content"])
+	require.Equal(t, "call_1", tool["tool_call_id"])
+}
+
+// Lock-in: removing the outer `normalizeContent` collapsed two code paths into one. The
+// test helper (normalizeChatRequest) and the HTTP-boundary entrypoint (prepareChatRequestBody)
+// must produce byte-identical output for every shape the message normalizer touches —
+// otherwise we re-introduce the class of bugs "tests pass, production rejects".
+func TestNormalizeChatRequestAndPrepareChatRequestBodyAgreeOnMessageShapes(t *testing.T) {
+	bodies := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "explicit-null tool_calls and function_call",
+			body: `{"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":"hello","tool_calls":null,"function_call":null}
+			]}`,
+		},
+		{
+			name: "legacy name on tool role",
+			body: `{"messages":[
+				{"role":"user","content":"q"},
+				{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]},
+				{"role":"tool","name":"calc","content":"42","tool_call_id":"c1"}
+			]}`,
+		},
+		{
+			name: "typed text content parts flattened",
+			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"text","text":"world"}]}]}`,
+		},
+		{
+			name: "empty tool content normalized to sentinel",
+			body: `{"messages":[
+				{"role":"user","content":"q"},
+				{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+				{"role":"tool","content":"","tool_call_id":"c1"}
+			]}`,
+		},
+	}
+	for _, tc := range bodies {
+		t.Run(tc.name, func(t *testing.T) {
+			pipelineOut, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			boundaryOut, _, err := prepareChatRequestBody(req)
+			require.NoError(t, err)
+
+			var pipelineMessages, boundaryMessages any
+			var pipelineRaw, boundaryRaw map[string]any
+			require.NoError(t, json.Unmarshal(pipelineOut, &pipelineRaw))
+			require.NoError(t, json.Unmarshal(boundaryOut, &boundaryRaw))
+			pipelineMessages = pipelineRaw["messages"]
+			boundaryMessages = boundaryRaw["messages"]
+			require.Equal(t, pipelineMessages, boundaryMessages,
+				"normalizeChatRequest and prepareChatRequestBody must agree on the messages shape")
+		})
+	}
+}
+
+// Empty-array assistant content is a legitimate "only a tool call, no prose" payload that
+// some SDK bridges (Anthropic↔OpenAI in particular) emit instead of null / "". Treat it
+// the same as null when a call payload is present; otherwise the validator still rejects.
+// Captured-requests April 2026 batch: req-1779259426225387173-15356.
+func TestNormalizeChatRequestNormalizesEmptyArrayAssistantContentWithToolCalls(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"explore the codebase"},
+		{"role":"assistant","content":[],"tool_calls":[{"id":"c1","type":"function","function":{"name":"Task","arguments":"{\"prompt\":\"x\"}"}}]}
+	]}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	messages := raw["messages"].([]any)
+	assistant := messages[1].(map[string]any)
+	require.Contains(t, assistant, "content")
+	require.Nil(t, assistant["content"], "empty-array content should be normalized to nil for tool-call-only assistant turn")
+	require.Contains(t, assistant, "tool_calls")
+}
+
+func TestNormalizeChatRequestNormalizesEmptyArrayContentForToolRole(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+		{"role":"tool","content":[],"tool_call_id":"c1"}
+	]}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	messages := raw["messages"].([]any)
+	tool := messages[2].(map[string]any)
+	require.Equal(t, emptyToolResultContent, tool["content"])
+}
+
+// Empty-array content on an assistant with NO tool_calls / function_call is silently
+// dropped by the empty-assistant-turn normalizer (see TestNormalizeChatRequestDropsEmptyAssistantTurns
+// for the full coverage). This used to be a hard rejection; we relaxed it to match the
+// lenient policy for session-resume artifacts.
+func TestNormalizeChatRequestDropsEmptyArrayContentOnPureAssistant(t *testing.T) {
+	body := []byte(`{"messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":[]}
+	]}`)
+	out, _, err := normalizeChatRequest(body)
+	require.NoError(t, err)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(out, &raw))
+	messages := raw["messages"].([]any)
+	require.Len(t, messages, 1)
+	require.Equal(t, "user", messages[0].(map[string]any)["role"])
+}
+
+// Orphan tool messages (tool_call_id with no matching prior assistant.tool_calls.id) are
+// silently dropped. The strict OpenAI-spec rejection killed long agent conversations when
+// client-side history compaction lost part of the assistant.tool_calls fan-out. The
+// surviving (non-orphan) tool responses still pass the linkage check.
+// Captured-requests April 2026 batch: req-1779263614553842074-24798 (and 32 similar).
+func TestNormalizeChatRequestDropsOrphanToolMessages(t *testing.T) {
+	t.Run("single orphan after valid pair", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","content":"valid","tool_call_id":"c1"},
+			{"role":"tool","content":"orphan","tool_call_id":"never_emitted"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 3, "orphan should be dropped, valid pair survives")
+		require.Equal(t, "valid", messages[2].(map[string]any)["content"])
+	})
+
+	t.Run("multiple consecutive orphans dropped", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","content":"r1","tool_call_id":"c1"},
+			{"role":"tool","content":"orphan1","tool_call_id":"missing_a"},
+			{"role":"tool","content":"orphan2","tool_call_id":"missing_b"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 3)
+		require.Equal(t, "r1", messages[2].(map[string]any)["content"])
+	})
+
+	t.Run("orphan before any assistant turn is dropped", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"tool","content":"orphan","tool_call_id":"early"},
+			{"role":"assistant","content":"answer"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 2)
+		require.Equal(t, "user", messages[0].(map[string]any)["role"])
+		require.Equal(t, "assistant", messages[1].(map[string]any)["role"])
+	})
+
+	t.Run("duplicate tool response for same id keeps first, drops second", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","content":"first","tool_call_id":"c1"},
+			{"role":"tool","content":"dup","tool_call_id":"c1"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 3)
+		require.Equal(t, "first", messages[2].(map[string]any)["content"])
+	})
+
+	t.Run("two-of-three fan-out where one tool_call lost on client", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[
+				{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}},
+				{"id":"c2","type":"function","function":{"name":"f","arguments":"{}"}}
+			]},
+			{"role":"tool","content":"r1","tool_call_id":"c1"},
+			{"role":"tool","content":"r2","tool_call_id":"c2"},
+			{"role":"tool","content":"r3-orphan","tool_call_id":"c3_lost"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 4)
+	})
+
+	t.Run("no orphans — pass-through unchanged", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","content":"r1","tool_call_id":"c1"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 3)
+	})
+}
+
+// Empty assistant turns — placeholders left by session-resume frameworks when the prose
+// response between a tool result and the next user turn gets lost — are silently dropped.
+// The literal `{"role":"assistant"}` carries no information for the model.
+// Captured-requests April 2026: req-1779291749005921857-69735 (and 1 sibling).
+func TestNormalizeChatRequestDropsEmptyAssistantTurns(t *testing.T) {
+	t.Run("literal {role:assistant} between tool and user", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","content":"r","tool_call_id":"c1"},
+			{"role":"assistant"},
+			{"role":"user","content":"continue"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 4)
+		require.Equal(t, "tool", messages[2].(map[string]any)["role"])
+		require.Equal(t, "user", messages[3].(map[string]any)["role"])
+	})
+
+	t.Run("assistant with content:null and no calls dropped", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null},
+			{"role":"user","content":"q2"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 2)
+	})
+
+	t.Run("assistant with empty-string content and no calls dropped", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":""},
+			{"role":"user","content":"q2"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 2)
+	})
+
+	t.Run("assistant with empty-array content and no calls dropped", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":[]},
+			{"role":"user","content":"q2"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 2)
+	})
+
+	t.Run("assistant with tool_calls is preserved", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]},
+			{"role":"tool","content":"r","tool_call_id":"c1"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 3, "assistant with tool_calls is meaningful, never dropped")
+	})
+
+	t.Run("assistant with content is preserved", func(t *testing.T) {
+		body := []byte(`{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":"answer"}
+		]}`)
+		out, _, err := normalizeChatRequest(body)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		require.Len(t, messages, 2)
+	})
+}
+
+// `think: bool` is the Ollama-style top-level reasoning flag, used by Cline / Ollama-CLI
+// derived tools that target multiple backends. No vLLM-served model on the gateway
+// today is reasoning-capable, so silent-strip mirrors the treatment of `service_tier`,
+// `store`, and `thinking_config`. Revisit if a reasoning-capable route is added.
+// Captured-requests April 2026: 5 captures from Cline-like clients on Kimi K2.6 / Qwen3.
+func TestNormalizeChatRequestSilentlyStripsThinkParameter(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "think false", body: `{"think":false,"messages":[{"role":"user","content":"hi"}]}`},
+		{name: "think true", body: `{"think":true,"messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := normalizeChatRequest([]byte(tc.body))
+			require.NoError(t, err)
+			var raw map[string]any
+			require.NoError(t, json.Unmarshal(out, &raw))
+			require.NotContains(t, raw, "think")
+		})
+	}
+}
+
+// When a request hits multiple rejection paths at once (unsupported top-level parameter
+// AND malformed message content), the pipeline now surfaces the parameter rejection first
+// (PreValidation runs before NormalizeDocument). Both still produce a 400 — the test pins
+// the *behavior* (one error fires, request is rejected) rather than the exact priority,
+// so a future re-order won't silently break it.
+func TestPrepareChatRequestBodyRejectsCombinationOfUnsupportedFieldAndBadContent(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"unsupported_field": true,
+		"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}]
+	}`))
+	_, _, err := prepareChatRequestBody(req)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, chatRequestErrorStatus(err, http.StatusInternalServerError))
+
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "unsupported_field"):
+		// Current behavior: parameter rules run first in PreValidation, this error wins.
+	case strings.Contains(msg, "image_url"):
+		// Acceptable fallback: a future re-order surfaces the content-shape error first.
+	default:
+		t.Fatalf("expected either unsupported_field or image_url in error, got: %v", err)
+	}
+}
+
+// Coverage at the HTTP boundary for the two recent lenience fixes — same expectations as
+// the test-helper variants above, but exercised through the production code path so a
+// future regression in the pipeline ordering can't silently sneak past.
+func TestPrepareChatRequestBodyAppliesMessageLenienceFixes(t *testing.T) {
+	t.Run("null tool_calls dropped, request accepted", func(t *testing.T) {
+		body := `{"messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"hello","tool_calls":null}
+		]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		out, _, err := prepareChatRequestBody(req)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		assistant := messages[1].(map[string]any)
+		require.NotContains(t, assistant, "tool_calls")
+	})
+
+	t.Run("legacy name stripped from tool message", func(t *testing.T) {
+		body := `{"messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]},
+			{"role":"tool","name":"calc","content":"42","tool_call_id":"c1"}
+		]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		out, _, err := prepareChatRequestBody(req)
+		require.NoError(t, err)
+		var raw map[string]any
+		require.NoError(t, json.Unmarshal(out, &raw))
+		messages := raw["messages"].([]any)
+		tool := messages[2].(map[string]any)
+		require.NotContains(t, tool, "name")
+		require.Equal(t, "42", tool["content"])
+	})
 }
 
 func TestPrepareChatRequestBodyRejectsNonTextContentParts(t *testing.T) {
