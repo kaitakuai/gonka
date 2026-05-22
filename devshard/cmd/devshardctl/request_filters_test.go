@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -2101,60 +2102,32 @@ func TestNormalizeChatRequestThinkingTokenBudgetStrippedForOtherModelsEvenIfClie
 	require.NotContains(t, string(body), `thinking_token_budget`)
 }
 
-// max_tokens on Kimi-K2.6: clamped UP to kimiMaxTokensMin (16) so probes with
-// max_tokens=1 do not collapse into a sole </think> token (which vLLM drops from
-// message.content, presenting as empty content to clients).
-
-func TestNormalizeChatRequestKimiMaxTokensClampedFromBelowForProbe(t *testing.T) {
-	body, req, err := normalizeChatRequestForModel(
-		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":1,"thinking_token_budget":0}`),
-		kimiK26ModelID,
-	)
-	require.NoError(t, err)
-	require.Contains(t, string(body), `"max_tokens":16`)
-	require.EqualValues(t, 16, req.MaxTokens)
+func TestNormalizeChatRequestKimiMaxTokensClampedBelow(t *testing.T) {
+	for _, c := range []struct {
+		in, want uint64
+	}{
+		{1, 16}, {8, 16}, {16, 16}, {100, 100},
+	} {
+		body := fmt.Sprintf(`{"messages":[{"role":"user","content":"x"}],"max_tokens":%d,"thinking_token_budget":0}`, c.in)
+		out, req, err := normalizeChatRequestForModel([]byte(body), kimiK26ModelID)
+		require.NoError(t, err)
+		require.Contains(t, string(out), fmt.Sprintf(`"max_tokens":%d`, c.want))
+		require.Contains(t, string(out), `"thinking_token_budget":0`)
+		require.EqualValues(t, c.want, req.MaxTokens)
+	}
 }
 
-func TestNormalizeChatRequestKimiMaxTokensClampedFromBelowMidRange(t *testing.T) {
-	body, _, err := normalizeChatRequestForModel(
-		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":8}`),
-		kimiK26ModelID,
-	)
-	require.NoError(t, err)
-	require.Contains(t, string(body), `"max_tokens":16`)
-}
-
-func TestNormalizeChatRequestKimiMaxTokensAtFloorUnchanged(t *testing.T) {
-	body, _, err := normalizeChatRequestForModel(
-		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":16}`),
-		kimiK26ModelID,
-	)
-	require.NoError(t, err)
-	require.Contains(t, string(body), `"max_tokens":16`)
-}
-
-func TestNormalizeChatRequestKimiMaxTokensAboveFloorUnchanged(t *testing.T) {
-	body, _, err := normalizeChatRequestForModel(
-		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":100}`),
-		kimiK26ModelID,
-	)
-	require.NoError(t, err)
-	require.Contains(t, string(body), `"max_tokens":100`)
-}
-
-func TestNormalizeChatRequestKimiMaxCompletionTokensClampedFromBelow(t *testing.T) {
+func TestNormalizeChatRequestKimiMaxCompletionTokensClampedBelow(t *testing.T) {
 	body, req, err := normalizeChatRequestForModel(
 		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_completion_tokens":1}`),
 		kimiK26ModelID,
 	)
 	require.NoError(t, err)
 	require.Contains(t, string(body), `"max_completion_tokens":16`)
-	// applyOutputTokenLimits mirrors the value into req.MaxTokens (used downstream by the
-	// thinking_token_budget defaulter) even though only max_completion_tokens is on the wire.
 	require.EqualValues(t, 16, req.MaxTokens)
 }
 
-func TestNormalizeChatRequestKimiMaxTokensNotClampedForOtherModels(t *testing.T) {
+func TestNormalizeChatRequestMaxTokensNotClampedForOtherModels(t *testing.T) {
 	body, req, err := normalizeChatRequestForModel(
 		[]byte(`{"messages":[{"role":"user","content":"x"}],"max_tokens":1}`),
 		"some/other-model",
@@ -2162,20 +2135,6 @@ func TestNormalizeChatRequestKimiMaxTokensNotClampedForOtherModels(t *testing.T)
 	require.NoError(t, err)
 	require.Contains(t, string(body), `"max_tokens":1`)
 	require.EqualValues(t, 1, req.MaxTokens)
-}
-
-// End-to-end probe scenario: original captured payload (max_tokens=1, thinking_token_budget=0)
-// gets bumped so the downstream defaulter sees max_tokens=16 and the resulting request
-// yields non-empty content from Kimi (verified manually on B300 mlnode-020 / vLLM 0.20.0).
-func TestNormalizeChatRequestKimiProbeRequestSurvivesNormalization(t *testing.T) {
-	body, req, err := normalizeChatRequestForModel(
-		[]byte(`{"messages":[{"role":"user","content":"Who are you?"}],"max_tokens":1,"thinking_token_budget":0}`),
-		kimiK26ModelID,
-	)
-	require.NoError(t, err)
-	require.Contains(t, string(body), `"max_tokens":16`)
-	require.Contains(t, string(body), `"thinking_token_budget":0`)
-	require.EqualValues(t, 16, req.MaxTokens)
 }
 
 // safety_identifier is forwarded to Kimi K2.6 (Moonshot consumes it for abuse tracking)

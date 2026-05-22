@@ -763,12 +763,8 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 				}),
 		},
 		[]VLLMParameter{
-			// max_tokens / max_completion_tokens: clamp UP to kimiMaxTokensMin for Kimi-K2.6.
-			// Below the floor the model emits only </think> (a special token vLLM drops from
-			// message.content), so probes with max_tokens=1 produce empty content and get
-			// punished as if the node returned nothing. PreValidation stage so the bump lands
-			// before applyOutputTokenLimits (which only caps down) and before the
-			// thinking_token_budget defaulter (which derives ttb from max_tokens).
+			// PreValidation so the floor lands before applyOutputTokenLimits (caps down) and the
+			// thinking_token_budget defaulter (derives ttb from max_tokens).
 			newParameter("max_tokens").
 				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
 					Models:  []string{kimiK26ModelID},
