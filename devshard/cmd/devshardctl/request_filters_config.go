@@ -68,6 +68,13 @@ const (
 
 	kimiThinkingTokenBudgetDefaultDivisor uint64 = 2
 	kimiThinkingTokenBudgetMax            uint64 = 96_000
+
+	// kimiMaxTokensMin is the lower bound for max_tokens / max_completion_tokens on Kimi-K2.6.
+	// Below this floor, the model emits only the closing </think> special token (which vLLM
+	// drops from message.content), so a probe-style request with max_tokens=1 produces an
+	// empty content field even though completion_tokens=1. Clamping up keeps probes valid
+	// without changing higher-volume client requests.
+	kimiMaxTokensMin uint64 = 16
 )
 
 // Routed model identifiers. The catalog wires per-model behavior keyed on these strings.

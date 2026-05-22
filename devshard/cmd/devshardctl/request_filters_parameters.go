@@ -232,6 +232,23 @@ func (h ClampUintToFieldParameterHandler) Apply(ctx *RequestFilterContext, param
 	return nil
 }
 
+// MinUintParameterHandler clamps a uint parameter UP to Min when the value is present
+// and below the floor. Pass-through when the field is absent or already >= Min.
+type MinUintParameterHandler struct {
+	Min uint64
+}
+
+func (h MinUintParameterHandler) Apply(ctx *RequestFilterContext, parameter VLLMParameter) error {
+	value, ok := numericJSONValueAsUint64FromDocument(&ctx.Document, parameter.Name)
+	if !ok {
+		return nil
+	}
+	if value < h.Min {
+		ctx.Document.Set(parameter.Name, h.Min)
+	}
+	return nil
+}
+
 // ValidateUintParameterHandler rejects the request if the field is present but its value
 // cannot be parsed as a non-negative integer that fits in uint64. Pass-through when the
 // field is absent. Used for fields like `seed` where vLLM expects a uint64 and we want to
@@ -745,11 +762,27 @@ func defaultVLLMParameterCatalog() VLLMParameterCatalog {
 					UnmatchedHandler: StripParameterHandler{},
 				}),
 		},
+		[]VLLMParameter{
+			// max_tokens / max_completion_tokens: clamp UP to kimiMaxTokensMin for Kimi-K2.6.
+			// Below the floor the model emits only </think> (a special token vLLM drops from
+			// message.content), so probes with max_tokens=1 produce empty content and get
+			// punished as if the node returned nothing. PreValidation stage so the bump lands
+			// before applyOutputTokenLimits (which only caps down) and before the
+			// thinking_token_budget defaulter (which derives ttb from max_tokens).
+			newParameter("max_tokens").
+				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
+					Models:  []string{kimiK26ModelID},
+					Handler: MinUintParameterHandler{Min: kimiMaxTokensMin},
+				}),
+			newParameter("max_completion_tokens").
+				withRule(RequestFilterStagePreValidation, ModelScopedParameterHandler{
+					Models:  []string{kimiK26ModelID},
+					Handler: MinUintParameterHandler{Min: kimiMaxTokensMin},
+				}),
+		},
 		newParameters([]string{
 			"model",
 			"stream",
-			"max_tokens",
-			"max_completion_tokens",
 			"skip_special_tokens",
 			"detokenize",
 			"parallel_tool_calls",
