@@ -38,6 +38,7 @@ define DOCKER_BUILD
 	@echo "    	GOARCH: $(GOARCH)"
 	@$(DOCKER_BUILD_PREFIX) \
 		--platform $(PLATFORM) \
+		--build-arg LDFLAGS='$(ldflags)' \
 		--build-arg GOOS=$(GOOS) \
 		--build-arg GOARCH=$(GOARCH) \
 		--build-arg BLST_PORTABLE=$(BLST_PORTABLE) \
@@ -54,6 +55,7 @@ define DOCKER_BUILD_UPGRADE
 	@echo "    	GOARCH: $(GOARCH)"
 	@$(DOCKER_BUILD_UPGRADE_PREFIX) \
 		--platform $(PLATFORM) \
+		--build-arg LDFLAGS='$(ldflags)' \
 		--build-arg GOOS=$(GOOS) \
 		--build-arg GOARCH=$(GOARCH) \
 		--build-arg DEVSHARD_VERSION=$(DEVSHARD_VERSION) \
@@ -83,11 +85,14 @@ build: download-linux-deps
 		CGO_LDFLAGS="-L$(PWD)/build/deps -lwasmvm_muslc -lm" \
 		go build $(BUILD_FLAGS) -tags muslc -o ./build/dapi
 
+NATIVE_ARCH := $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+DOCKER_GOARCH ?= $(NATIVE_ARCH)
+
 build-docker:
 	rm -rf build/
-	$(eval PLATFORM=linux/amd64)
+	$(eval PLATFORM=linux/$(DOCKER_GOARCH))
 	$(eval GOOS=linux)
-	$(eval GOARCH=amd64)
+	$(eval GOARCH=$(DOCKER_GOARCH))
 	$(eval DOCKER_FILE=Dockerfile)
 	$(eval DOCKER_TAG=ghcr.io/product-science/api:$(VERSION))
 	$(DOCKER_BUILD)

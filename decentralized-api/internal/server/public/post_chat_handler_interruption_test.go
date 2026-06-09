@@ -18,6 +18,7 @@ import (
 	"decentralized-api/apiconfig"
 	"decentralized-api/broker"
 	"decentralized-api/chainphase"
+	"decentralized-api/completionapi"
 	"decentralized-api/cosmosclient"
 	"decentralized-api/mlnodeclient"
 	"decentralized-api/utils"
@@ -532,6 +533,56 @@ func setupInterruptionTestWithMLServer(t *testing.T, mlBehavior *mockMLNodeBehav
 	inferenceUpCmd := broker.NewInferenceUpAllCommand()
 	err = suite.nodeBroker.QueueMessage(inferenceUpCmd)
 	require.NoError(t, err)
+	<-inferenceUpCmd.Response
+
+	waitForStableInferenceNode := func() bool {
+		nodes, nodesErr := suite.nodeBroker.GetNodes()
+		require.NoError(t, nodesErr)
+		for _, n := range nodes {
+			if n.Node.Id == nodeConfig.Id &&
+				n.State.IntendedStatus == types.HardwareNodeStatus_INFERENCE &&
+				n.State.CurrentStatus == types.HardwareNodeStatus_INFERENCE &&
+				n.State.ReconcileInfo == nil {
+				return true
+			}
+		}
+		return false
+	}
+
+	nodeReady := false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if waitForStableInferenceNode() {
+			nodeReady = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !nodeReady {
+		setStatusCommand := broker.NewSetNodesActualStatusCommand(
+			[]broker.StatusUpdate{
+				{
+					NodeId:     nodeConfig.Id,
+					PrevStatus: types.HardwareNodeStatus_UNKNOWN,
+					NewStatus:  types.HardwareNodeStatus_INFERENCE,
+					Timestamp:  time.Now(),
+				},
+			},
+		)
+		err = suite.nodeBroker.QueueMessage(setStatusCommand)
+		require.NoError(t, err)
+		<-setStatusCommand.Response
+
+		deadline = time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if waitForStableInferenceNode() {
+				nodeReady = true
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	require.True(t, nodeReady, "node did not reach stable INFERENCE status before test start")
 
 	// 7. Create the public server
 	payloadStorage := newMockPayloadStorage()
@@ -559,6 +610,10 @@ func (s *interruptionTestSuite) createSignedExecutorRequest(inferenceId string, 
 		"stream":   stream,
 	}
 	bodyBytes, _ := json.Marshal(body)
+	modifiedRequest, err := completionapi.ModifyRequestBodyWithLogprobsMode(bodyBytes, 12345, types.DefaultLogprobsMode)
+	require.NoError(s.t, err)
+	modifiedPromptHash, _, err := getModifiedPromptHash(modifiedRequest.NewBody)
+	require.NoError(s.t, err)
 
 	timestamp := time.Now().UnixNano()
 	// Use the address from the test suite's generated keyring
@@ -577,7 +632,7 @@ func (s *interruptionTestSuite) createSignedExecutorRequest(inferenceId string, 
 
 	// TA signs: prompt_hash + timestamp + ta_address + executor_address
 	taComponents := calculations.SignatureComponents{
-		Payload:         originalPromptHash,
+		Payload:         modifiedPromptHash,
 		Timestamp:       timestamp,
 		TransferAddress: transferAddress,
 		ExecutorAddress: executorAddress,
@@ -593,7 +648,7 @@ func (s *interruptionTestSuite) createSignedExecutorRequest(inferenceId string, 
 	req.Header.Set("X-Transfer-Address", transferAddress)
 	req.Header.Set("X-Requester-Address", "test-requester-address")
 	req.Header.Set("X-TA-Signature", taSignature)
-	// Don't set X-Prompt-Hash - executor computes its own from modified body
+	req.Header.Set(utils.XPromptHashHeader, modifiedPromptHash)
 
 	return req
 }
@@ -858,7 +913,6 @@ func TestInterruption_ClientDisconnect_StreamingComplete_VerifyFinishInference(t
 	// What happens: MLNode finishes, Executor has full response, but write to TA/Client fails
 	//
 	// EXPECTED: FinishInference SHOULD be called (work was completed)
-	// QUESTION: Is it actually called?
 
 	chunks := generateStreamingChunks("inf-cd1", "test-model", 5)
 
@@ -885,14 +939,10 @@ func TestInterruption_ClientDisconnect_StreamingComplete_VerifyFinishInference(t
 	t.Logf("CLIENT_DISCONNECT_STREAM RESULT: FinishInference calls count = %d", len(calls))
 	t.Logf("CLIENT_DISCONNECT_STREAM: Written bytes before disconnect = %d", disconnectWriter.writtenBytes)
 
-	if len(calls) > 0 {
-		t.Logf("CLIENT_DISCONNECT_STREAM: FinishInference WAS called (promptTokens=%d, completionTokens=%d)",
-			calls[0].PromptTokenCount, calls[0].CompletionTokenCount)
-		t.Logf("CLIENT_DISCONNECT_STREAM: GOOD - Executor recorded the inference despite client disconnect")
-	} else {
-		t.Logf("CLIENT_DISCONNECT_STREAM: FinishInference was NOT called")
-		t.Logf("CLIENT_DISCONNECT_STREAM: BUG! Executor did NOT record inference when client disconnected!")
-	}
+	require.Len(t, calls, 1, "executor should record FinishInference from partial response data after client disconnect")
+	require.Equal(t, "inf-cd1", calls[0].InferenceId)
+	require.Equal(t, uint64(1), calls[0].CompletionTokenCount)
+	require.NotEmpty(t, calls[0].ResponseHash)
 }
 
 func TestInterruption_ClientDisconnect_JSONComplete_VerifyFinishInference(t *testing.T) {
