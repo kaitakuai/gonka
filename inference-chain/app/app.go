@@ -287,6 +287,15 @@ func New(
 		panic(err)
 	}
 
+	app.CollateralKeeper.SetRequiredCollateralProvider(app.InferenceKeeper)
+	app.CollateralKeeper.SetMaintenanceChecker(&app.InferenceKeeper)
+
+	// Wire maintenance-aware liveness exemption into slashing keeper.
+	// The adapter bridges inference keeper's AccAddress-based maintenance state
+	// to the slashing keeper's ConsAddress-based liveness checks.
+	maintenanceAdapter := NewMaintenanceSlashingAdapter(&app.InferenceKeeper)
+	app.SlashingKeeper.SetMaintenanceChecker(maintenanceAdapter)
+
 	app.App = appBuilder.Build(db, traceStore, baseAppOptions...)
 
 	// SendRestriction configuration is handled automatically through dependency injection
@@ -295,6 +304,7 @@ func New(
 
 	// register legacy modules
 	nodeConfig := app.registerLegacyModules(appOpts, wasmOpts)
+	app.InferenceKeeper.SetWasmKeeperGetter(app.GetWasmKeeper)
 
 	// register streaming services
 	if err := app.RegisterStreamingServices(appOpts, app.kvStoreKeys()); err != nil {
@@ -349,6 +359,12 @@ func New(
 			return nil, fmt.Errorf("failed to initialize pinned codes: %w", err)
 		}
 		ctx.Logger().Info("WASM keeper check: pinned codes enumerated successfully. Keeper is functional.")
+
+		if isTestnet, _ := appOpts.Get(server.KeyIsTestnet).(bool); isTestnet {
+			if err := InitInferenceAppForTestnet(app, appOpts); err != nil {
+				return nil, fmt.Errorf("init for testnet: %w", err)
+			}
+		}
 	}
 
 	return app, nil

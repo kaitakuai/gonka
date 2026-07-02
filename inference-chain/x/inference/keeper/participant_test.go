@@ -145,7 +145,7 @@ func TestUpdateParticipantStatus_TransitionToInvalid(t *testing.T) {
 
 	// Expect slashing to be called
 	mocks.CollateralKeeper.EXPECT().
-		Slash(ctx, gomock.Any(), gomock.Any(), types.SlashReasonInvalidation).
+		Slash(ctx, gomock.Any(), gomock.Any(), types.SlashReasonInvalidation, gomock.Any()).
 		Return(sdk.Coin{}, nil).
 		Times(1)
 
@@ -165,6 +165,7 @@ func TestUpdateParticipantStatus_TransitionToInvalid(t *testing.T) {
 
 	// Status should transition to INVALID
 	require.Equal(t, types.ParticipantStatus_INVALID, participant.Status)
+	require.Equal(t, int64(0), participant.ConsecutiveInvalidInferences)
 	// EpochsCompleted should be reduced by InvalidReputationPreserve (10 * 0.5 = 5)
 	require.Equal(t, uint32(5), participant.EpochsCompleted)
 }
@@ -193,7 +194,7 @@ func TestUpdateParticipantStatus_AlreadyInvalid(t *testing.T) {
 
 	// No slashing should be called (already INVALID)
 	mocks.CollateralKeeper.EXPECT().
-		Slash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Slash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(0)
 
 	// Call UpdateParticipantStatus
@@ -231,7 +232,7 @@ func TestUpdateParticipantStatus_AlreadyInactive(t *testing.T) {
 
 	// No slashing should be called (already INACTIVE)
 	mocks.CollateralKeeper.EXPECT().
-		Slash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Slash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(0)
 
 	// Call UpdateParticipantStatus
@@ -281,7 +282,7 @@ func TestInvalidParticipant_ReputationReduced(t *testing.T) {
 
 	// Mock slashing
 	mocks.CollateralKeeper.EXPECT().
-		Slash(ctx, gomock.Any(), gomock.Any(), types.SlashReasonInvalidation).
+		Slash(ctx, gomock.Any(), gomock.Any(), types.SlashReasonInvalidation, gomock.Any()).
 		Return(sdk.Coin{}, nil).
 		Times(1)
 
@@ -342,7 +343,7 @@ func TestParticipantStatusFlow_ActiveToInvalid(t *testing.T) {
 
 	// Mock slashing
 	mocks.CollateralKeeper.EXPECT().
-		Slash(ctx, gomock.Any(), gomock.Any(), types.SlashReasonInvalidation).
+		Slash(ctx, gomock.Any(), gomock.Any(), types.SlashReasonInvalidation, gomock.Any()).
 		Return(sdk.Coin{}, nil).
 		Times(1)
 
@@ -364,6 +365,7 @@ func TestParticipantStatusFlow_ActiveToInvalid(t *testing.T) {
 	saved, found := k.GetParticipant(ctx, participant.Address)
 	require.True(t, found)
 	require.Equal(t, types.ParticipantStatus_INVALID, saved.Status)
+	require.Equal(t, int64(0), saved.ConsecutiveInvalidInferences)
 	require.Equal(t, uint32(15), saved.EpochsCompleted) // 30 * 0.5 = 15
 }
 
@@ -393,7 +395,7 @@ func TestParticipantStatusFlow_InactiveStaysInactive(t *testing.T) {
 
 	// No slashing expected (already INACTIVE)
 	mocks.CollateralKeeper.EXPECT().
-		Slash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Slash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(0)
 
 	// Save participant

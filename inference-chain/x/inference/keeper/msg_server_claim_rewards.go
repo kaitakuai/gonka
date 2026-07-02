@@ -20,7 +20,13 @@ import (
 const maxInferenceSampleSize = 10000
 
 func (k msgServer) ClaimRewards(goCtx context.Context, msg *types.MsgClaimRewards) (*types.MsgClaimRewardsResponse, error) {
-	ctx := sdk.UnwrapSDKContext(goCtx)
+	if err := k.CheckPermission(goCtx, msg, ActiveParticipantPermission, PreviousActiveParticipantPermission); err != nil {
+		return nil, err
+	}
+	ctx, err := k.Keeper.InjectParamsIntoContext(sdk.UnwrapSDKContext(goCtx))
+	if err != nil {
+		return nil, err
+	}
 
 	settleAmount, response := k.validateRequest(ctx, msg)
 	if response != nil {
@@ -29,90 +35,115 @@ func (k msgServer) ClaimRewards(goCtx context.Context, msg *types.MsgClaimReward
 	}
 	k.LogInfo("Validate request succeeded", types.Claims, "account", msg.Creator, "settleAmount", settleAmount)
 
-	response, err := k.validateClaim(ctx, msg, settleAmount)
+	params, err := k.GetParams(ctx)
 	if err != nil {
-		k.LogError("Claim validation failed", types.Claims, "error", err, "account", msg.Creator)
-		return response, nil
+		k.LogError("GetParams failed in claim", types.Claims, "error", err, "account", msg.Creator)
+		return &types.MsgClaimRewardsResponse{
+			Amount: 0,
+			Result: "Internal error loading params",
+		}, nil
 	}
-	k.LogDebug("Claim verified", types.Claims, "account", msg.Creator, "seed", msg.Seed)
-
-	response, err = k.payoutClaim(ctx, msg, settleAmount)
-	if err != nil {
-		k.LogError("Claim payout failed", types.Claims, "error", err, "account", msg.Creator)
-		return response, nil
+	if params.ValidationParams != nil && params.ValidationParams.ClaimValidationEnabled {
+		validationResponse, validationErr := k.validateClaim(ctx, msg, settleAmount)
+		if validationErr != nil {
+			k.LogError("Claim validation failed", types.Claims, "error", validationErr, "account", msg.Creator)
+			return validationResponse, nil
+		}
+		k.LogDebug("Claim verified", types.Claims, "account", msg.Creator, "seed", msg.Seed)
 	}
 
-	return response, nil
+	payoutResponse, payoutErr := k.payoutClaim(ctx, msg, settleAmount)
+	if payoutErr != nil {
+		k.LogError("Claim payout failed", types.Claims, "error", payoutErr, "account", msg.Creator)
+		return payoutResponse, nil
+	}
+
+	return payoutResponse, nil
 }
 
 func (ms msgServer) payoutClaim(ctx sdk.Context, msg *types.MsgClaimRewards, settleAmount *types.SettleAmount) (*types.MsgClaimRewardsResponse, error) {
-	// TODO: Optimization: Payout claim should be done in one transaction
 	ms.LogInfo("Issuing rewards", types.Claims, "address", msg.Creator, "amount", settleAmount.GetTotalCoins())
+
+	// Use CacheContext so all payout mutations are atomic.
+	// If any payment fails, nothing is committed and the settle record
+	// + scheduled recipient persist for retry.
+	cacheCtx, writeFn := ctx.CacheContext()
+
+	// Resolve the destination once, using cacheCtx so the lookup view is
+	// consistent with the writes below. Recipient is already bech32-validated
+	// at the SetClaimRecipients write path; if not scheduled, returns msg.Creator.
+	payoutAddress, err := ms.resolvePayoutAddress(cacheCtx, msg.Creator, msg.EpochIndex)
+	if err != nil {
+		return &types.MsgClaimRewardsResponse{
+			Amount: 0,
+			Result: "Claim recipient lookup failed, claim can be retried",
+		}, err
+	}
 
 	// Pay for work from escrow
 	escrowPayment := settleAmount.GetWorkCoins()
-	params, err := ms.GetParams(ctx)
+	params, err := ms.GetParams(cacheCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get params: %w", err)
 	}
 	workVestingPeriod := &params.TokenomicsParams.WorkVestingPeriod
-	if err := ms.PayParticipantFromEscrow(ctx, msg.Creator, int64(escrowPayment), "work_coins:"+settleAmount.Participant, workVestingPeriod); err != nil {
+	if err := ms.PayParticipantFromEscrow(cacheCtx, payoutAddress, int64(escrowPayment), "work_coins:"+settleAmount.Participant, workVestingPeriod); err != nil {
 		if sdkerrors.ErrInsufficientFunds.Is(err) {
-			ms.handleUnderfundedWork(ctx, err, settleAmount)
+			ms.LogError("Insufficient funds for paying participant for work, claim can be retried", types.Claims, "error", err, "settleAmount", settleAmount)
 			return &types.MsgClaimRewardsResponse{
 				Amount: 0,
-				Result: "Insufficient funds for paying participant for work! Unpaid settlement",
+				Result: "Insufficient funds for paying participant for work, claim can be retried",
 			}, err
 		}
-		ms.LogError("Error paying participant from escrow", types.Claims, "error", err)
+		ms.LogError("Error paying participant from escrow, claim can be retried", types.Claims, "error", err)
 		return &types.MsgClaimRewardsResponse{
 			Amount: 0,
-			Result: "Error paying participant from escrow",
+			Result: "Error paying participant from escrow, claim can be retried",
 		}, err
 	}
-	ms.AddTokenomicsData(ctx, &types.TokenomicsData{TotalFees: settleAmount.GetWorkCoins()})
+	if err := ms.AddTokenomicsData(cacheCtx, &types.TokenomicsData{TotalFees: settleAmount.GetWorkCoins()}); err != nil {
+		ms.LogError("Failed to update tokenomics data after work payment", types.Claims, "error", err)
+	}
 
 	// Pay rewards from module
 	rewardVestingPeriod := &params.TokenomicsParams.RewardVestingPeriod
-	if err := ms.PayParticipantFromModule(ctx, msg.Creator, int64(settleAmount.GetRewardCoins()), types.ModuleName, "reward_coins:"+settleAmount.Participant, rewardVestingPeriod); err != nil {
+	if err := ms.PayParticipantFromModule(cacheCtx, payoutAddress, int64(settleAmount.GetRewardCoins()), types.ModuleName, "reward_coins:"+settleAmount.Participant, rewardVestingPeriod); err != nil {
 		if sdkerrors.ErrInsufficientFunds.Is(err) {
-			ms.LogError("Insufficient funds for paying rewards. Work paid, rewards declined", types.Claims, "error", err, "settleAmount", settleAmount)
+			ms.LogError("Insufficient funds for paying rewards, claim can be retried", types.Claims, "error", err, "settleAmount", settleAmount)
 		} else {
-			ms.LogError("Error paying participant for rewards", types.Claims, "error", err)
+			ms.LogError("Error paying participant for rewards, claim can be retried", types.Claims, "error", err)
 		}
-		ms.finishSettle(ctx, settleAmount)
 		return &types.MsgClaimRewardsResponse{
-			Amount: settleAmount.GetWorkCoins(),
-			Result: "Work paid, but rewards failed.",
+			Amount: 0,
+			Result: "Reward payment failed, claim can be retried",
 		}, err
 	}
 
-	ms.finishSettle(ctx, settleAmount)
+	ms.finishSettle(cacheCtx, settleAmount)
 	// impossible, but check anyhow
 	if settleAmount.GetTotalCoins() < 0 {
 		return nil, types.ErrNegativeRewardAmount
 	}
+
+	// All payout operations succeeded -- commit atomically.
+	writeFn()
+
 	return &types.MsgClaimRewardsResponse{
 		Amount: uint64(settleAmount.GetTotalCoins()),
 		Result: "Rewards claimed successfully",
 	}, nil
 }
 
-func (ms msgServer) handleUnderfundedWork(ctx sdk.Context, err error, settleAmount *types.SettleAmount) {
-	ms.LogError("Insufficient funds for paying participant for work! Unpaid settlement", types.Claims, "error", err, "settleAmount", settleAmount)
-
-	spendable, required := ms.parseBalanceError(err.Error())
-	ms.LogError("Balance details", types.Claims, "spendable", spendable, "required", required)
-
-	ms.finishSettle(ctx, settleAmount)
-}
-
-func (ms msgServer) parseBalanceError(errMsg string) (spendable int64, required int64) {
-	_, err := fmt.Sscanf(errMsg, "spendable balance %dnicoin is smaller than %dngonka", &spendable, &required)
+// resolvePayoutAddress returns the destination address for a claim payout.
+func (ms msgServer) resolvePayoutAddress(ctx context.Context, participant string, epoch uint64) (string, error) {
+	addr, err := ms.ResolveClaimRecipientAddress(ctx, participant, epoch)
 	if err != nil {
-		return 0, 0
+		return "", fmt.Errorf("failed to resolve claim recipient for participant %s epoch %d: %w", participant, epoch, err)
 	}
-	return spendable, required
+	if addr.String() != participant {
+		ms.LogInfo("Using scheduled claim recipient", types.Claims, "participant", participant, "epoch", epoch, "recipient", addr.String())
+	}
+	return addr.String(), nil
 }
 
 func (ms msgServer) finishSettle(ctx sdk.Context, settleAmount *types.SettleAmount) {
@@ -125,20 +156,35 @@ func (ms msgServer) finishSettle(ctx sdk.Context, settleAmount *types.SettleAmou
 			ms.LogError("Error setting epoch performance summary", types.Claims, "error", err)
 		}
 	}
+
+	// Grant maintenance credit for this successfully claimed epoch
+	if err := ms.GrantMaintenanceCredit(ctx, settleAmount.Participant, settleAmount.EpochIndex); err != nil {
+		ms.LogError("Error granting maintenance credit", types.Maintenance,
+			"participant", settleAmount.Participant,
+			"epoch", settleAmount.EpochIndex,
+			"error", err)
+	}
 }
 
 func (k msgServer) validateRequest(ctx sdk.Context, msg *types.MsgClaimRewards) (*types.SettleAmount, *types.MsgClaimRewardsResponse) {
-	currentEpoch, err := k.GetCurrentEpochGroup(ctx)
-	if err != nil {
-		k.LogError("GetCurrentEpoch failed", types.Claims, "error", err)
+	currentEpochIndex, found := k.GetEffectiveEpochIndex(ctx)
+	if !found {
+		k.LogError("GetEffectiveEpochIndex failed", types.Claims)
 		return nil, &types.MsgClaimRewardsResponse{
 			Amount: 0,
 			Result: "Can't validate claim, current epoch group not found",
 		}
 	}
+	if currentEpochIndex == 0 {
+		k.LogError("Current epoch index is zero, cannot validate previous-epoch claim", types.Claims, "epoch", msg.EpochIndex)
+		return nil, &types.MsgClaimRewardsResponse{
+			Amount: 0,
+			Result: "Can't validate claim, current epoch group does not match previous epoch",
+		}
+	}
 
-	if (currentEpoch.GroupData.EpochIndex - 1) != msg.EpochIndex {
-		k.LogError("Current epoch group does not match previous epoch", types.Claims, "epoch", msg.EpochIndex, "currentEpoch", currentEpoch.GroupData.EpochIndex)
+	if (currentEpochIndex - 1) != msg.EpochIndex {
+		k.LogError("Current epoch does not match previous epoch", types.Claims, "epoch", msg.EpochIndex, "currentEpoch", currentEpochIndex)
 		return nil, &types.MsgClaimRewardsResponse{
 			Amount: 0,
 			Result: "Can't validate claim, current epoch group does not match previous epoch",
@@ -216,6 +262,21 @@ func (k msgServer) validateClaim(ctx sdk.Context, msg *types.MsgClaimRewards, se
 }
 
 func (k msgServer) hasSignificantMissedValidations(ctx sdk.Context, msg *types.MsgClaimRewards) (bool, error) {
+	// Exempt participants who had a maintenance window covering the claimed
+	// epoch. Uses the same coverage check as GrantMaintenanceCredit so the
+	// two paths cannot disagree — otherwise a multi-epoch window's mid/end
+	// epoch could pass credit suppression but fail missed-validation here
+	// (the `==` match used previously only covered the window's start epoch).
+	participantAddr, err := sdk.AccAddressFromBech32(msg.Creator)
+	if err == nil {
+		state, found := k.GetMaintenanceState(ctx, participantAddr)
+		if found && k.maintenanceStateCoversEpoch(ctx, state, msg.EpochIndex) {
+			k.LogInfo("Skipping missed validation check: participant had maintenance in this epoch",
+				types.Maintenance, "participant", msg.Creator, "epoch", msg.EpochIndex)
+			return false, nil
+		}
+	}
+
 	//nolint:forbidigo // Must in different context
 	mustBeValidated, err := k.getMustBeValidatedInferences(ctx, msg)
 	if err != nil {
@@ -366,6 +427,7 @@ func (k msgServer) getMustBeValidatedInferences(ctx sdk.Context, msg *types.MsgC
 	if err != nil {
 		return nil, fmt.Errorf("failed to get params: %w", err)
 	}
+
 	epochContext := types.NewEpochContext(*epoch, *params.EpochParams)
 
 	// Create a map to store weight maps for each model
@@ -457,13 +519,34 @@ func (k msgServer) getMustBeValidatedInferences(ctx sdk.Context, msg *types.MsgC
 
 		totalWeight := modelTotalWeights[modelId]
 
-		if k.OverlapsWithPoC(&inference, epochContext) && !k.isActiveDuringPoC(&validatorPowerForModel) {
+		// Inferences that overlap with the PoC window are not validated: the executor was
+		// not required to serve during PoC, so a missed validation there is not a slashing
+		// signal.
+		if k.OverlapsWithPoC(&inference, epochContext) {
 			skipped++
 			continue
 		}
 
 		k.LogDebug("Getting validation", types.Claims, "seed", msg.Seed, "totalWeight", totalWeight, "executorPower", executorPower, "validatorPower", validatorPowerForModel)
-		shouldValidate, s := calculations.ShouldValidate(msg.Seed, &inference, uint32(totalWeight), uint32(validatorPowerForModel.Weight), uint32(executorPower.Weight),
+		safeTotalWeight, err := safeUint64FromInt64(totalWeight)
+		if err != nil {
+			k.LogError("Negative weight in validation sampling", types.Claims,
+				"totalWeight", totalWeight, "error", err, "inference", inference.InferenceId)
+			continue // Skip this inference -- can't compute validation probability safely
+		}
+		safeValidatorWeight, err := safeUint64FromInt64(validatorPowerForModel.Weight)
+		if err != nil {
+			k.LogError("Negative weight in validation sampling", types.Claims,
+				"validatorWeight", validatorPowerForModel.Weight, "error", err, "inference", inference.InferenceId)
+			continue
+		}
+		safeExecutorWeight, err := safeUint64FromInt64(executorPower.Weight)
+		if err != nil {
+			k.LogError("Negative weight in validation sampling", types.Claims,
+				"executorWeight", executorPower.Weight, "error", err, "inference", inference.InferenceId)
+			continue
+		}
+		shouldValidate, s := calculations.ShouldValidate(msg.Seed, &inference, safeTotalWeight, safeValidatorWeight, safeExecutorWeight,
 			params.ValidationParams, false)
 		k.LogDebug(s, types.Claims, "inference", inference.InferenceId, "seed", msg.Seed, "model", modelId, "validator", msg.Creator)
 		if shouldValidate {
@@ -473,42 +556,19 @@ func (k msgServer) getMustBeValidatedInferences(ctx sdk.Context, msg *types.MsgC
 
 	k.LogInfo("Must be validated inferences", types.Claims,
 		"count", len(mustBeValidated),
-		"validator_not_available_at_poc_skipped", skipped,
+		"poc_overlap_skipped", skipped,
 		"sampled", len(sample),
 	)
 
 	return mustBeValidated, nil
 }
 
+// OverlapsWithPoC reports whether an inference was created late enough in the epoch that
+// its execution can overlap with the next PoC window. Such inferences are not required
+// to be validated.
 func (k msgServer) OverlapsWithPoC(inferenceDetails *types.InferenceValidationDetails, epochContext types.EpochContext) bool {
-	if inferenceDetails == nil {
-		k.LogError("MsgClaimReward. OverlapsWithPoC. Inference details is nil", types.Claims, "inferenceDetails", inferenceDetails)
+	if inferenceDetails == nil || inferenceDetails.CreatedAtBlockHeight <= 0 {
 		return false
 	}
-
-	if inferenceDetails.CreatedAtBlockHeight == 0 {
-		k.LogWarn("MsgClaimReward. OverlapsWithPoC. CreatedAtBlockHeight is not set", types.Claims, "inferenceDetails", inferenceDetails)
-		return false
-	} else if inferenceDetails.CreatedAtBlockHeight < 0 {
-		k.LogError("MsgClaimReward. OverlapsWithPoC. CreatedAtBlockHeight is negative!", types.Claims, "inferenceDetails", inferenceDetails)
-		return false
-	}
-
-	happenedAfterCutoff := inferenceDetails.CreatedAtBlockHeight >= epochContext.InferenceValidationCutoff()
-	return happenedAfterCutoff
-}
-
-func (k msgServer) isActiveDuringPoC(weight *types.ValidationWeight) bool {
-	if weight == nil {
-		k.LogError("MsgClaimReward. isActiveDuringPoC. Validation weight is nil", types.Claims, "weight", weight)
-		return false
-	}
-
-	for _, n := range weight.MlNodes {
-		if n.IsActiveDuringPoC() {
-			return true
-		}
-	}
-
-	return false
+	return inferenceDetails.CreatedAtBlockHeight >= epochContext.InferenceValidationCutoff()
 }

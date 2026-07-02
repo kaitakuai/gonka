@@ -3,10 +3,11 @@ package keeper
 import (
 	"fmt"
 	"math"
-	"math/bits"
 	"math/big"
+	"math/bits"
 
 	"cosmossdk.io/log"
+	mathsdk "cosmossdk.io/math"
 	"github.com/productscience/inference/x/inference/types"
 	"github.com/shopspring/decimal"
 )
@@ -31,7 +32,31 @@ func GetBitcoinSettleAmounts(
 	bitcoinParams *types.BitcoinRewardParams,
 	validationParams *types.ValidationParams,
 	settleParams *SettleParameters,
-	participantMLNodes map[string][]*types.MLNodeInfo,
+	participantMLNodes map[string]map[string][]*types.MLNodeInfo,
+	logger log.Logger,
+) ([]*SettleResult, BitcoinResult, error) {
+	return GetBitcoinSettleAmountsWithTransfers(
+		participants,
+		epochGroupData,
+		bitcoinParams,
+		validationParams,
+		settleParams,
+		participantMLNodes,
+		nil,
+		nil,
+		logger,
+	)
+}
+
+func GetBitcoinSettleAmountsWithTransfers(
+	participants []types.Participant,
+	epochGroupData *types.EpochGroupData,
+	bitcoinParams *types.BitcoinRewardParams,
+	validationParams *types.ValidationParams,
+	settleParams *SettleParameters,
+	participantMLNodes map[string]map[string][]*types.MLNodeInfo,
+	delegationRewardTransfers []*types.DelegationRewardTransfer,
+	delegationRewardPenalties []*types.DelegationRewardPenalty,
 	logger log.Logger,
 ) ([]*SettleResult, BitcoinResult, error) {
 	if participants == nil {
@@ -54,7 +79,16 @@ func GetBitcoinSettleAmounts(
 	// 3. Complete distribution with remainder handling
 	// 4. Invalid participant handling
 	// 5. Error management
-	settleResults, bitcoinResult, err := CalculateParticipantBitcoinRewards(participants, epochGroupData, bitcoinParams, validationParams, participantMLNodes, logger)
+	settleResults, bitcoinResult, err := CalculateParticipantBitcoinRewardsWithTransfers(
+		participants,
+		epochGroupData,
+		bitcoinParams,
+		validationParams,
+		participantMLNodes,
+		delegationRewardTransfers,
+		delegationRewardPenalties,
+		logger,
+	)
 	if err != nil {
 		logger.Error("Error calculating participant bitcoin rewards", "error", err)
 		return settleResults, bitcoinResult, err
@@ -108,7 +142,7 @@ func GetBitcoinSettleAmounts(
 }
 
 func saturatingAddUint64Max(a int64, b uint64) int64 {
-	if a >= math.MaxInt64 {
+	if a == math.MaxInt64 {
 		return math.MaxInt64
 	}
 	headroom := uint64(math.MaxInt64 - a) // safe because a >= 0
@@ -116,6 +150,115 @@ func saturatingAddUint64Max(a int64, b uint64) int64 {
 		return math.MaxInt64
 	}
 	return a + int64(b) // safe because b < headroom <= MaxInt64
+}
+
+func positiveUint64(v int64) uint64 {
+	if v <= 0 {
+		return 0
+	}
+	return uint64(v)
+}
+
+func addUint64Saturating(a, b uint64) uint64 {
+	sum, carry := bits.Add64(a, b, 0)
+	if carry != 0 {
+		return math.MaxUint64
+	}
+	return sum
+}
+
+func delegationShareOfWeight(share *types.Decimal, weight uint64) uint64 {
+	if share == nil || weight == 0 || weight > math.MaxInt64 {
+		return 0
+	}
+	shareDec, err := share.ToLegacyDec()
+	if err != nil || shareDec.IsZero() {
+		return 0
+	}
+	amount := shareDec.MulInt64(int64(weight)).TruncateInt64()
+	return positiveUint64(amount)
+}
+
+func applyDelegationRewardPenalties(
+	participantWeights map[string]uint64,
+	penalties []*types.DelegationRewardPenalty,
+	logger log.Logger,
+) {
+	if len(penalties) == 0 {
+		return
+	}
+
+	baseRewardable := make(map[string]uint64, len(participantWeights))
+	for addr, w := range participantWeights {
+		baseRewardable[addr] = w
+	}
+
+	for _, penalty := range penalties {
+		if penalty == nil || penalty.Participant == "" {
+			continue
+		}
+		if _, ok := participantWeights[penalty.Participant]; !ok {
+			continue
+		}
+		removed := delegationShareOfWeight(penalty.PenaltyFraction, baseRewardable[penalty.Participant])
+		if removed > participantWeights[penalty.Participant] {
+			removed = participantWeights[penalty.Participant]
+		}
+		if removed == 0 {
+			continue
+		}
+		participantWeights[penalty.Participant] -= removed
+		logger.Info("Bitcoin Rewards: applied reward-only penalty",
+			"participant", penalty.Participant,
+			"removed", removed)
+	}
+}
+
+// applyDelegationRewardTransfers makes delegation reward sharing source-aware so
+// an excluded or downtimed delegator cannot inflate a delegatee's reward.
+//
+// All delegator-side reads use baseRewardable, a snapshot taken before any
+// transfer mutates the map. The current source balance clamps cumulative
+// outgoing transfers to the source's surviving rewardable weight.
+func applyDelegationRewardTransfers(
+	participantWeights map[string]uint64,
+	transfers []*types.DelegationRewardTransfer,
+	logger log.Logger,
+) {
+	if len(transfers) == 0 {
+		return
+	}
+
+	baseRewardable := make(map[string]uint64, len(participantWeights))
+	for addr, w := range participantWeights {
+		baseRewardable[addr] = w
+	}
+
+	for _, transfer := range transfers {
+		if transfer == nil || transfer.From == "" {
+			continue
+		}
+		if _, ok := participantWeights[transfer.From]; !ok {
+			continue
+		}
+
+		amount := delegationShareOfWeight(transfer.Share, baseRewardable[transfer.From])
+		if amount > participantWeights[transfer.From] {
+			amount = participantWeights[transfer.From]
+		}
+		if amount == 0 {
+			continue
+		}
+		participantWeights[transfer.From] -= amount
+		if transfer.To != "" && participantWeights[transfer.To] > 0 {
+			participantWeights[transfer.To] = addUint64Saturating(participantWeights[transfer.To], amount)
+		}
+		logger.Info("Bitcoin Rewards: applied reward-only delegation transfer",
+			"from", transfer.From,
+			"to", transfer.To,
+			"modelId", transfer.ModelId,
+			"amount", amount)
+	}
 }
 
 // CalculateFixedEpochReward implements the exponential decay reward calculation
@@ -166,49 +309,27 @@ func CalculateFixedEpochReward(epochsSinceGenesis uint64, initialReward uint64, 
 	return uint64(result), nil
 }
 
-// GetPreservedWeight calculates the weight of nodes with POC_SLOT=true
-// These nodes continue serving inference during confirmation PoC and are not subject to verification
-func GetPreservedWeight(participant string, epochGroupData *types.EpochGroupData) int64 {
-	for _, validationWeight := range epochGroupData.ValidationWeights {
-		if validationWeight.MemberAddress == participant {
-			var preservedWeight int64 = 0
-
-			// Sum weights from nodes with POC_SLOT=true (index 1)
-			for _, mlNode := range validationWeight.MlNodes {
-				if mlNode != nil && len(mlNode.TimeslotAllocation) > 1 && mlNode.TimeslotAllocation[1] {
-					preservedWeight += mlNode.PocWeight
-				}
+// CoefficientAdjustedWeight computes sum(coeff_i * sum(PocWeight for model_i)) for nodes
+// matching the filter. Pass nil filter to include all nodes.
+func CoefficientAdjustedWeight(modelNodes map[string][]*types.MLNodeInfo, coefficients map[string]mathsdk.LegacyDec, filter func(*types.MLNodeInfo) bool) int64 {
+	total := int64(0)
+	for modelId, nodes := range modelNodes {
+		coeff, ok := coefficients[modelId]
+		if !ok {
+			coeff = mathsdk.LegacyOneDec()
+		}
+		rawModel := int64(0)
+		for _, mlNode := range nodes {
+			if mlNode == nil {
+				continue
 			}
-
-			return preservedWeight
+			if filter == nil || filter(mlNode) {
+				rawModel += mlNode.PocWeight
+			}
 		}
+		total += coeff.MulInt64(rawModel).TruncateInt64()
 	}
-	return 0
-}
-
-// RecomputeEffectiveWeightFromMLNodes recalculates participant weight from uncapped MLNode weights
-// This allows integration of confirmation_weight for nodes subject to verification
-func RecomputeEffectiveWeightFromMLNodes(vw *types.ValidationWeight, mlNodes []*types.MLNodeInfo) int64 {
-	preservedWeight := int64(0) // Sum POC_SLOT=true nodes only
-
-	// Use provided mlNodes if available (from model subgroups), otherwise fall back to vw.MlNodes
-	nodesToUse := mlNodes
-	if len(nodesToUse) == 0 {
-		nodesToUse = vw.MlNodes
-	}
-
-	for _, mlNode := range nodesToUse {
-		if mlNode == nil || len(mlNode.TimeslotAllocation) < 2 {
-			continue
-		}
-
-		if mlNode.TimeslotAllocation[1] { // POC_SLOT=true
-			preservedWeight += mlNode.PocWeight
-		}
-	}
-
-	// ConfirmationWeight always initialized - holds verified weight for POC_SLOT=false nodes
-	return preservedWeight + vw.ConfirmationWeight
+	return total
 }
 
 // GetParticipantPoCWeight retrieves and calculates final PoC weight for reward distribution
@@ -556,7 +677,29 @@ func CalculateParticipantBitcoinRewards(
 	epochGroupData *types.EpochGroupData,
 	bitcoinParams *types.BitcoinRewardParams,
 	validationParams *types.ValidationParams,
-	participantMLNodes map[string][]*types.MLNodeInfo,
+	participantMLNodes map[string]map[string][]*types.MLNodeInfo,
+	logger log.Logger,
+) ([]*SettleResult, BitcoinResult, error) {
+	return CalculateParticipantBitcoinRewardsWithTransfers(
+		participants,
+		epochGroupData,
+		bitcoinParams,
+		validationParams,
+		participantMLNodes,
+		nil,
+		nil,
+		logger,
+	)
+}
+
+func CalculateParticipantBitcoinRewardsWithTransfers(
+	participants []types.Participant,
+	epochGroupData *types.EpochGroupData,
+	bitcoinParams *types.BitcoinRewardParams,
+	validationParams *types.ValidationParams,
+	participantMLNodes map[string]map[string][]*types.MLNodeInfo,
+	delegationRewardTransfers []*types.DelegationRewardTransfer,
+	delegationRewardPenalties []*types.DelegationRewardPenalty,
 	logger log.Logger,
 ) ([]*SettleResult, BitcoinResult, error) {
 	// Parameter validation
@@ -585,6 +728,7 @@ func CalculateParticipantBitcoinRewards(
 	// 2. Calculate effective weights with confirmation capping
 	participantWeights := make(map[string]uint64)
 	participantFullWeights := make(map[string]uint64) // Track full weights for denominator (prevents redistribution)
+	confirmationWeightCoefficients := types.ConfirmationWeightCoefficients(epochGroupData.ConfirmationWeightScales)
 
 	// Calculate effectiveWeight for each participant using helper function
 	effectiveWeights := make([]*types.ActiveParticipant, 0, len(participants))
@@ -623,11 +767,30 @@ func CalculateParticipantBitcoinRewards(
 			continue
 		}
 
-		// Recompute effective weight from MLNodes (includes confirmation capping)
-		mlNodes := participantMLNodes[participant.Address]
-		effectiveWeight := RecomputeEffectiveWeightFromMLNodes(vw, mlNodes)
-		if effectiveWeight < 0 {
+		effectiveWeight := fullWeight
+		if len(epochGroupData.ConfirmationWeightScales) == 0 {
+			logger.Info("Bitcoin Rewards: no confirmation weight scales, skipping confirmation rescale",
+				"participant", participant.Address,
+				"fullWeight", fullWeight)
+		} else {
+			rawTotal := types.ConfirmationWeightOfModelNodesWithCoefficients(
+				participantMLNodes[participant.Address],
+				confirmationWeightCoefficients,
+			)
 			effectiveWeight = 0
+			if rawTotal > 0 {
+				confirmed := vw.ConfirmationWeight
+				if confirmed < 0 {
+					confirmed = 0
+				}
+				ewBig := big.NewInt(confirmed)
+				ewBig.Mul(ewBig, big.NewInt(vw.Weight))
+				ewBig.Div(ewBig, big.NewInt(rawTotal))
+				effectiveWeight = ewBig.Int64()
+			}
+		}
+		if effectiveWeight > int64(fullWeight) {
+			effectiveWeight = int64(fullWeight)
 		}
 
 		logger.Info("Bitcoin Rewards: Calculated effective weight",
@@ -689,6 +852,9 @@ func CalculateParticipantBitcoinRewards(
 		logger.Info("Bitcoin Rewards: Skipping downtime punishment (outage circuit breaker)", "epoch", currentEpoch)
 	}
 	logger.Info("Bitcoin Rewards: weights after downtime check", "participants", participantWeights)
+	applyDelegationRewardPenalties(participantWeights, delegationRewardPenalties, logger)
+	applyDelegationRewardTransfers(participantWeights, delegationRewardTransfers, logger)
+	logger.Info("Bitcoin Rewards: weights after delegation reward transfers", "participants", participantWeights)
 	// IMPORTANT: We intentionally DO NOT renormalize totalPoCWeightBeforeDowntime after downtime punishment,
 	// invalidation, or CPoC reductions. Any "missed" share becomes undistributed and transferred to governance.
 
@@ -733,8 +899,13 @@ func CalculateParticipantBitcoinRewards(
 				if result.IsUint64() {
 					rewardCoins = result.Uint64()
 				} else {
-					// If still too large, participant gets maximum possible uint64
-					rewardCoins = ^uint64(0) // Max uint64
+					// cap to MaxInt64 — MaxUint64 sentinel would wrap to 0 when summed with WorkCoins downstream
+					logger.Error("bitcoin reward division exceeded uint64; capping to MaxInt64",
+						"participant", participant.Address,
+						"participantWeight", participantWeight,
+						"fixedEpochReward", fixedEpochReward,
+						"totalFullWeight", totalPoCWeightBeforeDowntime)
+					rewardCoins = uint64(math.MaxInt64)
 				}
 				totalDistributed += rewardCoins
 			}
@@ -756,8 +927,11 @@ func CalculateParticipantBitcoinRewards(
 
 		// Create SettleResult
 		settleResults = append(settleResults, &SettleResult{
-			Settle: settleAmount,
-			Error:  settleError,
+			Settle:                  settleAmount,
+			Error:                   settleError,
+			ParticipantRewardWeight: participantWeights[participant.Address],
+			ParticipantFullWeight:   participantFullWeights[participant.Address],
+			TotalRewardWeight:       totalPoCWeightBeforeDowntime,
 		})
 	}
 

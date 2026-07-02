@@ -70,6 +70,42 @@ class InvalidationTests : TestermintTest() {
         assertThat(newParticipants.excludedParticipants).isEmpty()
         val removedRestored = newParticipants.activeParticipants.getParticipant(genesis)
         assertNotNull(removedRestored, "Excluded participant was not restored")
+
+        logSection("Verifying restored participant stays active after serving fresh inference traffic")
+        val restoredAddress = genesis.node.getColdAddress()
+        val maxAttempts = 20
+        var restoredExecutorResult: InferenceResult? = null
+        for (attempt in 1..maxAttempts) {
+            genesis.waitForNextInferenceWindow()
+            val result = getInferenceResult(genesis)
+            Logger.info(
+                "Post-restore probe $attempt/$maxAttempts: executor=${result.executorBefore.id} status=${result.inference.statusEnum}"
+            )
+            if (result.executorBefore.id == restoredAddress) {
+                restoredExecutorResult = result
+                break
+            }
+        }
+
+        assertNotNull(
+            restoredExecutorResult,
+            "Restored participant never received a post-restore inference within $maxAttempts attempts"
+        )
+
+        genesis.node.waitForNextBlock(2)
+        val rawParticipantAfterRestoreInference = genesis.node.getRawParticipants().getParticipant(genesis)
+        assertNotNull(rawParticipantAfterRestoreInference, "Unable to fetch restored participant after fresh inference")
+        assertThat(rawParticipantAfterRestoreInference.status).isEqualTo("ACTIVE")
+
+        val activeParticipantsAfterRestoreInference = genesis.api.getActiveParticipants()
+        assertThat(activeParticipantsAfterRestoreInference.excludedParticipants.none { it.address == restoredAddress })
+            .describedAs("Restored participant should not be re-excluded after serving fresh inference traffic")
+            .isTrue()
+        assertNotNull(
+            activeParticipantsAfterRestoreInference.activeParticipants.getParticipant(genesis),
+            "Restored participant disappeared from active set after serving fresh inference traffic"
+        )
+
     }
 
     @Test
@@ -91,28 +127,41 @@ class InvalidationTests : TestermintTest() {
 
         Logger.warn("Got invalid result, waiting for validation.")
         logSection("Waiting for revalidation")
-        genesis.node.waitForNextBlock(10)
+        // Poll for VALIDATED status instead of fixed block wait — validation
+        // timing depends on epoch length, validator count, and network conditions.
+        val maxWaitBlocks = 30
+        var newState = genesis.api.getInference(invalidResult.inference.inferenceId)
+        var waited = 0
+        while (newState.statusEnum != InferenceStatus.VALIDATED && waited < maxWaitBlocks) {
+            genesis.node.waitForNextBlock(2)
+            waited += 2
+            newState = genesis.api.getInference(invalidResult.inference.inferenceId)
+            Logger.info("Revalidation status after $waited blocks: ${newState.statusEnum}")
+        }
         logSection("Verifying revalidation")
-        val newState = genesis.api.getInference(invalidResult.inference.inferenceId)
-
         assertThat(newState.statusEnum).isEqualTo(InferenceStatus.VALIDATED)
 
     }
 
     @Test
     fun `test invalid gets marked invalid`() {
-        var tries = 3
+        var tries = 4
         val (cluster, genesis) = initCluster(reboot = true)
         val oddPair = cluster.joinPairs.last()
         val badResponse = defaultInferenceResponseObject.withMissingLogit()
         oddPair.mock?.setInferenceResponse(badResponse)
-        var newState: InferencePayload
-        do {
+        var newState: InferencePayload? = null
+        while (tries-- > 0 && newState?.statusEnum != InferenceStatus.INVALIDATED) {
             logSection("Trying to get invalid inference. Tries left: $tries")
             genesis.waitForNextInferenceWindow()
-            newState = getInferenceValidationState(genesis, oddPair)
-        } while (newState.statusEnum != InferenceStatus.INVALIDATED && tries-- > 0)
+            newState = runCatching { getInferenceValidationState(genesis, oddPair) }
+                .onFailure { error ->
+                    Logger.warn("Failed to get invalid inference in this window: $error")
+                }
+                .getOrNull()
+        }
         logSection("Verifying invalidation")
+        assertNotNull(newState)
         assertThat(newState.statusEnum).isEqualTo(InferenceStatus.INVALIDATED)
     }
 

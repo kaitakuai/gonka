@@ -64,7 +64,14 @@ func (r *JsonCompletionResponse) GetEnforcedStr() (string, error) {
 		logging.Warn("More than one choice in a non-steamed inference response, defaulting to first one", types.Validation, "choices", r.Resp.Choices)
 	}
 
-	content := r.Resp.Choices[0].Message.Content
+	choice := r.Resp.Choices[0]
+	content := ""
+	if choice.Message != nil {
+		content = choice.Message.Content
+	}
+	if content == "" {
+		content = choice.Text
+	}
 	if content == "" {
 		logging.Error("Model return empty response", types.Validation, "inference_id", r.Resp.ID)
 		return "", errors.New("JsonResponse has no content")
@@ -153,14 +160,16 @@ func (r *StreamedCompletionResponse) GetEnforcedTokens() (EnforcedTokens, error)
 				return EnforcedTokens{}, errors.New("StreamedCompletionResponse: choice has no logprobs content")
 			}
 
-			var topTokens []string
-			for _, topToken := range choice.Logprobs.Content[0].TopLogprobs {
-				topTokens = append(topTokens, topToken.Token)
+			for _, content := range choice.Logprobs.Content {
+				var topTokens []string
+				for _, topToken := range content.TopLogprobs {
+					topTokens = append(topTokens, topToken.Token)
+				}
+				enforcedTokens.Tokens = append(enforcedTokens.Tokens, EnforcedToken{
+					Token:     content.Token,
+					TopTokens: topTokens,
+				})
 			}
-			enforcedTokens.Tokens = append(enforcedTokens.Tokens, EnforcedToken{
-				Token:     choice.Logprobs.Content[0].Token,
-				TopTokens: topTokens,
-			})
 		}
 	}
 
@@ -249,9 +258,17 @@ func (r *StreamedCompletionResponse) GetEnforcedStr() (string, error) {
 			logging.Warn("More than one choice in a streamed inference response, defaulting to first one", types.Validation, "inferenceId", event.ID, "choices", event.Choices)
 		}
 
-		content := event.Choices[0].Delta.Content
-		if content != nil {
-			stringBuilder.WriteString(*content)
+		choice := event.Choices[0]
+		if choice.Delta != nil && choice.Delta.Content != nil {
+			stringBuilder.WriteString(*choice.Delta.Content)
+			continue
+		}
+		if choice.Text != "" {
+			stringBuilder.WriteString(choice.Text)
+			continue
+		}
+		if choice.Message != nil && choice.Message.Content != "" {
+			stringBuilder.WriteString(choice.Message.Content)
 		}
 	}
 

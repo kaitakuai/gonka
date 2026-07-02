@@ -223,6 +223,11 @@ update_configs
 kv app state-sync.snapshot-interval    "$SNAPSHOT_INTERVAL"
 kv app state-sync.snapshot-keep-recent "$SNAPSHOT_KEEP_RECENT"
 
+# Disable IAVL fast node: cause failed state sync
+kv app iavl-disable-fastnode true
+
+# Query gas limit (protects from expensive read queries)
+kv app query-gas-limit "${QUERY_GAS_LIMIT:-10000000}"
 
 # CONFIG_* environment overrides ----------------------------------------------
 (
@@ -240,6 +245,18 @@ update_configs
 if [ ! -d "$STATE_DIR/cosmovisor" ]; then
   echo "Initialising cosmovisor directory"
   run cosmovisor init /usr/bin/inferenced
+fi
+
+###############################################################################
+# Restore current binary from image if missing (e.g. upgrade binary was removed)
+###############################################################################
+COSMOVISOR_CURRENT_BIN="$STATE_DIR/cosmovisor/current/bin/inferenced"
+if [ -e "$STATE_DIR/cosmovisor/current" ] && { [ ! -x "$COSMOVISOR_CURRENT_BIN" ] || [ ! -f "$COSMOVISOR_CURRENT_BIN" ]; }; then
+  if [ -x /usr/bin/inferenced ]; then
+    echo "Current cosmovisor binary missing or not executable; restoring from image"
+    mkdir -p "$(dirname "$COSMOVISOR_CURRENT_BIN")"
+    cp -f /usr/bin/inferenced "$COSMOVISOR_CURRENT_BIN"
+  fi
 fi
 
 ###############################################################################

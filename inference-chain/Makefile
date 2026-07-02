@@ -1,12 +1,16 @@
-.PHONY: all install build build-docker init clean-state mock-expected-keepers docker-push release build-all package deploy
+.PHONY: all install build build-docker init clean-state mock-expected-keepers docker-push release build-all package deploy proto
 
 BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 COMMIT := $(shell git log -1 --format='%H')
 
+include ../scripts/blst-portable.mk
+
 VERSION ?= $(shell git describe --always)
-BLST_PORTABLE ?= 0
 SET_LATEST ?= 0
 SET_LATEST := $(shell if [ "$(SET_LATEST)" = "1" ]; then echo 1; else echo 0; fi)
+PLATFORM ?= linux/amd64
+GOOS ?= linux
+GOARCH ?= amd64
 
 ldflags = \
   -X github.com/cosmos/cosmos-sdk/version.Name=inference-chain \
@@ -23,6 +27,19 @@ WASMVM_VERSION := v2.2.4
 WASMVM_STATIC_DARWIN_URL := https://github.com/CosmWasm/wasmvm/releases/download/$(WASMVM_VERSION)/libwasmvmstatic_darwin.a
 WASMVM_STATIC_LINUX_X64_URL := https://github.com/CosmWasm/wasmvm/releases/download/$(WASMVM_VERSION)/libwasmvm_muslc.x86_64.a
 WASMVM_STATIC_LINUX_ARM64_URL := https://github.com/CosmWasm/wasmvm/releases/download/$(WASMVM_VERSION)/libwasmvm_muslc.aarch64.a
+
+USE_REGISTRY_CACHE ?= 0
+ifeq ($(USE_REGISTRY_CACHE),1)
+DOCKER_CACHE_ARGS := --cache-from type=registry,ref=ghcr.io/gonka-ai/inferenced:buildcache --cache-to type=registry,ref=ghcr.io/gonka-ai/inferenced:buildcache,mode=min
+DOCKER_CACHE_ARGS_UPGRADE := --cache-from type=registry,ref=ghcr.io/gonka-ai/inferenced:buildcache-upgrade --cache-to type=registry,ref=ghcr.io/gonka-ai/inferenced:buildcache-upgrade,mode=min
+DOCKER_BUILD_PREFIX := docker buildx build --load $(DOCKER_CACHE_ARGS)
+DOCKER_BUILD_UPGRADE_PREFIX := docker buildx build $(DOCKER_CACHE_ARGS_UPGRADE)
+else
+DOCKER_CACHE_ARGS :=
+DOCKER_CACHE_ARGS_UPGRADE :=
+DOCKER_BUILD_PREFIX := DOCKER_BUILDKIT=1 docker build
+DOCKER_BUILD_UPGRADE_PREFIX := DOCKER_BUILDKIT=1 docker build
+endif
 
 install:
 	@echo "Installing locally with ldflags..."
@@ -69,6 +86,7 @@ define DOCKER_BUILD
 	@echo "--> building inferenced docker image"
 	@echo "platform:  $(PLATFORM)"
 	@echo "GOARCH:    $(GOARCH)"
+	@echo "BLST_PORTABLE: $(BLST_PORTABLE)"
 	@echo "LDFLAGS:   $(ldflags)"
 	@echo "GOOS:      $(GOOS)"
 	@echo "GENESIS_OVERRIDES_FILE: $(GENESIS_OVERRIDES_FILE)"
@@ -80,9 +98,7 @@ define DOCKER_BUILD
 	@cp -r .[^.]* .docker-context/inference-chain/ 2>/dev/null || true
 	@rm -rf .docker-context/inference-chain/.docker-context
 	@mkdir -p .docker-context/cosmovisor && cp -r ../cosmovisor/* .docker-context/cosmovisor/
-	@DOCKER_BUILDKIT=1 \
-	docker build \
-		--load \
+	@$(DOCKER_BUILD_PREFIX) \
 		--platform $(PLATFORM) \
 		--build-arg LDFLAGS='$(ldflags)' \
 		--build-arg GOOS=$(GOOS) \
@@ -99,6 +115,7 @@ define DOCKER_BUILD_UPGRADE
 	@echo "--> building inferenced docker image"
 	@echo "platform:  $(PLATFORM)"
 	@echo "GOARCH:    $(GOARCH)"
+	@echo "BLST_PORTABLE: $(BLST_PORTABLE)"
 	@echo "LDFLAGS:   $(ldflags)"
 	@echo "GOOS:      $(GOOS)"
 	@echo "TAGS:      $(if $(filter 1,$(TESTS)),upgraded,not set)"
@@ -109,8 +126,7 @@ define DOCKER_BUILD_UPGRADE
 	@cp -r .[^.]* .docker-context/inference-chain/ 2>/dev/null || true
 	@rm -rf .docker-context/inference-chain/.docker-context
 	@mkdir -p .docker-context/cosmovisor && cp -r ../cosmovisor/* .docker-context/cosmovisor/
-	@DOCKER_BUILDKIT=1 \
-	docker build \
+	@$(DOCKER_BUILD_UPGRADE_PREFIX) \
 		--platform $(PLATFORM) \
 		--build-arg LDFLAGS='$(ldflags)' \
 		--build-arg GOOS=$(GOOS) \
@@ -123,11 +139,13 @@ define DOCKER_BUILD_UPGRADE
 	@rm -rf .docker-context
 endef
 
+include ../scripts/blst-portable.mk
+
 build-docker:
 	rm -rf build/
-	$(eval PLATFORM=linux/amd64)
-	$(eval GOOS=linux)
-	$(eval GOARCH=amd64)
+	$(eval PLATFORM=$(DOCKER_PLATFORM))
+	$(eval GOOS=$(DOCKER_GOOS))
+	$(eval GOARCH=$(DOCKER_GOARCH))
 	$(eval DOCKER_FILE=Dockerfile)
 	$(eval DOCKER_TAG=ghcr.io/product-science/inferenced:$(VERSION))
 	$(eval GENESIS_OVERRIDES_FILE=$(GENESIS_OVERRIDES_FILE))
@@ -153,30 +171,26 @@ docker-push:
 	fi
 
 build-for-upgrade:
-	$(eval PLATFORM=linux/amd64)
-	$(eval GOOS=linux)
-	$(eval GOARCH=amd64)
 	$(eval DOCKER_FILE=Dockerfile)
 	$(DOCKER_BUILD_UPGRADE)
-	@echo "--> clearing out ../public-html/v2/inferenced"
-	@rm -rf ../public-html/v2/inferenced/*
+	@echo "--> staging inferenced binary and dependencies for $(GOARCH)"
 	@mkdir -p ../public-html/v2/inferenced
-	@echo "--> copying built inferenced binary and dependencies to ../public-html/v2/inferenced/"
-	@cp ./output/build_output/* ../public-html/v2/inferenced/
+	@rm -rf ./output/upgrade-package-$(GOARCH)
+	@mkdir -p ./output/upgrade-package-$(GOARCH)
+	@cp ./output/build_output/* ./output/upgrade-package-$(GOARCH)/
+	@echo "--> zipping inferenced binary with dependencies for $(GOARCH)"
+	# We set the timestamp to a const and strip metadata in zip so we have a reproduceable checksum
+	@TZ=UTC find ./output/upgrade-package-$(GOARCH) -type f -exec touch -t 200001010000 {} \;
+	@archive_path="$$(pwd)/../public-html/v2/inferenced/inferenced-$(GOARCH).zip"; \
+		rm -f "$$archive_path"; \
+		cd ./output/upgrade-package-$(GOARCH) && zip -X -r "$$archive_path" .
+	@echo "--> generating shasum for inferenced-$(GOARCH).zip"
+	@shasum -a 256 ../public-html/v2/inferenced/inferenced-$(GOARCH).zip
+	@echo "--> appending to ../public-html/v2/checksums.txt"
+	@checksum=$$(shasum -a 256 ../public-html/v2/inferenced/inferenced-$(GOARCH).zip | awk '{print $$1}'); \
+		echo "inferenced-$(GOARCH).zip $$checksum" >> ../public-html/v2/checksums.txt
 	@echo "--> cleaning up intermediate build output"
 	@rm -rf ./output
-	@echo "--> zipping inferenced binary with dependencies"
-	# We set the timestamp to a const and strip metadata in zip so we have a reproduceable checksum
-	@TZ=UTC find ../public-html/v2/inferenced -type f -exec touch -t 200001010000 {} \;
-	@cd ../public-html/v2/inferenced && zip -X -r inferenced-amd64.zip .
-	@echo "--> generating shasum for inferenced-amd64.zip"
-	@shasum -a 256 ../public-html/v2/inferenced/inferenced-amd64.zip
-	@echo "--> appending to ../public-html/v2/checksums.txt"
-	@echo "inferenced-amd64.zip $(shasum -a 256 ../public-html/v2/inferenced/inferenced-amd64.zip)" >> ../public-html/v2/checksums.txt
-
-# Disabled ARM builds as requested
-build-for-upgrade-arm:
-	@echo "ARM builds disabled"
 
 #################################################
 # CROSS-COMPILATION SECTION
@@ -297,3 +311,6 @@ mock-expected-keepers:
 	@mockgen -source=x/inference/types/expected_keepers.go \
 		-package keeper \
 		-destination=testutil/keeper/expected_keepers_mocks.go
+
+proto:
+	ignite generate proto-go

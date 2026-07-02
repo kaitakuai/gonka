@@ -26,13 +26,19 @@ import (
 )
 
 type ConfigManager struct {
-	currentConfig  Config
-	KoanProvider   koanf.Provider
-	WriterProvider WriteCloserProvider
-	sqlDb          SqlDatabase
-	mutex          sync.RWMutex
-	configDumpPath string
-	sqlitePath     string
+	currentConfig            Config
+	KoanProvider             koanf.Provider
+	WriterProvider           WriteCloserProvider
+	sqlDb                    SqlDatabase
+	mutex                    sync.RWMutex
+	runtimePublishMu         sync.RWMutex
+	runtimePublished         runtimePublishedMarker
+	runtimeParamsBlockHeight int64 // last published revision height; guarded by runtimePublishMu
+	runtimeConfigNotifier    *RuntimeConfigNotifier
+	epochOnChangeMu          sync.Mutex
+	epochOnChange            EpochChangeListener // optional; set once at process startup
+	configDumpPath           string
+	sqlitePath               string
 }
 
 type WriteCloserProvider interface {
@@ -58,12 +64,13 @@ func LoadConfigManagerWithPaths(configPath, sqlitePath, nodeConfigPath string) (
 	}
 
 	manager := ConfigManager{
-		KoanProvider:   file.Provider(configPath),
-		WriterProvider: NewFileWriteCloserProvider(configPath),
-		sqlDb:          db,
-		mutex:          sync.RWMutex{},
-		configDumpPath: filepath.Join(filepath.Dir(sqlitePath), "config-dump.json"),
-		sqlitePath:     sqlitePath,
+		KoanProvider:          file.Provider(configPath),
+		WriterProvider:        NewFileWriteCloserProvider(configPath),
+		sqlDb:                 db,
+		mutex:                 sync.RWMutex{},
+		runtimeConfigNotifier: NewRuntimeConfigNotifier(),
+		configDumpPath:        filepath.Join(filepath.Dir(sqlitePath), "config-dump.json"),
+		sqlitePath:            sqlitePath,
 	}
 	err := manager.Load()
 	if err != nil {
@@ -131,18 +138,32 @@ func (cm *ConfigManager) Load() error {
 // Need to make sure we pass back a COPY of the ChainNodeConfig to make sure
 // we don't modify the original
 func (cm *ConfigManager) GetChainNodeConfig() ChainNodeConfig {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.ChainNode
 }
 
+func (cm *ConfigManager) GetEarlyShareGuardConfig() EarlyShareGuardConfig {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	return cm.currentConfig.EarlyShareGuard
+}
+
 func (cm *ConfigManager) GetApiConfig() ApiConfig {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.Api
 }
 
 func (cm *ConfigManager) GetNatsConfig() NatsServerConfig {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.Nats
 }
 
 func (cm *ConfigManager) GetTxBatchingConfig() TxBatchingConfig {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	cfg := cm.currentConfig.TxBatching
 	if cfg.FlushSize == 0 {
 		cfg.FlushSize = 50
@@ -163,6 +184,8 @@ func (cm *ConfigManager) GetTxBatchingConfig() TxBatchingConfig {
 }
 
 func (cm *ConfigManager) GetNodes() []InferenceNodeConfig {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	nodes := make([]InferenceNodeConfig, len(cm.currentConfig.Nodes))
 	copy(nodes, cm.currentConfig.Nodes)
 	return nodes
@@ -185,7 +208,11 @@ func (cm *ConfigManager) GetConfig() Config {
 	return cm.currentConfig
 }
 
-func (cm *ConfigManager) GetUpgradePlan() UpgradePlan { return cm.currentConfig.UpgradePlan }
+func (cm *ConfigManager) GetUpgradePlan() UpgradePlan {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	return cm.currentConfig.UpgradePlan
+}
 
 func (cm *ConfigManager) SetUpgradePlan(plan UpgradePlan) error {
 	cm.mutex.Lock()
@@ -212,6 +239,8 @@ func (cm *ConfigManager) SetHeight(height int64) error {
 }
 
 func (cm *ConfigManager) GetLastProcessedHeight() int64 {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.LastProcessedHeight
 }
 
@@ -224,6 +253,8 @@ func (cm *ConfigManager) SetLastProcessedHeight(height int64) error {
 }
 
 func (cm *ConfigManager) GetCurrentNodeVersion() string {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.CurrentNodeVersion
 }
 
@@ -270,6 +301,74 @@ type CosmosQueryClient interface {
 	MLNodeVersion(ctx context.Context, req *types.QueryGetMLNodeVersionRequest, opts ...grpc.CallOption) (*types.QueryGetMLNodeVersionResponse, error)
 }
 
+// SetRuntimeParamsBlockHeight sets params_block_height without notifying (tests only).
+// Production code must use ApplyRuntimeConfigBlockIfChanged.
+func (cm *ConfigManager) SetRuntimeParamsBlockHeight(height int64) {
+	cm.runtimePublishMu.Lock()
+	defer cm.runtimePublishMu.Unlock()
+	if height > cm.runtimeParamsBlockHeight {
+		cm.runtimeParamsBlockHeight = height
+	}
+}
+
+func (cm *ConfigManager) RuntimeParamsBlockHeight() int64 {
+	cm.runtimePublishMu.RLock()
+	defer cm.runtimePublishMu.RUnlock()
+	return cm.runtimeParamsBlockHeight
+}
+
+// RuntimeConfigNotifier returns the broadcast primitive used by GetRuntimeConfig
+// long-poll waiters. Nil only on zero-value ConfigManager used in isolated tests.
+func (cm *ConfigManager) RuntimeConfigNotifier() *RuntimeConfigNotifier {
+	return cm.runtimeConfigNotifier
+}
+
+// EnsureRuntimeConfigNotifier initializes the notifier on zero-value managers (tests).
+func (cm *ConfigManager) EnsureRuntimeConfigNotifier() {
+	if cm.runtimeConfigNotifier == nil {
+		cm.runtimeConfigNotifier = NewRuntimeConfigNotifier()
+	}
+}
+
+// liveRuntimeConfigContent reads the in-memory caches (not yet published). Used only
+// by ApplyRuntimeConfigBlockIfChanged to detect whether a new revision is needed.
+func (cm *ConfigManager) liveRuntimeConfigContent() runtimeConfigContent {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+
+	vp := cm.currentConfig.ValidationParams
+	dv := cm.currentConfig.DevshardVersionsCache
+	versions := make([]DevshardVersion, len(dv.Versions))
+	copy(versions, dv.Versions)
+	return runtimeConfigContent{
+		LogprobsMode:            vp.LogprobsMode,
+		DevshardRequestsEnabled: dv.DevshardRequestsEnabled,
+		MaxNonce:                dv.MaxNonce,
+		ApprovedVersions:        versions,
+		RefusalTimeout:          dv.RefusalTimeout,
+		ExecutionTimeout:        dv.ExecutionTimeout,
+		ValidationRate:          dv.ValidationRate,
+		VoteThresholdFactor:     dv.VoteThresholdFactor,
+	}
+}
+
+// RuntimeConfigSnapshot returns the last published runtime revision (content and
+// params_block_height updated together in ApplyRuntimeConfigBlockIfChanged). Until
+// the first publish, it reflects the live caches. currentEpochID comes from
+// ChainPhaseTracker (not ConfigManager).
+func (cm *ConfigManager) RuntimeConfigSnapshot(currentEpochID uint64) RuntimeConfigSnapshot {
+	cm.runtimePublishMu.RLock()
+	published := cm.runtimePublished
+	height := cm.runtimeParamsBlockHeight
+	cm.runtimePublishMu.RUnlock()
+
+	if published.initialized {
+		return runtimeConfigSnapshotFromContent(height, currentEpochID, published.content)
+	}
+
+	return runtimeConfigSnapshotFromContent(height, currentEpochID, cm.liveRuntimeConfigContent())
+}
+
 func (cm *ConfigManager) SetValidationParams(params ValidationParamsCache) error {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
@@ -279,6 +378,8 @@ func (cm *ConfigManager) SetValidationParams(params ValidationParamsCache) error
 }
 
 func (cm *ConfigManager) GetValidationParams() ValidationParamsCache {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.ValidationParams
 }
 
@@ -291,7 +392,23 @@ func (cm *ConfigManager) SetBandwidthParams(params BandwidthParamsCache) error {
 }
 
 func (cm *ConfigManager) GetBandwidthParams() BandwidthParamsCache {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.BandwidthParams
+}
+
+func (cm *ConfigManager) SetPoCParams(params PoCParamsCache) error {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	cm.currentConfig.PoCParams = params
+	logging.Info("Setting poc params", types.Config, "params", params)
+	return nil
+}
+
+func (cm *ConfigManager) GetPoCParams() PoCParamsCache {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	return cm.currentConfig.PoCParams
 }
 
 func (cm *ConfigManager) SetTransferAgentAccessCache(cache TransferAgentAccessCache) {
@@ -306,11 +423,40 @@ func (cm *ConfigManager) GetTransferAgentAccessCache() TransferAgentAccessCache 
 	return cm.currentConfig.TransferAgentAccessCache
 }
 
+func (cm *ConfigManager) SetDevshardVersions(cache DevshardVersionsCache) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	prev := cm.currentConfig.DevshardVersionsCache.DevshardRequestsEnabled
+	cm.currentConfig.DevshardVersionsCache = cache
+	if prev != cache.DevshardRequestsEnabled {
+		logging.Info("runtime_config: devshard_requests_enabled updated from chain", types.Config,
+			"previous", prev,
+			"current", cache.DevshardRequestsEnabled,
+		)
+	} else {
+		logging.Debug("runtime_config: devshard escrow cache refreshed", types.Config,
+			"devshardRequestsEnabled", cache.DevshardRequestsEnabled,
+			"maxNonce", cache.MaxNonce,
+			"approvedVersions", len(cache.Versions),
+		)
+	}
+}
+
+func (cm *ConfigManager) GetDevshardVersions() DevshardVersionsCache {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	return cm.currentConfig.DevshardVersionsCache
+}
+
 func (cm *ConfigManager) GetHeight() int64 {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.CurrentHeight
 }
 
 func (cm *ConfigManager) GetLastUsedVersion() string {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.LastUsedVersion
 }
 
@@ -361,6 +507,8 @@ func (cm *ConfigManager) IsPreviousSeedClaimed() bool {
 }
 
 func (cm *ConfigManager) GetPreviousSeed() SeedInfo {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.PreviousSeed
 }
 
@@ -373,6 +521,8 @@ func (cm *ConfigManager) SetCurrentSeed(seed SeedInfo) error {
 }
 
 func (cm *ConfigManager) GetCurrentSeed() SeedInfo {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.CurrentSeed
 }
 
@@ -385,6 +535,8 @@ func (cm *ConfigManager) SetUpcomingSeed(seed SeedInfo) error {
 }
 
 func (cm *ConfigManager) GetUpcomingSeed() SeedInfo {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
 	return cm.currentConfig.UpcomingSeed
 }
 
@@ -462,7 +614,11 @@ func readConfig(provider koanf.Provider) (Config, error) {
 	if err != nil {
 		log.Fatalf("error loading env: %v", err)
 	}
-	var config Config
+	// Pre-seed early-share guard defaults so any field absent from yaml/env keeps
+	// its default while explicitly-set values override. koanf unmarshals with
+	// ZeroFields=false, so only keys actually present overwrite these. This is
+	// the single defaulting mechanism for the guard (works for the bool too).
+	config := Config{EarlyShareGuard: DefaultEarlyShareGuardConfig()}
 	err = k.Unmarshal("", &config)
 	if err != nil {
 		log.Fatalf("error unmarshalling config: %v", err)
@@ -701,6 +857,10 @@ func (cm *ConfigManager) migrateDynamicDataToDb(ctx context.Context) (bool, erro
 	if ok, _ := func() (bool, error) { return KVGetJSON(ctx, cm.sqlDb.GetDb(), kvKeyBandwidthParams, &bp) }(); !ok && (config.BandwidthParams.EstimatedLimitsPerBlockKb != 0) {
 		_ = KVSetJSON(ctx, cm.sqlDb.GetDb(), kvKeyBandwidthParams, config.BandwidthParams)
 	}
+	var pp PoCParamsCache
+	if ok, _ := func() (bool, error) { return KVGetJSON(ctx, cm.sqlDb.GetDb(), kvKeyPoCParams, &pp) }(); !ok && len(config.PoCParams.Models) > 0 {
+		_ = KVSetJSON(ctx, cm.sqlDb.GetDb(), kvKeyPoCParams, config.PoCParams)
+	}
 
 	// ML node key config
 	var mk MLNodeKeyConfig
@@ -774,6 +934,11 @@ func (cm *ConfigManager) HydrateFromDB(_ context.Context) error {
 			logging.Info("Reading bandwidth params from DB", types.Config, "params", bp)
 			cm.currentConfig.BandwidthParams = bp
 		}
+		var pp PoCParamsCache
+		if ok, err := KVGetJSON(ctx, db, kvKeyPoCParams, &pp); err == nil && ok {
+			logging.Info("Reading poc params from DB", types.Config, "params", pp)
+			cm.currentConfig.PoCParams = pp
+		}
 		var mk MLNodeKeyConfig
 		if ok, err := KVGetJSON(ctx, db, kvKeyMLNodeKeyConfig, &mk); err == nil && ok {
 			cm.currentConfig.MLNodeKeyConfig = mk
@@ -843,6 +1008,7 @@ func (cm *ConfigManager) flushToDB(ctx context.Context) error {
 	_ = KVSetJSON(ctx, db, kvKeyMLNodeKeyConfig, cfg.MLNodeKeyConfig)
 	_ = KVSetJSON(ctx, db, kvKeyValidationParams, cfg.ValidationParams)
 	_ = KVSetJSON(ctx, db, kvKeyBandwidthParams, cfg.BandwidthParams)
+	_ = KVSetJSON(ctx, db, kvKeyPoCParams, cfg.PoCParams)
 
 	logging.Info("Flushed dynamic config to DB", types.Config)
 
@@ -932,6 +1098,7 @@ func (cm *ConfigManager) getStaticConfigCopyUnsafe() Config {
 	c.LastUsedVersion = ""
 	c.ValidationParams = ValidationParamsCache{}
 	c.BandwidthParams = BandwidthParamsCache{}
+	c.PoCParams = PoCParamsCache{}
 	return c
 }
 
@@ -947,6 +1114,7 @@ const (
 	kvKeyLastUsedVersion     = "last_used_version"
 	kvKeyValidationParams    = "validation_params"
 	kvKeyBandwidthParams     = "bandwidth_params"
+	kvKeyPoCParams           = "poc_params"
 	kvKeyMLNodeKeyConfig     = "ml_node_key_config"
 	kvKeyNodeConfigMerged    = "node_config_merged"
 	kvKeyConfigMigrated      = "config_migrated"

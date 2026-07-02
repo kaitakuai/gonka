@@ -9,6 +9,24 @@ on:
       - main
 
 jobs:
+  check-storage-ddl:
+    # Pinned runner because the ripgrep apt version below only exists in the
+    # 22.04 (jammy) package archive. Bumping the runner requires bumping the
+    # pinned ripgrep version in lockstep.
+    runs-on: ubuntu-22.04
+    name: Storage schema DDL guard
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install ripgrep
+        # Pin the package version so the DDL guard runs against a known
+        # ripgrep build (reproducible CI). Update both pins together.
+        run: sudo apt-get update && sudo apt-get install -y ripgrep=13.0.0-2
+
+      - name: Check storage DDL placement
+        run: bash scripts/check-storage-ddl.sh
+
   build-and-test:
     runs-on: ubuntu-latest
     name: Build and Test chain
@@ -131,4 +149,128 @@ jobs:
         with:
           name: Decentralized-API Tests
           path: decentralized-api/junit-report.xml
+          reporter: java-junit
+
+  build-and-test-versioned:
+    runs-on: ubuntu-latest
+    name: Build and Test Versioned
+    permissions:
+      contents: read
+      checks: write
+    defaults:
+      run:
+        working-directory: ./versioned
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3.0.0
+        with:
+          go-version: '1.24.2'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run Tests (fork PRs)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+        run: go test ./... -v
+
+      - name: Install go-junit-report
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+        run: go install github.com/jstemmer/go-junit-report/v2@v2.1.0
+
+      - name: Run Tests and Generate JUnit Report
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+        run: go test ./... -v 2>&1 | go-junit-report -set-exit-code > junit-report.xml
+
+      - name: Publish Test Results
+        uses: actions/upload-artifact@v4
+        if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+        with:
+          name: versioned-junit-report
+          path: versioned/junit-report.xml
+
+      - name: Report Test Results in GitHub
+        if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+        uses: dorny/test-reporter@v1
+        with:
+          name: Versioned Tests
+          path: versioned/junit-report.xml
+          reporter: java-junit
+
+  build-and-test-devshard:
+    runs-on: ubuntu-22.04
+    name: Build and Test Devshard
+    permissions:
+      contents: read
+      checks: write
+    defaults:
+      run:
+        working-directory: ./devshard
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3.0.0
+        with:
+          go-version: '1.24.2'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Install ripgrep
+        # Pin the package version for reproducible CI; keep in sync with runner image.
+        run: sudo apt-get update && sudo apt-get install -y ripgrep=13.0.0-2
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run Tests (fork PRs)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+        run: go test ./... -v
+
+      - name: Install go-junit-report
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+        run: go install github.com/jstemmer/go-junit-report/v2@v2.1.0
+
+      - name: Run Tests and Generate JUnit Report
+        if: github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork
+        run: go test ./... -v 2>&1 | go-junit-report -set-exit-code > junit-report.xml
+
+      - name: Publish Test Results
+        uses: actions/upload-artifact@v4
+        if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+        with:
+          name: devshard-junit-report
+          path: devshard/junit-report.xml
+
+      - name: Report Test Results in GitHub
+        if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork)
+        uses: dorny/test-reporter@v1
+        with:
+          name: Devshard Tests
+          path: devshard/junit-report.xml
           reporter: java-junit

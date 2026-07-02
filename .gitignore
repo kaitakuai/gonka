@@ -1,8 +1,12 @@
 vue/node_modules
 vue/dist
+/build/
 release/
 .idea/
 .vscode/
+/.claude
+.cursor/
+/.claude
 .DS_Store
 *.dot
 *.log
@@ -15,6 +19,9 @@ decentralized-api/responses/
 inference-chain/build/
 inference-chain/dist/
 /decentralized-api/decentralized-api
+/decentralized-api/devshardd
+/devshard/devshardctl
+/devshard/devshardd
 chain-venv/
 .inference/
 prod-genesis/
@@ -22,6 +29,7 @@ prod-local/
 /payload.json
 /prod-local/genesis
 /inference-chain/output/
+/inference-chain/inferenced
 /decentralized-api/output/
 /jq_test/
 /public-html/
@@ -38,8 +46,13 @@ testermint/parallel-test-results/
 run-parallel-tests/
 **/node_modules/
 **/target/
+/tmp
+.worklog
+.metals
+actionlint
 
 # Generated proto artifacts (buf output in wrong location)
 inference-chain/proto/github.com/
 inference-chain/proto/api/
 inference-chain/proto/**/module/*.pb.go
+/inference-chain/.docker-context/

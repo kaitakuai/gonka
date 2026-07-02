@@ -5,10 +5,11 @@
 ################################################################################
 FROM golang:1.24.2-alpine3.20 AS builder
 
-ARG BUILD_FLAGS
 ARG GOOS
 ARG GOARCH
 ARG BLST_PORTABLE=0
+ARG DEVSHARD_VERSION=dev
+ARG DEVSHARD_PROTOCOL_VERSION=v2
 
 ENV GOOS=${GOOS} \
     GOARCH=${GOARCH} \
@@ -39,6 +40,7 @@ RUN if [ "$GOARCH" = "arm64" ]; then \
     fi
 
 COPY inference-chain/ /app/inference-chain
+COPY devshard/ /app/devshard
 
 WORKDIR /app/decentralized-api
 COPY decentralized-api/go.mod decentralized-api/go.sum ./
@@ -50,7 +52,7 @@ RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
 
 COPY decentralized-api/. .
 
-# ARG LDFLAGS
+ARG LDFLAGS
 RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
     --mount=type=cache,id=go-mod-cache3,target=/go/pkg/mod \
     if [ "$BLST_PORTABLE" = "1" ]; then export CGO_CFLAGS="$CGO_CFLAGS -D__BLST_PORTABLE__"; fi; \
@@ -69,6 +71,23 @@ RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
     -o ./build/inferenced ./cmd/inferenced/main.go \
     && patchelf --set-rpath '$ORIGIN:$ORIGIN/current:/root/.inference/cosmovisor/current' ./build/inferenced
 
+# Build devshardctl
+RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
+    --mount=type=cache,id=go-mod-cache3,target=/go/pkg/mod \
+    cd /app/devshard && \
+    CGO_ENABLED=0 go build -ldflags "-X main.Version=${DEVSHARD_VERSION} -X devshard/types.buildStateRootProtocolVersion=${DEVSHARD_PROTOCOL_VERSION}" -o ./build/devshardctl ./cmd/devshardctl/
+
+# Build devshardd (standalone host binary for versiond).
+# Must use CGO_ENABLED=1 + muslc tags (same as dapi) because blst requires CGO.
+# The binary is NOT included in the final api image — it ships via versiond.
+RUN --mount=type=cache,id=go-build-cache3,target=/root/.cache/go-build \
+    --mount=type=cache,id=go-mod-cache3,target=/go/pkg/mod \
+    if [ "$BLST_PORTABLE" = "1" ]; then export CGO_CFLAGS="$CGO_CFLAGS -D__BLST_PORTABLE__"; fi; \
+    CGO_ENABLED=1 CC=gcc \
+    go build -mod=readonly -tags muslc \
+    -ldflags "$LDFLAGS -X main.Version=${DEVSHARD_VERSION} -X devshard/types.buildStateRootProtocolVersion=${DEVSHARD_PROTOCOL_VERSION}" \
+    -o ./build/devshardd ./cmd/devshardd
+
 RUN mkdir /build_output
 ################################################################################
 # Binary Exporter stage (for --output optimization)
@@ -77,7 +96,7 @@ FROM scratch AS binary-exporter
 # Copy all required files to a flat structure
 COPY --from=builder /app/decentralized-api/build/dapi /build_output/decentralized-api
 COPY --from=builder /app/inference-chain/build/inferenced /build_output/inferenced
-COPY --from=builder /lib/libwasmvm_muslc.x86_64.a /build_output/libwasmvm_muslc.x86_64.a
+COPY --from=builder /lib/libwasmvm_muslc.*.a /build_output/
 COPY --from=builder /usr/lib/libgcc_s.so.1 /build_output/libgcc_s.so.1
 
 ################################################################################
@@ -104,6 +123,7 @@ ENV DAEMON_DOWNLOAD_RETRIES=-1
 # Copy over binaries from the build-env
 COPY --from=builder /app/decentralized-api/build/dapi /usr/bin/decentralized-api
 COPY --from=builder /app/inference-chain/build/inferenced /usr/bin/inferenced
+COPY --from=builder /app/devshard/build/devshardctl /usr/bin/devshardctl
 COPY ./decentralized-api/scripts/init-docker.sh /root/init-docker.sh
 COPY ./decentralized-api/config-prod.yaml /root/api-config.yaml
 COPY ./cosmovisor/v1.7.2/${GOOS}-${GOARCH}/cosmovisor /usr/bin/cosmovisor

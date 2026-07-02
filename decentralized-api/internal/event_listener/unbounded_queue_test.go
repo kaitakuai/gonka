@@ -4,14 +4,15 @@ import (
 	"context"
 	"decentralized-api/logging"
 	"fmt"
-	"github.com/productscience/inference/x/inference/types"
-	"github.com/stretchr/testify/require"
 	"math/rand"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/productscience/inference/x/inference/types"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBasicQueueOperations verifies basic enqueue/dequeue functionality
@@ -37,6 +38,49 @@ func TestBasicQueueOperations(t *testing.T) {
 		if result != expected {
 			t.Errorf("Item %d: Expected %d, got %d", i, expected, result)
 		}
+	}
+}
+
+// TestBoundedQueueBackpressureNoDropOrReorder verifies that a bounded queue
+// applies backpressure (a fast producer with a slow consumer never deadlocks
+// and never grows without bound) while still delivering every item exactly
+// once and in FIFO order. This is the core safety property the tx-event queue
+// relies on to avoid the unbounded-memory OOM.
+func TestBoundedQueueBackpressureNoDropOrReorder(t *testing.T) {
+	const capacity = 8
+	q := NewBoundedQueue[int](capacity)
+	defer q.Close()
+
+	const itemCount = 2000
+
+	produceDone := make(chan struct{})
+	go func() {
+		defer close(produceDone)
+		for i := 0; i < itemCount; i++ {
+			q.In <- i // blocks under backpressure once the queue is full
+		}
+	}()
+
+	deadline := time.After(10 * time.Second)
+	for i := 0; i < itemCount; i++ {
+		// Deliberately lag the consumer so the producer must block.
+		if i%100 == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out (possible deadlock) after receiving %d/%d items", i, itemCount)
+		case v := <-q.Out:
+			if v != i {
+				t.Fatalf("FIFO violation: expected %d, got %d", i, v)
+			}
+		}
+	}
+
+	select {
+	case <-produceDone:
+	case <-time.After(time.Second):
+		t.Fatal("producer did not finish after all items were consumed")
 	}
 }
 
@@ -318,15 +362,15 @@ func TestEmptyQueueBehavior(t *testing.T) {
 	defer q.Close()
 
 	// Try to receive with timeout
-	received := false
+	var received atomic.Bool
 	go func() {
 		<-q.Out
-		received = true
+		received.Store(true)
 	}()
 
 	// Should time out without receiving
 	time.Sleep(100 * time.Millisecond)
-	if received {
+	if received.Load() {
 		t.Error("Received value from empty queue, expected to block")
 	}
 
@@ -336,7 +380,7 @@ func TestEmptyQueueBehavior(t *testing.T) {
 	// Allow time for processing
 	time.Sleep(100 * time.Millisecond)
 
-	if !received {
+	if !received.Load() {
 		t.Error("Did not receive value after it was sent")
 	}
 }

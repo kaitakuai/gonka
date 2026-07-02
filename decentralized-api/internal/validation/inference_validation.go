@@ -10,6 +10,7 @@ import (
 	"decentralized-api/cosmosclient"
 	"decentralized-api/internal/utils"
 	"decentralized-api/logging"
+	"decentralized-api/observability"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -105,9 +107,9 @@ func (s *InferenceValidator) shouldValidateInference(
 	shouldValidate, message := calculations.ShouldValidate(
 		seed,
 		inferenceDetails,
-		uint32(inferenceDetails.TotalPower),
-		uint32(validatorPower),
-		uint32(inferenceDetails.ExecutorPower),
+		inferenceDetails.TotalPower,
+		validatorPower,
+		inferenceDetails.ExecutorPower,
 		validationParams,
 		false)
 
@@ -469,6 +471,10 @@ func (s *InferenceValidator) SampleInferenceToValidate(ids []string, transaction
 		return
 	}
 
+	_, sampleOp := observability.Inference.StartValidationSample(s.recorder.GetContext(), len(ids))
+	var sampleErr error
+	defer func() { sampleOp.FinishErr(&sampleErr) }()
+
 	logging.Debug("Sampling inf transactions to validate", types.Validation)
 
 	queryClient := transactionRecorder.NewInferenceQueryClient()
@@ -480,18 +486,21 @@ func (s *InferenceValidator) SampleInferenceToValidate(ids []string, transaction
 	if err != nil {
 		// FIXME: what should we do with validating the transaction?
 		logging.Warn("Failed to query GetInferenceValidationParameters.", types.Validation, "error", err)
+		sampleErr = err
 		return
 	}
 
 	params, err := queryClient.Params(transactionRecorder.GetContext(), &types.QueryParamsRequest{})
 	if err != nil {
 		logging.Error("Failed to get params", types.Validation, "error", err)
+		sampleErr = err
 		return
 	}
 
 	supportedModels, err := s.getCurrentSupportedModels()
 	if err != nil {
 		logging.Error("Failed to get currently available models", types.Validation, "error", err)
+		sampleErr = err
 		return
 	}
 
@@ -501,6 +510,8 @@ func (s *InferenceValidator) SampleInferenceToValidate(ids []string, transaction
 	currentSeed := s.configManager.GetCurrentSeed().Seed
 	var toValidateIds []string
 
+	totalDecisions := 0
+	selectedDecisions := 0
 	for _, inferenceWithExecutor := range r.Details {
 		if !supportedModels[inferenceWithExecutor.Model] {
 			logging.Debug("Skipping inference by not supported model", types.Validation, "inferenceId", inferenceWithExecutor.InferenceId, "model", inferenceWithExecutor.Model)
@@ -524,11 +535,27 @@ func (s *InferenceValidator) SampleInferenceToValidate(ids []string, transaction
 			params.Params.ValidationParams)
 
 		logging.Info(message, types.Validation, "inferenceId", inferenceWithExecutor.InferenceId, "seed", currentSeed, "validator", address)
-
+		observability.Inference.AddValidationSampleDecision(
+			sampleOp,
+			inferenceWithExecutor.InferenceId,
+			inferenceWithExecutor.Model,
+			inferenceWithExecutor.ExecutorId,
+			address,
+			shouldValidate,
+			message,
+			currentSeed,
+			validatorPower,
+			inferenceWithExecutor.ExecutorPower,
+			inferenceWithExecutor.TotalPower,
+		)
+		totalDecisions++
 		if shouldValidate {
+			selectedDecisions++
 			toValidateIds = append(toValidateIds, inferenceWithExecutor.InferenceId)
 		}
 	}
+	observability.Inference.SetSampledCount(sampleOp, len(toValidateIds))
+	observability.Inference.SetValidationSampleDecisionStats(sampleOp, totalDecisions, selectedDecisions, totalDecisions-selectedDecisions)
 
 	logInferencesToValidate(toValidateIds)
 	for _, inf := range toValidateIds {
@@ -571,8 +598,14 @@ func logInferencesToValidate(toValidate []string) {
 }
 
 func (s *InferenceValidator) validateInferenceAndSendValMessage(inf types.Inference, transactionRecorder cosmosclient.InferenceCosmosClient, revalidation bool) {
-	promptPayload, responsePayload, err := s.retrievePayloadsWithRetry(inf)
+	ctx, op := observability.Inference.StartValidationExecution(
+		s.recorder.GetContext(), inf.InferenceId, inf.Model, int64(inf.EpochId), revalidation)
+	var execErr error
+	defer func() { op.FinishErr(&execErr) }()
+
+	promptPayload, responsePayload, err := s.retrievePayloadsWithRetry(ctx, inf)
 	if err != nil {
+		execErr = err
 		if errors.Is(err, ErrPayloadUnavailable) {
 			// Post-upgrade inference: executor unavailable after 20 min of retries
 			s.checkAndInvalidateUnavailable(inf, transactionRecorder, revalidation)
@@ -706,11 +739,14 @@ func (s *InferenceValidator) isAlreadyValidated(inferenceId string, epochId uint
 // For post-upgrade inferences, returns ErrPayloadUnavailable for caller to handle invalidation.
 // Returns ErrHashMismatch immediately (no retry) when executor serves wrong payload with valid signature.
 // Returns ErrEpochStale if inference epoch becomes too old during retries.
-func (s *InferenceValidator) retrievePayloadsWithRetry(inf types.Inference) ([]byte, []byte, error) {
+// Retries use a short first backoff and longer subsequent backoffs, both with jitter.
+func (s *InferenceValidator) retrievePayloadsWithRetry(ctx context.Context, inf types.Inference) (_ []byte, _ []byte, retErr error) {
 	const maxRetries = 10
-	const retryInterval = 2 * time.Minute // 10 * 2 min = 20 min total
+	const firstRetryInterval = 10 * time.Second
+	const subsequentRetryInterval = 2 * time.Minute
 
-	ctx := s.recorder.GetContext()
+	ctx, op := observability.Inference.StartPayloadRetrieval(ctx, inf.InferenceId, inf.ExecutedBy, int64(inf.EpochId))
+	defer func() { op.FinishErr(&retErr) }()
 	var lastErr error
 
 	logging.Debug("Starting payload retrieval from executor", types.Validation,
@@ -724,8 +760,11 @@ func (s *InferenceValidator) retrievePayloadsWithRetry(inf types.Inference) ([]b
 			return nil, nil, ErrEpochStale
 		}
 
+		attemptCtx, attemptOp := observability.Inference.StartPayloadRetrievalAttempt(
+			ctx, inf.InferenceId, inf.ExecutedBy, int64(inf.EpochId), attempt)
 		promptPayload, responsePayload, err := RetrievePayloadsFromExecutor(
-			ctx, inf.InferenceId, inf.ExecutedBy, inf.EpochId, s.recorder)
+			attemptCtx, inf.InferenceId, inf.ExecutedBy, inf.EpochId, s.recorder)
+		attemptOp.Finish(err)
 
 		if err == nil {
 			logging.Debug("Successfully retrieved payloads from executor", types.Validation,
@@ -749,8 +788,20 @@ func (s *InferenceValidator) retrievePayloadsWithRetry(inf types.Inference) ([]b
 
 		// Wait between retries with random jitter (skip sleep on final attempt since we're done)
 		if attempt < maxRetries {
-			jitter := time.Duration(1+rand.Intn(120)) * time.Second
-			time.Sleep(retryInterval + jitter)
+			retryInterval := subsequentRetryInterval
+			jitterMaxSeconds := 120
+			if attempt == 1 {
+				retryInterval = firstRetryInterval
+				jitterMaxSeconds = 10
+			}
+			sleepDuration := retryInterval + time.Duration(1+rand.Intn(jitterMaxSeconds))*time.Second
+			timer := time.NewTimer(sleepDuration)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 
@@ -878,8 +929,21 @@ func (s *InferenceValidator) validateWithPayloads(inference types.Inference, inf
 		return &InvalidInferenceResult{inference.InferenceId, "Failed to get enforced string.", err}, nil
 	}
 
-	// From here on, errors are on the part of the validator, not the inference that was passed in
-	requestMap["enforced_tokens"] = enforcedTokens
+	isEmptySentinel := isEmptySentinelTokens(enforcedTokens)
+
+	if !isEmptySentinel && hasNonNumericTokens(enforcedTokens) {
+		logging.Warn("Executor response contains non-numeric token strings in logprobs instead of token IDs", types.Validation,
+			"inferenceId", inference.InferenceId)
+		return &InvalidInferenceResult{inference.InferenceId, "Logprobs contain decoded text instead of numeric token IDs.", nil}, nil
+	}
+
+	if isEmptySentinel {
+		logging.Info("Detected empty sentinel response; replaying prompt without enforced tokens to verify executor failure", types.Validation,
+			"inferenceId", inference.InferenceId)
+		delete(requestMap, "enforced_tokens")
+	} else {
+		requestMap["enforced_tokens"] = enforcedTokens
+	}
 	requestMap["stream"] = false
 	requestMap["skip_special_tokens"] = false
 	delete(requestMap, "stream_options")
@@ -895,15 +959,22 @@ func (s *InferenceValidator) validateWithPayloads(inference types.Inference, inf
 		return nil, err
 	}
 
-	resp, err := http.Post(
-		completionsUrl,
-		"application/json",
-		bytes.NewReader(requestBody),
-	)
+	mlCtx, mlOp := observability.Inference.StartValidationMLNode(
+		s.recorder.GetContext(), inference.InferenceId, inference.Model, inferenceNode.Id)
+	req, reqErr := http.NewRequestWithContext(mlCtx, http.MethodPost, completionsUrl, bytes.NewReader(requestBody))
+	if reqErr != nil {
+		mlOp.Finish(reqErr)
+		return nil, reqErr
+	}
+	req.Header.Set("Content-Type", "application/json")
+	observability.Inference.InjectRequestContext(mlCtx, req.Header)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		mlOp.Finish(err)
 		return nil, err
 	}
 	defer resp.Body.Close()
+	mlOp.Finish(nil)
 
 	respBodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -927,6 +998,13 @@ func (s *InferenceValidator) validateWithPayloads(inference types.Inference, inf
 		}, nil
 	}
 
+	if isEmptySentinel && resp.StatusCode == http.StatusOK {
+		logging.Warn("Executor returned error but validator successfully served the prompt", types.Validation,
+			"inferenceId", inference.InferenceId,
+			"validatorStatus", resp.StatusCode)
+		return &InvalidInferenceResult{inference.InferenceId, "Executor returned error but prompt is servable.", nil}, nil
+	}
+
 	logging.Debug("responseValidation", types.Validation, "validation", string(respBodyBytes))
 	responseValidation, err := completionapi.NewCompletionResponseFromBytes(respBodyBytes)
 	if err != nil {
@@ -945,7 +1023,13 @@ func (s *InferenceValidator) validateWithPayloads(inference types.Inference, inf
 		return nil, errors.New("no logits found in original or validation response")
 	}
 
-	return compareLogits(originalLogits, validationLogits, baseResult), nil
+	_, cmpOp := observability.Inference.StartCompareLogits(s.recorder.GetContext(), inference.InferenceId)
+	result := CompareLogits(originalLogits, validationLogits, baseResult)
+	if simResult, ok := result.(*SimilarityValidationResult); ok {
+		observability.Inference.SetSimilarity(cmpOp, simResult.Value)
+	}
+	cmpOp.Finish(nil)
+	return result, nil
 }
 
 func unmarshalResponse(inference *types.Inference) (completionapi.CompletionResponse, error) {
@@ -1036,7 +1120,34 @@ func (r InvalidInferenceResult) GetValidationResponseBytes() []byte {
 	return []byte{}
 }
 
-func compareLogits(
+const emptySentinelToken = "<EMPTY>"
+
+func isEmptySentinelTokens(et completionapi.EnforcedTokens) bool {
+	for _, t := range et.Tokens {
+		if t.Token == emptySentinelToken {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonNumericTokens(et completionapi.EnforcedTokens) bool {
+	for _, t := range et.Tokens {
+		n, err := strconv.Atoi(t.Token)
+		if err != nil || n < 0 {
+			return true
+		}
+		for _, topToken := range t.TopTokens {
+			n, err := strconv.Atoi(topToken)
+			if err != nil || n < 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func CompareLogits(
 	originalLogits []completionapi.Logprob,
 	validationLogits []completionapi.Logprob,
 	baseComparisonResult BaseValidationResult,

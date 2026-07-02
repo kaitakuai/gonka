@@ -16,8 +16,11 @@ var (
 	ErrDecodingTxHash     = errors.New("error decoding transaction hash")
 	ErrInvalidAddress     = errors.New("invalid bech32 string")
 
-	ErrTxFailedToBroadcastAndPutOnRetry = errors.New("failed to broadcast and put on retry")
-	ErrTxNotFound                       = errors.New("tx not found")
+	// Retry queue accepted the tx.
+	ErrTxQueuedForRetry = errors.New("tx queued for retry")
+	// Retryable tx could not be enqueued.
+	ErrTxRetryEnqueueFailed = errors.New("failed to enqueue tx for retry")
+	ErrTxNotFound           = errors.New("tx not found")
 )
 
 // TxResponseAction defines the action to take after broadcast based on response classification
@@ -64,6 +67,10 @@ var retryablePatterns = []string{
 
 	"unordered transaction has a timeout_timestamp that has already passed",
 	"unordered tx ttl exceeds",
+	// Out-of-gas: the per-msg-type estimate underestimated this batch's
+	// real consumption. Retry with a bumped gasWanted (estimateBatchGas
+	// applies a multiplier per attempt, see gas_estimate.go).
+	"out of gas",
 }
 
 // isRetryableRawLog checks if the raw log contains any retryable error patterns

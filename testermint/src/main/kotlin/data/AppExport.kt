@@ -40,15 +40,9 @@ data class TokenomicsData(
 data class GenesisOnlyParams(
     val totalSupply: Long,
     val originatorSupply: Long,
-    val topRewardAmount: Long,
     val standardRewardAmount: Long,
     val preProgrammedSaleAmount: Long,
-    val topRewards: Int,
     val supplyDenom: String,
-    val topRewardPeriod: Long,
-    val topRewardPayouts: Long,
-    val topRewardPayoutsPerMiner: Long,
-    val topRewardMaxDuration: Long,
     val maxIndividualPowerPercentage: Decimal?,
     val genesisGuardianEnabled: Boolean,
     val genesisGuardianNetworkMaturityThreshold: Long,
@@ -76,20 +70,54 @@ data class InferenceParams(
     val confirmationPocParams: ConfirmationPoCParams? = null,
     @SerializedName("transfer_agent_access_params")
     val transferAgentAccessParams: TransferAgentAccessParams? = null,
+    @SerializedName("devshard_escrow_params")
+    val devshardEscrowParams: DevshardEscrowParams? = null,
+    @SerializedName("fee_params")
+    val feeParams: FeeParamsData? = null,
+    @SerializedName("maintenance_params")
+    val maintenanceParams: MaintenanceParams? = null,
+    @SerializedName("delegation_params")
+    val delegationParams: DelegationParams? = null,
+)
+
+data class FeeParamsData(
+    @SerializedName("min_gas_price_ngonka")
+    val minGasPriceNgonka: Long = 0,
+    @SerializedName("base_validation_gas")
+    val baseValidationGas: Long = 0,
+    @SerializedName("gas_per_poc_count")
+    val gasPerPocCount: Long = 0,
+)
+
+data class DelegationParams(
+    @SerializedName("deploy_window")
+    val deployWindow: Long = 1,
+    @SerializedName("refusal_penalty")
+    val refusalPenalty: Decimal = Decimal(0, 0),
+    @SerializedName("no_participation_penalty")
+    val noParticipationPenalty: Decimal = Decimal(0, 0),
+    @SerializedName("delegation_share")
+    val delegationShare: Decimal = Decimal(0, 0),
+    @SerializedName("w_threshold")
+    val wThreshold: Decimal = Decimal(0, 0),
+    @SerializedName("v_min")
+    val vMin: Long = 0,
+    @SerializedName("cap_factor")
+    val capFactor: Decimal = Decimal(0, 0),
+    @SerializedName("initial_model_id")
+    val initialModelId: String = "",
+    @SerializedName("max_model_voting_power_percentage")
+    val maxModelVotingPowerPercentage: Decimal = Decimal(0, 0),
 )
 
 data class TokenomicsParams(
     val subsidyReductionInterval: Decimal,
     val subsidyReductionAmount: Decimal,
     val currentSubsidyPercentage: Decimal,
-    val topRewardAllowedFailure: Decimal,
-    val topMinerPocQualification: Long,
     @SerializedName("work_vesting_period")
     val workVestingPeriod: Long? = null,
     @SerializedName("reward_vesting_period") 
     val rewardVestingPeriod: Long? = null,
-    @SerializedName("top_miner_vesting_period")
-    val topMinerVestingPeriod: Long? = null,
 )
 
 data class BitcoinRewardParams(
@@ -144,6 +172,7 @@ data class EpochParams(
     val pocPruningMax: Long,
     @SerializedName("poc_slot_allocation")
     val pocSlotAllocation: Decimal?,
+    val confirmationPocSafetyWindow: Long,
 )
 
 data class Decimal(
@@ -157,6 +186,8 @@ data class Decimal(
     override fun equals(other: Any?): Boolean {
         return this.toDouble() == (other as? Decimal)?.toDouble()
     }
+
+    override fun hashCode(): Int = toDouble().hashCode()
 
     companion object {
         private fun fromNumber(number: Number): Decimal {
@@ -209,6 +240,10 @@ data class ValidationParams(
     val quickFailureThreshold: Decimal?,
     @SerializedName("binom_test_p0")
     val binomTestP0: Decimal?,
+    @SerializedName("claim_validation_enabled")
+    val claimValidationEnabled: Boolean = false,
+    @SerializedName("logprobs_mode")
+    val logprobsMode: String = "",
 )
 
 data class BandwidthLimitsParams(
@@ -221,7 +256,7 @@ data class BandwidthLimitsParams(
     @SerializedName("invalidations_limit")
     val invalidationsLimit: Long,
     @SerializedName("invalidations_sample_period")
-    val invalidationsSamplePeriod: Long,
+    val invalidationsSamplePeriod: Long = 1,
     @SerializedName("invalidations_limit_curve")
     val invalidationsLimitCurve: Long,
     @SerializedName("minimum_concurrent_invalidations")
@@ -246,11 +281,58 @@ data class TransferAgentAccessParams(
     val allowedTransferAddresses: List<String> = emptyList(),
 )
 
+data class DevshardApprovedVersion(
+    val name: String,
+    val binary: String,
+    val sha256: String,
+)
+
+data class DevshardEscrowParams(
+    @SerializedName("min_amount")
+    val minAmount: Long,
+    @SerializedName("max_amount")
+    val maxAmount: Long,
+    @SerializedName("max_escrows_per_epoch")
+    val maxEscrowsPerEpoch: Long,
+    @SerializedName("group_size")
+    val groupSize: Long,
+    @SerializedName("allowed_creator_addresses")
+    val allowedCreatorAddresses: List<String>? = emptyList(),
+    @SerializedName("token_price")
+    val tokenPrice: Long,
+    @SerializedName("approved_versions")
+    val approvedVersions: List<DevshardApprovedVersion>? = emptyList(),
+    @SerializedName("max_nonce")
+    val maxNonce: Long = 0,
+    @SerializedName("default_inference_seal_grace_nonces")
+    val defaultInferenceSealGraceNonces: Long = 0,
+    @SerializedName("default_inference_seal_grace_seconds")
+    val defaultInferenceSealGraceSeconds: Long = 0,
+    @SerializedName("default_auto_seal_every_n_nonces")
+    val defaultAutoSealEveryNNonces: Long = 0,
+    @SerializedName("devshard_requests_enabled")
+    val devshardRequestsEnabled: Boolean = true,
+    @SerializedName("create_devshard_fee")
+    val createDevshardFee: Long = 0,
+    @SerializedName("fee_per_nonce")
+    val feePerNonce: Long = 0,
+    @SerializedName("refusal_timeout")
+    val refusalTimeout: Long = 0,
+    @SerializedName("execution_timeout")
+    val executionTimeout: Long = 0,
+    @SerializedName("validation_rate")
+    val validationRate: Long = 0,
+    @SerializedName("vote_threshold_factor")
+    val voteThresholdFactor: Long = 0,
+)
+
 data class PocParams(
     val defaultDifficulty: Int,
     val validationSampleSize: Int,
     @SerializedName("poc_data_pruning_epoch_threshold")
     val pocDataPruningEpochThreshold: Long,
+    @SerializedName("models")
+    val models: List<PoCModelConfig> = emptyList(),
     @SerializedName("weight_scale_factor")
     val weightScaleFactor: Decimal? = null,
     @SerializedName("model_params")
@@ -269,6 +351,29 @@ data class PocParams(
     val validationSlots: Long = 2,
     @SerializedName("poc_normalization_enabled")
     val pocNormalizationEnabled: Boolean = false,  // Disabled by default in tests
+) {
+    fun primaryModelConfig(): PoCModelConfig? {
+        return models.firstOrNull()
+    }
+
+    val effectiveModelId: String?
+        get() = primaryModelConfig()?.modelId
+
+    val effectiveSeqLen: Long?
+        get() = primaryModelConfig()?.seqLen
+}
+
+data class PoCModelConfig(
+    @SerializedName("model_id")
+    val modelId: String? = null,
+    @SerializedName("seq_len")
+    val seqLen: Long? = null,
+    @SerializedName("stat_test")
+    val statTest: PoCStatTestParams? = null,
+    @SerializedName("weight_scale_factor")
+    val weightScaleFactor: Decimal? = null,
+    @SerializedName("penalty_start_epoch")
+    val penaltyStartEpoch: Long = 0,
 )
 
 data class PoCStatTestParams(
@@ -429,4 +534,35 @@ data class ExemptionUsageEntry(
     val accountAddress: String,
     @SerializedName("usage_count")
     val usageCount: Long,
+)
+
+// -----------------------
+// Maintenance Window Parameters
+// -----------------------
+// Defaults below mirror the chain's Default* constants in
+// inference-chain/x/inference/types/params.go (DefaultMaintenanceEnabled,
+// DefaultMaintenanceMinScheduleLeadBlocks, DefaultMaintenanceMaxWindowBlocks,
+// DefaultMaintenanceMaxConcurrentValidators, DefaultMaintenanceMaxConcurrentPowerBps,
+// DefaultMaintenanceCreditCapBlocks, DefaultMaintenanceCreditEarnPerEpochBlocks).
+// Keep the two sides in lockstep — testermint exercises real chain genesis,
+// so any drift here will silently mask a bug rather than expose it.
+
+data class MaintenanceParams(
+    @SerializedName("maintenance_enabled")
+    val maintenanceEnabled: Boolean = false,
+    @SerializedName("maintenance_min_schedule_lead_blocks")
+    val maintenanceMinScheduleLeadBlocks: Long = 100,
+    @SerializedName("maintenance_max_window_blocks")
+    val maintenanceMaxWindowBlocks: Long = 200,
+    // Proto types are uint32 (range 0 .. 4_294_967_295). Kotlin Int is signed
+    // and would overflow at 2_147_483_648. Widen to Long so any governance
+    // value the chain accepts can round-trip without silent truncation.
+    @SerializedName("maintenance_max_concurrent_validators")
+    val maintenanceMaxConcurrentValidators: Long = 3,
+    @SerializedName("maintenance_max_concurrent_power_bps")
+    val maintenanceMaxConcurrentPowerBps: Long = 1000,
+    @SerializedName("maintenance_credit_cap_blocks")
+    val maintenanceCreditCapBlocks: Long = 400,
+    @SerializedName("maintenance_credit_earn_per_successful_epoch_blocks")
+    val maintenanceCreditEarnPerSuccessfulEpochBlocks: Long = 20,
 )

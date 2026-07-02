@@ -12,8 +12,16 @@ class NodeAdminStateTests : TestermintTest() {
 
     @Test
     fun `test node disable during inference phase`() {
-        val (_, genesis) = initCluster(reboot = true)
-        genesis.waitForNextInferenceWindow()
+        val config = inferenceConfig.copy(
+            genesisSpec = createSpec(
+                epochLength = 25,
+                epochShift = 10
+            ),
+        )
+        val (_, genesis) = initCluster(config = config, reboot = true)
+        // Past set_new_validators so GetRandomExecutor uses all participants, not the
+        // preserved-node PoC filter (which is empty right at that boundary).
+        genesis.waitForStage(EpochStage.SET_NEW_VALIDATORS, offset = 2)
 
         val genesisValidatorBeforeDisabled = genesis.node.getStakeValidator()
         assertThat(genesisValidatorBeforeDisabled.tokens).isEqualTo(10)
@@ -53,13 +61,14 @@ class NodeAdminStateTests : TestermintTest() {
         
         logSection("Waiting for PoC phase to verify node stops")
         genesis.waitForStage(EpochStage.START_OF_POC)
-        
-        // Give reconciliation some time to kick in
         genesis.node.waitForNextBlock(2)
-        
-        // At this point, the disabled node should not participate in PoC
-        // We can verify this by checking node states or attempting operations
-        
+
+        val nodesInNextPoc = genesis.api.getNodes()
+        val disabledNodeInNextPoc = nodesInNextPoc.first { it.node.id == nodeId }
+        assertThat(disabledNodeInNextPoc.state.intendedStatus).isEqualTo("INFERENCE")
+        assertThat(disabledNodeInNextPoc.state.currentStatus).isEqualTo("INFERENCE")
+        assertThat(disabledNodeInNextPoc.state.adminState?.enabled).isFalse()
+
         logSection("Re-enabling node")
         val enableResponse = genesis.api.enableNode(nodeId)
         assertThat(enableResponse.nodeId).isEqualTo(nodeId)
@@ -72,15 +81,31 @@ class NodeAdminStateTests : TestermintTest() {
             .isTrue()
             .`as`("Node should be enabled again")
 
-        genesis.waitForStage(EpochStage.SET_NEW_VALIDATORS, offset = 3)
-        val genesisValidatorAfterNodeIsDisabled = genesis.node.getStakeValidator()
-        assertThat(genesisValidatorAfterNodeIsDisabled.tokens).isEqualTo(0)
-        assertThat(genesisValidatorAfterNodeIsDisabled.status).contains("UNBONDING")
+        logSection("Waiting past set_new_validators after re-enable")
+        genesis.waitForStage(EpochStage.SET_NEW_VALIDATORS, offset = 2)
+        genesis.waitForBlock(10) { pair ->
+            pair.api.getNodes()
+                .first { it.node.id == nodeId }
+                .let { node ->
+                    node.state.adminState?.enabled == true && node.state.currentStatus == "INFERENCE"
+                }
+        }
+
+        val nodesAfterReenableEpoch = genesis.api.getNodes()
+        val reenabledNode = nodesAfterReenableEpoch.first { it.node.id == nodeId }
+        assertThat(reenabledNode.state.adminState?.enabled).isTrue()
+        assertThat(reenabledNode.state.currentStatus).isEqualTo("INFERENCE")
     }
 
     @Test
     fun `test node disable during PoC phase`() {
-        val (_, genesis) = initCluster(reboot = true)
+        val config = inferenceConfig.copy(
+            genesisSpec = createSpec(
+                epochLength = 25,
+                epochShift = 10
+            ),
+        )
+        val (_, genesis) = initCluster(config = config, reboot = true)
         
         logSection("Waiting for PoC phase")
         genesis.waitForStage(EpochStage.START_OF_POC)
@@ -100,8 +125,8 @@ class NodeAdminStateTests : TestermintTest() {
             .isFalse()
             .`as`("Node should be disabled")
 
-        logSection("Waiting for next epoch to verify node doesn't participate")
-        genesis.waitForStage(EpochStage.END_OF_POC_VALIDATION, offset = 3)
+        logSection("Waiting for current epoch validator update")
+        genesis.waitForStage(EpochStage.SET_NEW_VALIDATORS, offset = 3)
 
         // It's too late to disable at PoC, so we expect the node to participate and keep its weight
         val genesisStakeValidatorWhenDisabledAtPoc = genesis.node.getStakeValidator()
@@ -109,16 +134,16 @@ class NodeAdminStateTests : TestermintTest() {
         assertThat(genesisStakeValidatorWhenDisabledAtPoc.status).contains("BONDED")
 
         genesis.waitForStage(EpochStage.START_OF_POC)
-        genesis.waitForStage(EpochStage.END_OF_POC_VALIDATION, offset = 3)
+        genesis.node.waitForNextBlock(2)
 
-        // At this point, disabled node should not be participating in new PoC
-        val genesisValidatorAfterOneMoreEpoch = genesis.node.getStakeValidator()
-        assertThat(genesisValidatorAfterOneMoreEpoch.tokens).isEqualTo(0)
-        assertThat(genesisValidatorAfterOneMoreEpoch.status).contains("UNBONDING")
+        // At this point, disabled node should not be participating in new PoC.
+        val nodesInNextPoc = genesis.api.getNodes()
+        val disabledNodeInNextPoc = nodesInNextPoc.first { it.node.id == nodeId }
+        assertThat(disabledNodeInNextPoc.state.intendedStatus).isEqualTo("INFERENCE")
+        assertThat(disabledNodeInNextPoc.state.currentStatus).isEqualTo("INFERENCE")
         
         logSection("Verifying disabled node state persists across epochs")
-        val nodesInNewEpoch = genesis.api.getNodes()
-        val stillDisabledNode = nodesInNewEpoch.first { it.node.id == nodeId }
+        val stillDisabledNode = genesis.api.getNodes().first { it.node.id == nodeId }
         assertThat(stillDisabledNode.state.adminState?.enabled)
             .isFalse()
             .`as`("Node should remain disabled in new epoch")
@@ -204,4 +229,4 @@ class NodeAdminStateTests : TestermintTest() {
             .isFalse()
             .`as`("Node 2 should remain disabled")
     }
-} 
+}

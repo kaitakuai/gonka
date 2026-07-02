@@ -7,8 +7,10 @@ import (
 	"decentralized-api/broker"
 	"decentralized-api/completionapi"
 	"decentralized-api/logging"
+	"decentralized-api/observability"
 	"decentralized-api/utils"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -25,6 +27,9 @@ import (
 	"github.com/productscience/inference/cmd/inferenced/cmd"
 	"github.com/productscience/inference/x/inference/calculations"
 	"github.com/productscience/inference/x/inference/types"
+	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // AuthKeyContext represents the context in which an AuthKey was used
@@ -38,10 +43,15 @@ const (
 	// BothContexts indicates the AuthKey was used for both transfer and executor requests
 	BothContexts = TransferContext | ExecutorContext
 
-	// MaxRequestBodySize is the maximum allowed size for request bodies (10 MB)
-	// This prevents memory exhaustion attacks from oversized requests
+	// MaxRequestBodySize is the maximum allowed size for request bodies (10 MiB)
 	MaxRequestBodySize = 10 * 1024 * 1024
+	// MaxRequestBodyLimit is the Echo body-limit middleware value that matches MaxRequestBodySize exactly.
+	MaxRequestBodyLimit = "10485760"
+
+	chatCompletionsPath = "/v1/chat/completions"
 )
+
+const executorCompletionsUnsupportedMsg = "selected executor does not support /v1/completions; upgrade required"
 
 // Package-level variables for AuthKey reuse prevention
 var (
@@ -124,10 +134,10 @@ func emptyButParseableResponsePayload(inferenceId, model string, promptTokens ui
 // checkAndRecordAuthKey checks if an AuthKey has been used before and records it if not
 // Returns true if the key has been used before in the specified context, false otherwise
 func checkAndRecordAuthKey(authKey string, currentBlockHeight int64, context AuthKeyContext) bool {
-	authKeysMutex.RLock()
-	existingContext, exists := usedAuthKeys[authKey]
-	authKeysMutex.RUnlock()
+	authKeysMutex.Lock()
+	defer authKeysMutex.Unlock()
 
+	existingContext, exists := usedAuthKeys[authKey]
 	if exists {
 		// If the key exists, check if it's been used in the current context
 		if existingContext&context != 0 {
@@ -135,20 +145,12 @@ func checkAndRecordAuthKey(authKey string, currentBlockHeight int64, context Aut
 		}
 
 		// Key exists but hasn't been used in this context, update the context
-		authKeysMutex.Lock()
-		defer authKeysMutex.Unlock()
-
-		// Update the context to include the new context
 		usedAuthKeys[authKey] = existingContext | context
 		return false // Key wasn't used before in this context
 	}
 
 	// Key doesn't exist, add it with the current context
-	authKeysMutex.Lock()
-	defer authKeysMutex.Unlock()
-
 	usedAuthKeys[authKey] = context
-
 	authKeysByBlock[currentBlockHeight] = append(authKeysByBlock[currentBlockHeight], authKey)
 
 	if oldestBlockHeight == 0 {
@@ -210,9 +212,30 @@ func cleanupExpiredAuthKeys(currentBlockHeight int64) {
 }
 
 func (s *Server) postChat(ctx echo.Context) error {
+	req := ctx.Request()
+	traceCtx := observability.Inference.ExtractRequestContext(req.Context(), req.Header)
+	traceCtx, op := observability.Inference.StartRequest(traceCtx, req.Method)
+	ctx.SetRequest(req.WithContext(traceCtx))
+	var err error
+	defer func() {
+		observability.Inference.SetHTTPStatus(op, ctx.Response().Status)
+		op.FinishErr(&err)
+	}()
+
+	body, err := readRequestBody(ctx.Request(), ctx.Response().Writer)
+	if err != nil {
+		logging.Error("Unable to read request body", types.Server, "error", err)
+		err = mapRequestBodyReadError(err)
+		return err
+	}
+	err = s.postChatWithBody(ctx, body, utils.GenerateSHA256Hash(string(body)), chatCompletionsPath, body)
+	return err
+}
+
+func (s *Server) postChatWithBody(ctx echo.Context, body []byte, signBodyHash string, forwardPath string, forwardBody []byte) error {
 	logging.Debug("PostChat. Received request", types.Inferences, "path", ctx.Request().URL.Path)
 
-	chatRequest, err := readRequest(ctx.Request(), ctx.Response().Writer, s.recorder.GetAccountAddress())
+	chatRequest, err := readRequest(ctx.Request(), s.recorder.GetAccountAddress(), body, signBodyHash, forwardPath, forwardBody)
 	if err != nil {
 		return err
 	}
@@ -239,11 +262,20 @@ func (s *Server) postChat(ctx echo.Context) error {
 	if err := s.enforceDeveloperAccessGate(ctx.Request().Context(), chatRequest.RequesterAddress); err != nil {
 		return err
 	}
+	if err := completionapi.ValidateOpenAICompatRequestBody(chatRequest.Body); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+
+	rootOp := observability.OperationFromContext(ctx.Request().Context())
+	observability.Inference.SetRequestIdentity(rootOp, chatRequest.OpenAiRequest.Model, chatRequest.RequesterAddress)
+	observability.Inference.SetTransferAddress(rootOp, chatRequest.TransferAddress)
 
 	if chatRequest.InferenceId != "" && chatRequest.Seed != "" {
+		observability.Inference.MarkExecutorPath(rootOp, chatRequest.InferenceId)
 		logging.Info("Executor request", types.Inferences, "inferenceId", chatRequest.InferenceId, "seed", chatRequest.Seed)
 		return s.handleExecutorRequest(ctx, chatRequest, ctx.Response().Writer)
 	} else {
+		observability.Inference.MarkTransferPath(rootOp)
 		logging.Info("Transfer request", types.Inferences, "requesterAddress", chatRequest.RequesterAddress)
 		return s.handleTransferRequest(ctx, chatRequest)
 	}
@@ -292,19 +324,25 @@ func (s *Server) enforceTransferAgentAccess(taAddress string) error {
 	return echo.NewHTTPError(http.StatusForbidden, "Transfer Agent not allowed")
 }
 
-func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) error {
+func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) (err error) {
+	traceCtx, op := observability.Inference.StartTransfer(
+		ctx.Request().Context(), request.OpenAiRequest.Model, request.RequesterAddress)
+	ctx.SetRequest(ctx.Request().WithContext(traceCtx))
+	defer func() { op.FinishErr(&err) }()
+
 	logging.Debug("GET inference requester for transfer", types.Inferences, "address", request.RequesterAddress)
 
 	queryClient := s.recorder.NewInferenceQueryClient()
-	requester, err := queryClient.InferenceParticipant(ctx.Request().Context(), &types.QueryInferenceParticipantRequest{Address: request.RequesterAddress})
+	requester, err := queryClient.AccountByAddress(ctx.Request().Context(), &types.QueryAccountByAddressRequest{Address: request.RequesterAddress})
 	if err != nil {
 		logging.Error("Failed to get inference requester", types.Inferences, "address", request.RequesterAddress, "error", err)
 		return err
 	}
 
-	promptText := ""
-	for _, message := range request.OpenAiRequest.Messages {
-		promptText += message.Content + "\n"
+	promptText, ignoredParts := FlattenMessagesText(request.OpenAiRequest.Messages)
+	if ignoredParts > 0 {
+		logging.Info("Ignored non-text prompt parts while estimating prompt size", types.Inferences,
+			"ignored_parts", ignoredParts, "model", request.OpenAiRequest.Model)
 	}
 
 	promptTokenCount, err := s.getPromptTokenEstimation(promptText, request.OpenAiRequest.Model)
@@ -343,13 +381,24 @@ func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) e
 
 	executor, err := s.getExecutorForRequest(ctx.Request().Context(), request.OpenAiRequest.Model)
 	if err != nil {
-		logging.Error("Failed to get executor", types.Inferences, "error", err)
-		return err
+		logging.Error("Failed to get executor", types.Inferences, "model", request.OpenAiRequest.Model, "error", err)
+		if st, ok := grpcstatus.FromError(err); ok {
+			if st.Code() == codes.NotFound {
+				return echo.NewHTTPError(http.StatusNotFound, "model not found")
+			}
+			return echo.NewHTTPError(http.StatusServiceUnavailable, "no executors available for model")
+		}
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "no executors available for model")
+	}
+
+	selectedLogprobsMode := s.configManager.GetValidationParams().LogprobsMode
+	if selectedLogprobsMode == "" {
+		selectedLogprobsMode = types.DefaultLogprobsMode
 	}
 
 	seed := rand.Int31()
 	inferenceUUID := request.AuthKey
-	inferenceRequest, err := createInferenceStartRequest(s, request, seed, request.AuthKey, executor, s.configManager.GetCurrentNodeVersion(), promptTokenCount)
+	inferenceRequest, err := createInferenceStartRequest(s, request, seed, request.AuthKey, executor, s.configManager.GetCurrentNodeVersion(), promptTokenCount, selectedLogprobsMode)
 	if err != nil {
 		logging.Error("Failed to create inference start request", types.Inferences, "error", err)
 		return err
@@ -368,8 +417,16 @@ func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) e
 		}
 	}()
 
-	// It's important here to send the ORIGINAL body, not the finalRequest body. The executor will AGAIN go through
-	// the same process to create the same final request body
+	forwardPath := request.ForwardPath
+	if forwardPath == "" {
+		forwardPath = chatCompletionsPath
+	}
+	forwardBody := request.ForwardBody
+	if len(forwardBody) == 0 {
+		forwardBody = request.Body
+	}
+
+	// Send the same body shape to the next hop that was used for developer signature verification.
 	logging.Debug("Sending request to executor", types.Inferences, "url", executor.Url, "seed", seed, "inferenceId", inferenceUUID)
 
 	if s.configManager.GetApiConfig().PublicUrl == executor.Url {
@@ -385,7 +442,7 @@ func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) e
 		return s.handleExecutorRequest(ctx, request, ctx.Response().Writer)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, executor.Url+"/v1/chat/completions", bytes.NewReader(request.Body))
+	req, err := http.NewRequest(http.MethodPost, executor.Url+forwardPath, bytes.NewReader(forwardBody))
 	if err != nil {
 		logging.Error("handleTransferRequest. Failed to create request to the executor node", types.Inferences, "error", err)
 		return err
@@ -402,17 +459,30 @@ func (s *Server) handleTransferRequest(ctx echo.Context, request *ChatRequest) e
 	req.Header.Set(utils.XPromptHashHeader, inferenceRequest.PromptHash)
 	req.Header.Set("Content-Type", request.Request.Header.Get("Content-Type"))
 
+	forwardCtx, forwardOp := observability.Inference.StartForwardExecutor(
+		ctx.Request().Context(), request.OpenAiRequest.Model, executor.Address, executor.Url)
+	req = req.WithContext(forwardCtx)
+	observability.Inference.InjectRequestContext(forwardCtx, req.Header)
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		forwardOp.Finish(err)
 		logging.Error("Failed to make http request to executor", types.Inferences, "error", err, "url", executor.Url)
 		return err
 	}
 	defer resp.Body.Close()
+	forwardOp.Finish(nil, attributeStatus(resp.StatusCode))
+
+	if unsupportedErr := mapExecutorCompletionsUnsupportedError(forwardPath, resp.StatusCode); unsupportedErr != nil {
+		logging.Warn("Selected executor does not support completions endpoint", types.Inferences,
+			"executor", executor.Address, "url", executor.Url, "status_code", resp.StatusCode, "path", forwardPath)
+		return unsupportedErr
+	}
 
 	logging.Info("Proxying response from executor", types.Inferences,
 		"inferenceId", inferenceUUID,
 		"executor", executor.Address)
-	proxyResponse(resp, ctx.Response().Writer, false, nil, inferenceUUID)
+	_ = ProxyResponse(resp, ctx.Response().Writer, false, nil, inferenceUUID)
 	return nil
 }
 
@@ -508,17 +578,29 @@ func (s *Server) extractPromptTextFromRequest(requestBytes []byte) (string, erro
 	if err != nil {
 		return "", err
 	}
+	if len(openAiRequest.Messages) == 0 {
+		if completionsRequest, ok := tryBuildOpenAiRequestFromCompletionsBody(requestBytes); ok {
+			openAiRequest = completionsRequest
+		}
+	}
 
-	promptText := ""
-	for _, message := range openAiRequest.Messages {
-		promptText += message.Content + "\n"
+	promptText, ignoredParts := FlattenMessagesText(openAiRequest.Messages)
+	if ignoredParts > 0 {
+		logging.Info("Ignored non-text prompt parts while extracting prompt text", types.Inferences,
+			"ignored_parts", ignoredParts, "model", openAiRequest.Model)
 	}
 	return promptText, nil
 }
 
-func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w http.ResponseWriter) error {
+func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w http.ResponseWriter) (err error) {
 	inferenceId := request.InferenceId
-	err := s.validateFullRequest(ctx, request)
+	traceCtx, op := observability.Inference.StartExecutor(
+		ctx.Request().Context(), inferenceId, request.OpenAiRequest.Model,
+		request.RequesterAddress, request.TransferAddress)
+	ctx.SetRequest(ctx.Request().WithContext(traceCtx))
+	defer func() { op.FinishErr(&err) }()
+
+	err = s.validateFullRequest(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -529,10 +611,14 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 		return echo.ErrBadRequest
 	}
 
-	modifiedRequestBody, err := completionapi.ModifyRequestBody(request.Body, int32(seed))
+	logprobsMode := s.configManager.GetValidationParams().LogprobsMode
+	if logprobsMode == "" {
+		logprobsMode = types.DefaultLogprobsMode
+	}
+	modifiedRequestBody, err := completionapi.ModifyRequestBodyWithLogprobsMode(request.Body, int32(seed), logprobsMode)
 	if err != nil {
 		logging.Warn("Unable to modify request body", types.Inferences, "error", err)
-		return err
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid chat completion request: "+err.Error())
 	}
 
 	computedPromptHash, promptPayload, err := getModifiedPromptHash(modifiedRequestBody.NewBody)
@@ -540,7 +626,11 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 		logging.Error("Failed to compute prompt hash", types.Inferences, "error", err)
 		return echo.NewHTTPError(http.StatusBadRequest, "Failed to compute prompt hash")
 	}
-	if request.PromptHash != "" && computedPromptHash != request.PromptHash {
+	if request.PromptHash == "" {
+		logging.Error("Empty prompt hash", types.Inferences)
+		return echo.NewHTTPError(http.StatusBadRequest, "Prompt hash is missing")
+	}
+	if computedPromptHash != request.PromptHash {
 		logging.Error("Prompt hash mismatch", types.Inferences,
 			"expected", request.PromptHash, "computed", computedPromptHash)
 		return echo.NewHTTPError(http.StatusBadRequest, "Prompt hash mismatch")
@@ -548,29 +638,45 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 
 	logging.Info("Attempting to lock node for inference", types.Inferences,
 		"inferenceId", inferenceId, "nodeVersion", s.configManager.GetCurrentNodeVersion())
+	inferencePath := request.ForwardPath
+	if inferencePath == "" {
+		inferencePath = chatCompletionsPath
+	}
+	mlCtx, mlOp := observability.Inference.StartMLNodeExecution(
+		ctx.Request().Context(), inferenceId, request.OpenAiRequest.Model)
 	resp, err := broker.DoWithLockedNodeHTTPRetry(s.nodeBroker, request.OpenAiRequest.Model, nil, 3, func(node *broker.Node) (*http.Response, *broker.ActionError) {
 		logging.Info("Successfully acquired node lock for inference", types.Inferences,
 			"inferenceId", inferenceId, "node", node.Id, "url", node.InferenceUrlWithVersion(s.configManager.GetCurrentNodeVersion()))
 
-		completionsUrl, err := url.JoinPath(node.InferenceUrlWithVersion(s.configManager.GetCurrentNodeVersion()), "/v1/chat/completions")
+		nodeURL := node.InferenceUrlWithVersion(s.configManager.GetCurrentNodeVersion())
+		observability.Inference.SetMLNodeTarget(mlOp, node.Id, nodeURL)
+
+		completionsUrl, err := url.JoinPath(nodeURL, inferencePath)
 		if err != nil {
 			return nil, broker.NewApplicationActionError(err)
 		}
-		resp, postErr := s.httpClient.Post(
-			completionsUrl,
-			request.Request.Header.Get("Content-Type"),
-			bytes.NewReader(modifiedRequestBody.NewBody),
-		)
+		req, reqErr := http.NewRequestWithContext(mlCtx, http.MethodPost, completionsUrl, bytes.NewReader(modifiedRequestBody.NewBody))
+		if reqErr != nil {
+			return nil, broker.NewApplicationActionError(reqErr)
+		}
+		req.Header.Set("Content-Type", request.Request.Header.Get("Content-Type"))
+		observability.Inference.InjectRequestContext(mlCtx, req.Header)
+		resp, postErr := s.httpClient.Do(req)
 		if postErr != nil {
 			return nil, broker.NewTransportActionError(postErr)
 		}
 		return resp, nil
 	})
 	if err != nil {
+		mlOp.Finish(err)
 		logging.Error("Failed to get response from inference node", types.Inferences,
 			"inferenceId", inferenceId, "error", err)
+		if errors.Is(err, broker.ErrNoNodesAvailable) {
+			return echo.NewHTTPError(http.StatusServiceUnavailable, "no inference nodes available")
+		}
 		return err
 	}
+	mlOp.Finish(nil, attributeStatus(resp.StatusCode))
 	defer resp.Body.Close()
 
 	logging.Info("Node lock released for inference", types.Inferences, "inferenceId", inferenceId)
@@ -590,7 +696,7 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 				logging.Error("Failed to create synthetic response payload", types.Inferences, "inferenceId", inferenceId)
 				return echo.NewHTTPError(http.StatusInternalServerError, "Failed to create synthetic response payload")
 			}
-			if txErr := s.sendInferenceTransaction(request.InferenceId, synthetic, request.Body, s.recorder.GetAccountAddress(), request, promptPayload); txErr != nil {
+			if txErr := s.sendInferenceTransaction(ctx.Request().Context(), request.InferenceId, synthetic, request.Body, s.recorder.GetAccountAddress(), request, promptPayload); txErr != nil {
 				logging.Error("Failed to record FinishInference after inference node payload error", types.Inferences,
 					"inferenceId", inferenceId, "error", txErr)
 			}
@@ -601,17 +707,29 @@ func (s *Server) handleExecutorRequest(ctx echo.Context, request *ChatRequest, w
 
 	responseProcessor := completionapi.NewExecutorResponseProcessor(request.InferenceId)
 	logging.Debug("Proxying response from inference node", types.Inferences, "inferenceId", request.InferenceId)
-	proxyResponse(resp, w, true, responseProcessor, inferenceId)
+	proxyErr := ProxyResponse(resp, w, true, responseProcessor, inferenceId)
 
 	logging.Debug("Processing response from inference node", types.Inferences, "inferenceId", request.InferenceId)
 	completionResponse, err := responseProcessor.GetResponse()
 
-	if err != nil || completionResponse == nil {
+	if completionResponse == nil && err == nil {
+		err = errors.New("completion response is nil")
+	}
+	if err != nil {
+		if proxyErr != nil {
+			logging.Error("Failed to proxy response before a parseable completion was available", types.Inferences,
+				"inferenceId", inferenceId, "proxyError", proxyErr, "parseError", err)
+			return fmt.Errorf("proxy response failed before parseable completion: %w", proxyErr)
+		}
 		logging.Error("Failed to parse response data into CompletionResponse", types.Inferences, "error", err)
-		return err
+		return fmt.Errorf("parse completion response: %w", err)
+	}
+	if proxyErr != nil {
+		logging.Warn("Recording FinishInference from partial proxied response", types.Inferences,
+			"inferenceId", inferenceId, "error", proxyErr)
 	}
 
-	err = s.sendInferenceTransaction(request.InferenceId, completionResponse, request.Body, s.recorder.GetAccountAddress(), request, promptPayload)
+	err = s.sendInferenceTransaction(ctx.Request().Context(), request.InferenceId, completionResponse, request.Body, s.recorder.GetAccountAddress(), request, promptPayload)
 	if err != nil {
 		// Not http.Error, because we assume we already returned everything to the client during proxyResponse execution
 		logging.Error("Failed to send inference transaction", types.Inferences, "error", err)
@@ -626,7 +744,7 @@ func (s *Server) getAllowedPubKeys(ctx echo.Context, granterAddress string) ([]s
 
 func (s *Server) validateFullRequest(ctx echo.Context, request *ChatRequest) error {
 	queryClient := s.recorder.NewInferenceQueryClient()
-	dev, err := queryClient.InferenceParticipant(ctx.Request().Context(), &types.QueryInferenceParticipantRequest{Address: request.RequesterAddress})
+	dev, err := queryClient.AccountByAddress(ctx.Request().Context(), &types.QueryAccountByAddressRequest{Address: request.RequesterAddress})
 	if err != nil {
 		logging.Error("Failed to get inference requester", types.Inferences, "address", request.RequesterAddress, "error", err)
 		return err
@@ -752,7 +870,10 @@ func (s *Server) calculateSignature(payload string, timestamp int64, transferAdd
 	return signature, nil
 }
 
-func (s *Server) sendInferenceTransaction(inferenceId string, response completionapi.CompletionResponse, requestBody []byte, executorAddress string, request *ChatRequest, promptPayload []byte) error {
+func (s *Server) sendInferenceTransaction(ctx context.Context, inferenceId string, response completionapi.CompletionResponse, requestBody []byte, executorAddress string, request *ChatRequest, promptPayload []byte) (err error) {
+	_, op := observability.Inference.StartFinishSubmission(ctx, inferenceId, executorAddress, request.OpenAiRequest.Model)
+	defer func() { op.FinishErr(&err) }()
+
 	responseHash, err := response.GetHash()
 	if err != nil || responseHash == "" {
 		logging.Error("Failed to get responseHash from response", types.Inferences, "error", err)
@@ -799,6 +920,10 @@ func (s *Server) sendInferenceTransaction(inferenceId string, response completio
 		return err
 	}
 
+	observability.Inference.SetModel(op, model)
+	observability.Inference.SetResponseHash(op, responseHash)
+	op.RecordTokens(usage.PromptTokens, usage.CompletionTokens)
+
 	if s.recorder != nil {
 		promptHash := utils.GenerateSHA256HashBytes(promptPayload)
 		originalPromptHash := utils.GenerateSHA256HashBytes(request.Body)
@@ -840,6 +965,12 @@ func (s *Server) sendInferenceTransaction(inferenceId string, response completio
 	return nil
 }
 
+// attributeStatus formats an HTTP status code as the OTel `http.status_code`
+// attribute used on outbound HTTP client spans.
+func attributeStatus(code int) attribute.KeyValue {
+	return attribute.Int("http.status_code", code)
+}
+
 func (s *Server) storePayloadsToStorage(ctx context.Context, inferenceId string, promptPayload, responsePayload []byte) {
 	if s.payloadStorage == nil {
 		logging.Warn("Cannot store payload: payloadStorage is nil", types.Inferences, "inferenceId", inferenceId)
@@ -876,10 +1007,11 @@ func getModifiedPromptHash(requestBytes []byte) (string, []byte, error) {
 	return promptHash, []byte(canonicalJSON), nil
 }
 
-func createInferenceStartRequest(s *Server, request *ChatRequest, seed int32, inferenceId string, executor *ExecutorDestination, nodeVersion string, promptTokenCount int) (*inference.MsgStartInference, error) {
-	modifiedRequest, err := completionapi.ModifyRequestBody(request.Body, seed)
+func createInferenceStartRequest(s *Server, request *ChatRequest, seed int32, inferenceId string, executor *ExecutorDestination, nodeVersion string, promptTokenCount int, logprobsMode string) (*inference.MsgStartInference, error) {
+	modifiedRequest, err := completionapi.ModifyRequestBodyWithLogprobsMode(request.Body, seed, logprobsMode)
 	if err != nil {
-		return nil, err
+		logging.Warn("Unable to normalize request body for inference start", types.Inferences, "error", err)
+		return nil, echo.NewHTTPError(http.StatusBadRequest, "invalid chat completion request: "+err.Error())
 	}
 	modifiedPromptHash, _, err := getModifiedPromptHash(modifiedRequest.NewBody)
 	if err != nil {
@@ -927,17 +1059,24 @@ func getInferenceErrorMessage(resp *http.Response) string {
 	}
 }
 
-func readRequest(request *http.Request, writer http.ResponseWriter, transferAddress string) (*ChatRequest, error) {
-	body, err := readRequestBody(request, writer)
-	if err != nil {
-		logging.Error("Unable to read request body", types.Server, "error", err)
-		return nil, err
+func readRequest(request *http.Request, transferAddress string, body []byte, signBodyHash string, forwardPath string, forwardBody []byte) (*ChatRequest, error) {
+	if forwardPath == "" {
+		forwardPath = chatCompletionsPath
 	}
 
 	openAiRequest := OpenAiRequest{}
-	err = json.Unmarshal(body, &openAiRequest)
-	if err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, &openAiRequest); err != nil {
+		logging.Warn("Invalid chat completion request body", types.Inferences, "error", err)
+		return nil, echo.NewHTTPError(http.StatusBadRequest, "invalid chat completion request: "+err.Error())
+	}
+	if len(openAiRequest.Messages) == 0 && forwardPath == completionsPath {
+		if completionsRequest, ok := tryBuildOpenAiRequestFromCompletionsBody(body); ok {
+			openAiRequest = completionsRequest
+		}
+	}
+	if forwardPath == chatCompletionsPath && len(openAiRequest.Messages) == 0 {
+		logging.Warn("Chat completion request without messages", types.Inferences)
+		return nil, echo.NewHTTPError(http.StatusBadRequest, "messages is required")
 	}
 
 	timestamp, err := strconv.ParseInt(request.Header.Get(utils.XTimestampHeader), 10, 64)
@@ -947,9 +1086,14 @@ func readRequest(request *http.Request, writer http.ResponseWriter, transferAddr
 	if request.Header.Get(utils.XTransferAddressHeader) != "" {
 		transferAddress = request.Header.Get(utils.XTransferAddressHeader)
 	}
+	if len(forwardBody) == 0 {
+		forwardBody = body
+	}
 
 	return &ChatRequest{
 		Body:              body,
+		ForwardPath:       forwardPath,
+		ForwardBody:       append([]byte(nil), forwardBody...),
 		Request:           request,
 		OpenAiRequest:     openAiRequest,
 		AuthKey:           request.Header.Get(utils.AuthorizationHeader),
@@ -960,6 +1104,7 @@ func readRequest(request *http.Request, writer http.ResponseWriter, transferAddr
 		TransferAddress:   transferAddress,
 		TransferSignature: request.Header.Get(utils.XTASignatureHeader),
 		PromptHash:        request.Header.Get(utils.XPromptHashHeader),
+		SignBodyHash:      signBodyHash,
 	}, nil
 }
 
@@ -975,17 +1120,75 @@ func readRequestBody(r *http.Request, writer http.ResponseWriter) ([]byte, error
 	return buf.Bytes(), nil
 }
 
+// mapRequestBodyReadError converts low-level body read failures into stable, safe HTTP responses.
+func mapRequestBodyReadError(err error) error {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return echo.NewHTTPError(http.StatusRequestEntityTooLarge, "request body too large")
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return echo.NewHTTPError(http.StatusBadRequest, "malformed request body")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return echo.NewHTTPError(http.StatusRequestTimeout, "request body read timeout")
+	}
+	if errors.Is(err, context.Canceled) {
+		return echo.NewHTTPError(http.StatusBadRequest, "request body read cancelled")
+	}
+	return echo.NewHTTPError(http.StatusBadRequest, "failed to read request body")
+}
+
+func mapExecutorCompletionsUnsupportedError(forwardPath string, statusCode int) error {
+	if forwardPath != completionsPath {
+		return nil
+	}
+	switch statusCode {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return echo.NewHTTPError(http.StatusServiceUnavailable, executorCompletionsUnsupportedMsg)
+	default:
+		return nil
+	}
+}
+
+func (s *Server) validateModelSupported(model string) error {
+	if model == "" {
+		return ErrNoModelSpecified
+	}
+	if s.phaseTracker == nil || s.epochGroupDataCache == nil {
+		return nil
+	}
+	epochState := s.phaseTracker.GetCurrentEpochState()
+	if epochState == nil {
+		return nil
+	}
+	epochGroupData, err := s.epochGroupDataCache.GetCurrentEpochGroupData(epochState.LatestEpoch.EpochIndex)
+	if err != nil {
+		logging.Warn("Failed to fetch current epoch group data for model validation", types.Inferences, "error", err)
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "unable to fetch current epoch group data")
+	}
+	for _, m := range epochGroupData.SubGroupModels {
+		if m == model {
+			return nil
+		}
+	}
+	return echo.NewHTTPError(http.StatusNotFound, "model not found")
+}
+
 // validateRequester validates requester with dynamic pricing fallback to legacy
-func (s *Server) validateRequester(ctx context.Context, request *ChatRequest, requester *types.QueryInferenceParticipantResponse, promptTokenCount int) error {
+func (s *Server) validateRequester(ctx context.Context, request *ChatRequest, requester *types.QueryAccountByAddressResponse, promptTokenCount int) error {
 	if requester == nil {
-		logging.Error("Inference participant not found", types.Inferences, "address", request.RequesterAddress)
-		return ErrInferenceParticipantNotFound
+		logging.Error("Account not found", types.Inferences, "address", request.RequesterAddress)
+		return ErrAccountNotFound
 	}
 
 	err := validateTransferRequest(request, requester.Pubkey)
 	if err != nil {
 		logging.Error("Unable to validate request against PubKey", types.Inferences, "error", err)
 		return echo.NewHTTPError(http.StatusUnauthorized, "Unable to validate request against PubKey:"+err.Error())
+	}
+
+	if err := s.validateModelSupported(request.OpenAiRequest.Model); err != nil {
+		return err
 	}
 
 	if request.OpenAiRequest.MaxTokens == 0 {

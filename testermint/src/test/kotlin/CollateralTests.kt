@@ -3,20 +3,62 @@ import com.productscience.data.Collateral
 import com.productscience.data.TxResponse
 import com.productscience.data.spec
 import com.productscience.data.AppState
+import com.productscience.data.Decimal
 import com.productscience.data.InferenceState
 import com.productscience.data.InferenceParams
 import com.productscience.data.ValidationParams
+import com.productscience.data.getParticipant
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.data.Offset
 import org.junit.jupiter.api.Test
+import java.time.Duration
 
 class CollateralTests : TestermintTest() {
+
+    private data class CollateralSlashExpectation(
+        val slashCount: Int,
+        val activeAmount: Long,
+        val unbondingAmount: Long,
+    )
+
+    private fun expectedCollateralAfterDowntimeSlashes(
+        activeAmount: Long,
+        unbondingAmount: Long,
+        slashFraction: Double,
+        maxSlashCount: Int,
+    ): List<CollateralSlashExpectation> {
+        var currentActive = activeAmount
+        var currentUnbonding = unbondingAmount
+
+        return (1..maxSlashCount).map { slashCount ->
+            currentActive -= (currentActive * slashFraction).toLong()
+            currentUnbonding -= (currentUnbonding * slashFraction).toLong()
+
+            CollateralSlashExpectation(
+                slashCount = slashCount,
+                activeAmount = currentActive,
+                unbondingAmount = currentUnbonding,
+            )
+        }
+    }
+
+    /** Stream vesting credits [initial_epoch_reward] at CLAIM_REWARDS; settle through epoch 2 before balance checks. */
+    private fun LocalInferencePair.waitThroughEpochRewardClaim(targetEpoch: Long) {
+        logSection("Waiting through CLAIM_REWARDS until epoch $targetEpoch rewards are settled")
+        while (getEpochData().latestEpoch.index < targetEpoch) {
+            waitForStage(EpochStage.CLAIM_REWARDS, offset = 2)
+        }
+        waitForStage(EpochStage.CLAIM_REWARDS, offset = 2)
+        node.waitForNextBlock(2)
+    }
 
     @Test
     fun `a participant can deposit collateral and withdraw it`() {
         val (cluster, genesis) = initCluster(reboot = true)
         val participant = cluster.genesis
         val participantAddress = participant.node.getColdAddress()
+
+        participant.waitThroughEpochRewardClaim(targetEpoch = 2)
 
         logSection("Despositing collateral")
 
@@ -43,12 +85,12 @@ class CollateralTests : TestermintTest() {
         assertThat(balanceAfterDeposit).isEqualTo(initialBalance - depositAmount)
 
         logSection("Withdrawing $depositAmount nicoin from ${participant.name}")
-        val epochBeforeWithdraw = participant.api.getLatestEpoch().latestEpoch.index-1
+        val currentEpoch = participant.api.getLatestEpoch().latestEpoch.index
         val startLastRewardedEpoch = getRewardCalculationEpochIndex(participant)
         val params = participant.node.queryCollateralParams()
         val unbondingPeriod = params.params.unbondingPeriodEpochs.toLong()
-        val expectedCompletionEpoch = epochBeforeWithdraw + unbondingPeriod
-        logHighlight("Expected completion epoch: $expectedCompletionEpoch (epoch $epochBeforeWithdraw + $unbondingPeriod)")
+        val expectedCompletionEpoch = currentEpoch + unbondingPeriod
+        logHighlight("Expected completion epoch: $expectedCompletionEpoch (epoch $currentEpoch + $unbondingPeriod)")
         Thread.sleep(10000)
 
         participant.withdrawCollateral(depositAmount)
@@ -96,25 +138,26 @@ class CollateralTests : TestermintTest() {
     @Test
     fun `a participant is slashed for downtime with unbonding slashed`() {
         // Configure genesis with fast expiration for downtime testing
-        val fastExpirationSpec = spec {
-            this[AppState::inference] = spec<InferenceState> {
-                this[InferenceState::params] = spec<InferenceParams> {
-                    this[InferenceParams::validationParams] = spec<ValidationParams> {
-                        this[ValidationParams::expirationBlocks] = 2L // Fast expiration for testing
+        val fastExpirationSpec = createSpec(
+            epochLength = 40,
+            epochShift = 10,
+        ).merge(spec {
+                this[AppState::inference] = spec<InferenceState> {
+                    this[InferenceState::params] = spec<InferenceParams> {
+                        this[InferenceParams::validationParams] = spec<ValidationParams> {
+                            this[ValidationParams::downtimeHThreshold] = Decimal.fromDouble(1.0)
+                        }
                     }
                 }
-            }
-        }
+            })
 
         val fastExpirationConfig = inferenceConfig.copy(
             genesisSpec = inferenceConfig.genesisSpec?.merge(fastExpirationSpec) ?: fastExpirationSpec
         )
 
-        val (cluster, genesis) = initCluster(config = fastExpirationConfig, reboot = true)
+        val (cluster, genesis) = initCluster(joinCount = 0, config = fastExpirationConfig, reboot = true)
         val genesisAddress = genesis.node.getColdAddress()
         val depositAmount = 1000L
-
-        val timeoutsAtStart = genesis.node.getInferenceTimeouts()
 
         logSection("Depositing $depositAmount nicoin for ${genesis.name}")
         genesis.depositCollateral(depositAmount)
@@ -125,9 +168,15 @@ class CollateralTests : TestermintTest() {
         assertThat(initialCollateral.amount?.amount).isEqualTo(depositAmount)
 
         logSection("Making good inferences")
+        genesis.waitForNextInferenceWindow(windowSizeInBlocks = 15)
+        var successfulGoodInferences = 0
         repeat(3) {
-            runCatching { genesis.makeInferenceRequest(inferenceRequest) }
+            val result = runCatching { genesis.makeInferenceRequest(inferenceRequest) }
+            if (result.isSuccess) {
+                successfulGoodInferences++
+            }
         }
+        logSection("Warm-up good inferences succeeded: $successfulGoodInferences/3")
         genesis.node.waitForNextBlock(1)
 
         genesis.waitForStage(EpochStage.SET_NEW_VALIDATORS)
@@ -147,49 +196,117 @@ class CollateralTests : TestermintTest() {
         assertThat(unbondingQueueBeforeSlash.unbondings).hasSize(1)
         assertThat(unbondingQueueBeforeSlash.unbondings!!.first().amount.amount).isEqualTo(withdrawAmount)
 
-
         logSection("Getting bad inferences")
         genesis.mock!!.setInferenceResponse("This is invalid json!!!")
 
-        logSection("Running inferences until genesis is INVALID")
-        repeat(15) {
-            runCatching { genesis.makeInferenceRequest(inferenceRequest) }
-        }
-        genesis.node.waitForNextBlock(1)
-        val timeoutsBefore = genesis.node.getInferenceTimeouts()
-        logSection("Total timeouts right after inference requests: ${timeoutsBefore.inferenceTimeout?.count() ?: 0}")
-
+        logSection("Running inferences until downtime slashing is observed")
         val expirationBlocks = genesis.node.getInferenceParams().params.validationParams.expirationBlocks + 1
-        val expirationBlock = genesis.getCurrentBlockHeight() + expirationBlocks
-        logSection("Waiting for expirationBlocks: $expirationBlocks")
-        genesis.node.waitForMinimumBlock(expirationBlock, "inferenceExpiration")
+        var genesisStatus = genesis.node.getRawParticipants().getParticipant(genesis)?.status
+        val maxBadInferenceBatches = 4
+        var downtimeSlashCount = 0
+        for (batch in 0 until maxBadInferenceBatches) {
+            // Expiry during PoC uses preserve-node eligibility and skips downtime penalties.
+            // Wait until we're safely in the inference window so expiries are counted as missed work.
+            genesis.waitForNextInferenceWindow(windowSizeInBlocks = expirationBlocks.toInt() + 10)
 
-        val timeoutsAfter = genesis.node.getInferenceTimeouts()
-        logSection("Total timeouts after expiration wait: ${timeoutsAfter.inferenceTimeout?.count() ?: 0}")
-        genesis.node.waitForNextBlock(2)
+            logHighlight("Submitting bad inference batch ${batch + 1}")
+            val timeoutIdsBeforeBatch = genesis.node.getInferenceTimeouts()
+                .inferenceTimeout
+                .map { it.inferenceId }
+                .toSet()
+            repeat(3) { attempt ->
+                repeat(6) {
+                    runCatching { genesis.makeInferenceRequest(inferenceRequest) }
+                }
 
-        logSection("Waiting for slashing on downtime")
-        genesis.node.waitForNextBlock(2)
-        logSection("Verifying inference was processed and status updated")
+                genesis.node.waitForNextBlock(1)
+                val sawNewTimeout = runCatching {
+                    genesis.waitForBlock(maxBlocks = expirationBlocks.toInt() + 15) { pair ->
+                        pair.node.getInferenceTimeouts()
+                            .inferenceTimeout
+                            .any { it.inferenceId !in timeoutIdsBeforeBatch }
+                    }
+                    true
+                }.getOrDefault(false)
+                if (sawNewTimeout) return@repeat
+                logSection("Batch ${batch + 1} burst ${attempt + 1} did not create a timeout yet; retrying")
+            }
+            val newTimeouts = genesis.node.getInferenceTimeouts()
+                .inferenceTimeout
+                .filterNot { it.inferenceId in timeoutIdsBeforeBatch }
+            if (newTimeouts.isEmpty()) {
+                genesisStatus = genesis.node.getRawParticipants().getParticipant(genesis)?.status
+                logSection(
+                    "Batch ${batch + 1} created no new timeouts; " +
+                        "status=$genesisStatus, continuing to next batch"
+                )
+                genesis.node.waitForNextBlock(2)
+                continue
+            }
+            val expirationBlock = newTimeouts.maxOf { it.expirationHeight.toLong() } + 1
+            logSection(
+                "Batch ${batch + 1} created ${newTimeouts.size} new timeout(s); " +
+                    "waiting for reported expiration height $expirationBlock"
+            )
+            genesis.node.waitForState(
+                description = "inferenceExpiration:block height $expirationBlock",
+                staleTimeout = Duration.ofMinutes(2),
+            ) { it.syncInfo.latestBlockHeight >= expirationBlock }
+            genesis.node.waitForNextBlock(3)
+
+            downtimeSlashCount++
+            val timeoutsAfter = genesis.node.getInferenceTimeouts()
+            genesisStatus = genesis.node.getRawParticipants().getParticipant(genesis)?.status
+            logSection("After batch ${batch + 1}: status=$genesisStatus, total timeouts=${timeoutsAfter.inferenceTimeout?.count() ?: 0}")
+            break
+        }
+
+        assertThat(downtimeSlashCount)
+            .describedAs("Expected at least one downtime slash batch before verifying collateral changes")
+            .isGreaterThan(0)
 
         logSection("Verifying collateral has been slashed proportionally")
         val inferenceParams = genesis.node.getInferenceParams().params
         val slashFraction = inferenceParams.collateralParams.slashFractionDowntime
-        
-        // Verify active collateral was slashed
-        val expectedSlashedActive = (activeAmount * slashFraction.toDouble()).toLong()
-        val expectedFinalActive = activeAmount - expectedSlashedActive
-        val finalActiveCollateral = genesis.queryCollateral(genesisAddress)
-        assertThat(finalActiveCollateral.amount?.amount).isEqualTo(expectedFinalActive)
+        val expectedOutcomes = expectedCollateralAfterDowntimeSlashes(
+            activeAmount = activeAmount,
+            unbondingAmount = withdrawAmount,
+            slashFraction = slashFraction.toDouble(),
+            maxSlashCount = downtimeSlashCount,
+        )
 
-        // Verify unbonding collateral was slashed proportionally
-        val expectedSlashedUnbonding = (withdrawAmount * slashFraction.toDouble()).toLong()
-        val expectedFinalUnbonding = withdrawAmount - expectedSlashedUnbonding
+        genesis.waitForBlock(maxBlocks = 10) { pair ->
+            val currentActive = pair.queryCollateral(genesisAddress).amount?.amount
+            val currentUnbonding = pair.node.queryUnbondingCollateral(genesisAddress)
+                .unbondings
+                ?.firstOrNull()
+                ?.amount
+                ?.amount
+
+            expectedOutcomes.any {
+                currentActive == it.activeAmount && currentUnbonding == it.unbondingAmount
+            }
+        }
+
+        val finalActiveCollateral = genesis.queryCollateral(genesisAddress)
         val finalUnbondingQueue = genesis.node.queryUnbondingCollateral(genesisAddress)
         assertThat(finalUnbondingQueue.unbondings).hasSize(1)
-        assertThat(finalUnbondingQueue.unbondings!!.first().amount.amount).isEqualTo(expectedFinalUnbonding)
+        val finalActiveAmount = finalActiveCollateral.amount?.amount
+        val finalUnbondingAmount = finalUnbondingQueue.unbondings!!.first().amount.amount
 
-        logSection("Proportional slashing verified: Active ($activeAmount -> $expectedFinalActive), Unbonding ($withdrawAmount -> $expectedFinalUnbonding)")
+        val matchedExpectation = expectedOutcomes.firstOrNull {
+            finalActiveAmount == it.activeAmount && finalUnbondingAmount == it.unbondingAmount
+        }
+
+        assertThat(matchedExpectation)
+            .describedAs("Collateral should be slashed proportionally for the same number of downtime slashes")
+            .isNotNull()
+
+        logSection(
+            "Proportional slashing verified after ${matchedExpectation!!.slashCount} downtime slashes: " +
+                "Active ($activeAmount -> ${matchedExpectation.activeAmount}), " +
+                "Unbonding ($withdrawAmount -> ${matchedExpectation.unbondingAmount})"
+        )
         
         // Mark for reboot to reset parameters for subsequent tests
         genesis.markNeedsReboot()

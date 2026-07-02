@@ -37,6 +37,7 @@ data class NodeState(
     val adminState: AdminState? = null,
     val epochModels: Map<String, EpochModel>?,
     val epochMlNodes: Map<String, EpochMlNode>?,
+    val preservedModels: Map<String, Boolean>? = null,
 )
 
 data class AdminState(
@@ -72,6 +73,11 @@ data class NodeAdminStateResponse(
 
 data class MlNodeVersionQueryResponse(
     val mlnodeVersion: MlNodeVersion
+)
+
+data class LastUpgradeHeightQueryResponse(
+    val lastUpgradeHeight: Long,
+    val found: Boolean,
 )
 
 data class MlNodeVersion(

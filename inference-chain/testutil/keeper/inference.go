@@ -2,7 +2,7 @@ package keeper
 
 import (
 	"context"
-	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,12 +17,14 @@ import (
 	"cosmossdk.io/store"
 	"cosmossdk.io/store/metrics"
 	storetypes "cosmossdk.io/store/types"
+	wasmkeeper "github.com/CosmWasm/wasmd/x/wasm/keeper"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/cosmos-sdk/codec"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	"github.com/cosmos/cosmos-sdk/runtime"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/address"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
 	"github.com/stretchr/testify/require"
@@ -33,6 +35,17 @@ import (
 	inference "github.com/productscience/inference/x/inference/module"
 	"github.com/productscience/inference/x/inference/types"
 )
+
+var bech32ConfigOnce sync.Once
+
+func ensureBech32Config() {
+	bech32ConfigOnce.Do(func() {
+		cfg := sdk.GetConfig()
+		cfg.SetBech32PrefixForAccount("gonka", "gonkapub")
+		cfg.SetBech32PrefixForValidator("gonkavaloper", "gonkavaloperpub")
+		cfg.SetBech32PrefixForConsensusNode("gonkavalcons", "gonkavalconspub")
+	})
+}
 
 func InferenceKeeper(t testing.TB) (keeper.Keeper, sdk.Context) {
 	ctrl := gomock.NewController(t)
@@ -48,6 +61,7 @@ func InferenceKeeper(t testing.TB) (keeper.Keeper, sdk.Context) {
 	upgradeKeeper := NewMockUpgradeKeeper(ctrl)
 	mock, context := InferenceKeeperWithMock(t, bankKeeper, accountKeeperMock, validatorSetMock, groupMock, stakingMock, collateralMock, streamvestingMock, bankViewKeeper, authzKeeper, upgradeKeeper)
 	bankKeeper.ExpectAny(context)
+	mock.PrecomputeSPRTValues(context)
 	return mock, context
 }
 
@@ -77,6 +91,7 @@ type InferenceMocks struct {
 	StreamVestingKeeper *MockStreamVestingKeeper
 	BankViewKeeper      *MockBankKeeper
 	AuthzKeeper         *MockAuthzKeeper
+	WasmKeeper          *MockWasmKeeper
 }
 
 func (mocks *InferenceMocks) StubForInitGenesis(ctx context.Context) {
@@ -86,11 +101,11 @@ func (mocks *InferenceMocks) StubForInitGenesis(ctx context.Context) {
 }
 
 func (mocks *InferenceMocks) StubForInitGenesisWithValidators(ctx context.Context, validators []stakingtypes.Validator) {
-	mocks.AccountKeeper.EXPECT().GetModuleAccount(ctx, types.TopRewardPoolAccName)
+	inference.IgnoreDuplicateDenomRegistration = true
+
 	mocks.AccountKeeper.EXPECT().GetModuleAccount(ctx, types.PreProgrammedSaleAccName)
 	mocks.AccountKeeper.EXPECT().GetModuleAccount(ctx, types.BridgeEscrowAccName)
 	// Kind of pointless to test the exact amount of coins minted, it'd just be a repeat of the code
-	mocks.BankKeeper.EXPECT().MintCoins(ctx, types.TopRewardPoolAccName, gomock.Any(), gomock.Any())
 	mocks.BankKeeper.EXPECT().MintCoins(ctx, types.PreProgrammedSaleAccName, gomock.Any(), gomock.Any())
 	mocks.BankViewKeeper.EXPECT().GetDenomMetaData(ctx, types.BaseCoin).Return(banktypes.Metadata{
 		Base: types.BaseCoin,
@@ -121,14 +136,14 @@ func (mocks *InferenceMocks) StubForInitGenesisWithValidators(ctx context.Contex
 func (mocks *InferenceMocks) ExpectCreateGroupWithPolicyCall(ctx context.Context, groupId uint64) {
 	mocks.GroupKeeper.EXPECT().CreateGroupWithPolicy(ctx, gomock.Any()).Return(&group.MsgCreateGroupWithPolicyResponse{
 		GroupId:            groupId,
-		GroupPolicyAddress: fmt.Sprintf("group-policy-address-%d", groupId),
+		GroupPolicyAddress: sdk.AccAddress(address.Module("test-group-policy")).String(),
 	}, nil).Times(1)
 }
 
 func (mocks *InferenceMocks) ExpectAnyCreateGroupWithPolicyCall() *gomock.Call {
 	return mocks.GroupKeeper.EXPECT().CreateGroupWithPolicy(gomock.Any(), gomock.Any()).Return(&group.MsgCreateGroupWithPolicyResponse{
 		GroupId:            0,
-		GroupPolicyAddress: "group-policy-address",
+		GroupPolicyAddress: sdk.AccAddress(address.Module("test-policy-address")).String(),
 	}, nil).Times(1)
 }
 
@@ -166,6 +181,7 @@ func InferenceKeeperReturningMocks(t testing.TB) (keeper.Keeper, sdk.Context, In
 		BankViewKeeper:      bankViewKeeper,
 		AuthzKeeper:         authzKeeper,
 	}
+	keep.PrecomputeSPRTValues(context)
 	return keep, context, mocks
 }
 
@@ -182,33 +198,38 @@ func InferenceKeeperWithMock(
 	authzKeeper types.AuthzKeeper,
 	upgradeKeeper types.UpgradeKeeper,
 ) (keeper.Keeper, sdk.Context) {
-	sdk.GetConfig().SetBech32PrefixForAccount("gonka", "gonka")
+	ensureBech32Config()
 	storeKey := storetypes.NewKVStoreKey(types.StoreKey)
+	transientStoreKey := storetypes.NewTransientStoreKey(types.TransientStoreKey)
 	blsStoreKey := storetypes.NewKVStoreKey(blstypes.StoreKey)
 
 	db := dbm.NewMemDB()
 	stateStore := store.NewCommitMultiStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
 	stateStore.MountStoreWithDB(storeKey, storetypes.StoreTypeIAVL, db)
+	stateStore.MountStoreWithDB(transientStoreKey, storetypes.StoreTypeTransient, db)
 	stateStore.MountStoreWithDB(blsStoreKey, storetypes.StoreTypeIAVL, db)
 	require.NoError(t, stateStore.LoadLatestVersion())
 
 	registry := codectypes.NewInterfaceRegistry()
 	cdc := codec.NewProtoCodec(registry)
 	authority := authtypes.NewModuleAddress(govtypes.ModuleName)
+	authorityBech32, err := sdk.Bech32ifyAddressBytes(sdk.GetConfig().GetBech32AccountAddrPrefix(), authority)
+	require.NoError(t, err)
 
 	// Create BLS keeper for testing
 	blsKeeper := blskeeper.NewKeeper(
 		cdc,
 		runtime.NewKVStoreService(blsStoreKey),
 		PrintlnLogger{},
-		authority.String(),
+		authorityBech32,
 	)
 
 	k := keeper.NewKeeper(
 		cdc,
 		runtime.NewKVStoreService(storeKey),
+		runtime.NewTransientStoreService(transientStoreKey),
 		PrintlnLogger{},
-		authority.String(),
+		authorityBech32,
 		bankMock,
 		bankViewMock,
 		groupMock,
@@ -219,7 +240,7 @@ func InferenceKeeperWithMock(
 		collateralKeeper,
 		streamvestingKeeper,
 		authzKeeper,
-		nil,
+		func() wasmkeeper.Keeper { return wasmkeeper.Keeper{} },
 		upgradeKeeper,
 	)
 

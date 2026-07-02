@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"cosmossdk.io/x/feegrant"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	authztypes "github.com/cosmos/cosmos-sdk/x/authz"
 	"github.com/labstack/echo/v4"
@@ -74,6 +75,14 @@ var (
 	cachedReportMutex sync.RWMutex
 )
 
+// GetCachedReport returns the most recently generated setup report, or nil if
+// none has been generated yet. Used by the Prometheus collector.
+func GetCachedReport() *SetupReport {
+	cachedReportMutex.RLock()
+	defer cachedReportMutex.RUnlock()
+	return cachedReport
+}
+
 // EXPERIMENTAL: Setup report endpoint for participant onboarding validation
 func (s *Server) getSetupReport(c echo.Context) error {
 	ctx := c.Request().Context()
@@ -114,6 +123,7 @@ func (s *Server) generateSetupReport(ctx context.Context) (*SetupReport, error) 
 	checks = append(checks, s.checkColdKey(ctx)...)
 	checks = append(checks, s.checkWarmKey(ctx)...)
 	checks = append(checks, s.checkPermissions(ctx))
+	checks = append(checks, s.checkFeegrant(ctx))
 	checks = append(checks, s.checkConsensusKey(ctx)...)
 	checks = append(checks, s.checkParticipant(ctx))
 	checks = append(checks, s.checkMLNodes(ctx)...)
@@ -236,7 +246,12 @@ func (s *Server) checkPermissions(ctx context.Context) Check {
 	warmKeyAddr := s.recorder.GetSignerAddress()
 
 	authzQueryClient := authztypes.NewQueryClient(s.recorder.GetClientContext())
-	grantsResp, err := authzQueryClient.GranteeGrants(ctx, &authztypes.QueryGranteeGrantsRequest{
+	// Query only the cold->warm pair. GranteeGrants scans the entire authz store
+	// (grants are keyed granter-first) and trips the node's query-gas-limit on a
+	// populated chain; Grants(granter,grantee) prefix-scans just this pair. Cf. the
+	// keeper's HasWarmKeyGrant.
+	grantsResp, err := authzQueryClient.Grants(ctx, &authztypes.QueryGrantsRequest{
+		Granter: coldKeyAddr,
 		Grantee: warmKeyAddr,
 	})
 
@@ -248,16 +263,14 @@ func (s *Server) checkPermissions(ctx context.Context) Check {
 		}
 	}
 
-	grantedFromColdKey := make(map[string]*authztypes.GrantAuthorization)
+	grantedFromColdKey := make(map[string]*authztypes.Grant)
 	for _, grant := range grantsResp.Grants {
-		if grant.Granter == coldKeyAddr {
-			var authorization authztypes.Authorization
-			if err := s.cdc.UnpackAny(grant.Authorization, &authorization); err != nil {
-				continue
-			}
-			if genericAuth, ok := authorization.(*authztypes.GenericAuthorization); ok {
-				grantedFromColdKey[genericAuth.Msg] = grant
-			}
+		var authorization authztypes.Authorization
+		if err := s.cdc.UnpackAny(grant.Authorization, &authorization); err != nil {
+			continue
+		}
+		if genericAuth, ok := authorization.(*authztypes.GenericAuthorization); ok {
+			grantedFromColdKey[genericAuth.Msg] = grant
 		}
 	}
 
@@ -311,6 +324,106 @@ func (s *Server) checkPermissions(ctx context.Context) Check {
 		ID:      "permissions_granted",
 		Status:  status,
 		Message: message,
+		Details: details,
+	}
+}
+
+func (s *Server) checkFeegrant(ctx context.Context) Check {
+	coldKeyAddr := s.recorder.GetAccountAddress()
+	warmKeyAddr := s.recorder.GetSignerAddress()
+
+	details := map[string]interface{}{
+		"cold_key_address": coldKeyAddr,
+		"warm_key_address": warmKeyAddr,
+	}
+
+	queryClient := feegrant.NewQueryClient(s.recorder.GetClientContext())
+	resp, err := queryClient.Allowance(ctx, &feegrant.QueryAllowanceRequest{
+		Granter: coldKeyAddr,
+		Grantee: warmKeyAddr,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "NotFound") {
+			return Check{
+				ID:      "feegrant_allowance",
+				Status:  FAIL,
+				Message: "No fee allowance from cold to warm key. Warm-key txs cannot pay fees from the cold account",
+				Details: details,
+			}
+		}
+		return Check{
+			ID:      "feegrant_allowance",
+			Status:  UNAVAILABLE,
+			Message: fmt.Sprintf("Unable to check feegrant allowance: %s", err.Error()),
+			Details: details,
+		}
+	}
+
+	if resp == nil || resp.Allowance == nil {
+		return Check{
+			ID:      "feegrant_allowance",
+			Status:  FAIL,
+			Message: "No fee allowance from cold to warm key",
+			Details: details,
+		}
+	}
+
+	var allowance feegrant.FeeAllowanceI
+	if err := s.cdc.UnpackAny(resp.Allowance.Allowance, &allowance); err != nil {
+		return Check{
+			ID:      "feegrant_allowance",
+			Status:  UNAVAILABLE,
+			Message: fmt.Sprintf("Failed to unpack fee allowance: %s", err.Error()),
+			Details: details,
+		}
+	}
+
+	var expiration *time.Time
+	var spendLimit sdk.Coins
+	switch a := allowance.(type) {
+	case *feegrant.BasicAllowance:
+		expiration = a.Expiration
+		spendLimit = a.SpendLimit
+		details["allowance_type"] = "BasicAllowance"
+	case *feegrant.PeriodicAllowance:
+		expiration = a.Basic.Expiration
+		spendLimit = a.Basic.SpendLimit
+		details["allowance_type"] = "PeriodicAllowance"
+		details["period_spend_limit"] = a.PeriodSpendLimit.String()
+	default:
+		details["allowance_type"] = fmt.Sprintf("%T", allowance)
+	}
+
+	if !spendLimit.IsZero() {
+		details["spend_limit"] = spendLimit.String()
+	}
+	if expiration != nil {
+		details["expiration"] = expiration.Format(time.RFC3339)
+	}
+
+	now := time.Now()
+	if expiration != nil && !expiration.After(now) {
+		return Check{
+			ID:      "feegrant_allowance",
+			Status:  FAIL,
+			Message: fmt.Sprintf("Fee allowance from cold to warm key expired at %s", expiration.Format(time.RFC3339)),
+			Details: details,
+		}
+	}
+
+	if expiration != nil && expiration.Before(now.Add(7*24*time.Hour)) {
+		return Check{
+			ID:      "feegrant_allowance",
+			Status:  PASS,
+			Message: fmt.Sprintf("Fee allowance present, expiring soon at %s", expiration.Format(time.RFC3339)),
+			Details: details,
+		}
+	}
+
+	return Check{
+		ID:      "feegrant_allowance",
+		Status:  PASS,
+		Message: "Fee allowance from cold to warm key is configured",
 		Details: details,
 	}
 }
@@ -766,6 +879,7 @@ func buildRecommendationMap() map[string]string {
 		"warm_key_in_keyring":       "Ensure warm key exists in keyring at configured location",
 		"warm_key_address_match":    "Check KEY_NAME environment variable matches keyring key name",
 		"permissions_granted":       "Run authz grant commands. See inference-chain/x/inference/permissions.go",
+		"feegrant_allowance":        "Run `inferenced tx inference grant-ml-ops-permissions <cold-key> <warm-address>` to (re)grant the fee allowance",
 		"consensus_key_match":       "Verify validator node is running and consensus key matches participant registration",
 		"active_in_epoch":           "Check PoC participation and ensure node is properly registered",
 		"validator_not_jailed":      "Unjail validator or investigate validator status issues",

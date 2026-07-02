@@ -39,13 +39,14 @@ docker compose -p genesis \
   -f docker-compose.explorer.yml \
   -f docker-compose.proxy.yml \
   -f docker-compose.bridge.yml \
+  -f docker-compose.postgres.yml \
   up -d
 sleep 40
 
 # seed node parameters for both joining nodes
 export SEED_API_URL="http://genesis-api:9000"
 export SEED_NODE_RPC_URL="http://genesis-node:26657"
-export SEED_NODE_P2P_URL="http://genesis-node:26656"
+export SEED_NODE_P2P_URL="tcp://genesis-node:26656"
 export IS_GENESIS=false
 
 # join node 'join1' with proxy
@@ -63,7 +64,7 @@ export PROXY_PORT=81
 export API_SSL_PORT=444
 export PUBLIC_URL="http://${KEY_NAME}-api:8080"
 export POC_CALLBACK_URL="http://${KEY_NAME}-api:9100"
-export P2P_EXTERNAL_ADDRESS="http://${KEY_NAME}-node:26656"
+export P2P_EXTERNAL_ADDRESS="${KEY_NAME}-node:26656"
 export PROXY_ACTIVE=true
 export BRIDGE_ACTIVE=true
 # Unique internal bridge ports for join1
@@ -91,7 +92,7 @@ export PROXY_PORT=82
 export API_SSL_PORT=445
 export PUBLIC_URL="http://${KEY_NAME}-api:8080"
 export POC_CALLBACK_URL="http://${KEY_NAME}-api:9100"
-export P2P_EXTERNAL_ADDRESS="http://${KEY_NAME}-node:26656"
+export P2P_EXTERNAL_ADDRESS="${KEY_NAME}-node:26656"
 export PROXY_ACTIVE=true
 export BRIDGE_ACTIVE=true
 # Unique internal bridge ports for join2

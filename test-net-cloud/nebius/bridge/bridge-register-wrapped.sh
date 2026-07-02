@@ -1,23 +1,71 @@
 #!/bin/bash
 set -e
 
+# bridge-utils.sh
+# Shared utilities and environment setup for Gonka testnet bridge operations.
+# NOTE: You MUST use COLD KEYS (the validator operator keys) for registration,
+# as they are the ones that hold the funds required for governance deposits.
+
 # Resolve Base Directory (Logic matches launch.py)
-BASE_DIR="${TESTNET_BASE_DIR:-/srv/dai}"
+export BASE_DIR="${TESTNET_BASE_DIR:-/srv/dai}"
+export KEY_DIR="$BASE_DIR/.inference"
+export CHAIN_ID="gonka-testnet"
+export KEY_NAME="${KEY_NAME:-gonka-account-key}"
+export NODE_OPTS="--node http://localhost:8000/chain-rpc/"
+
+# Local and key-string support
+LOCAL_MODE=false
+KEY_STRING=""
 
 # Inferenced binary path (try local first, then system)
 if [ -f "$BASE_DIR/inferenced" ]; then
-    APP_NAME="$BASE_DIR/inferenced"
+    export APP_NAME="$BASE_DIR/inferenced"
 else
-    APP_NAME="inferenced"
+    # Try to find it in common local build locations
+    if [ -f "./inference-chain/build/inferenced" ]; then
+        export APP_NAME="./inference-chain/build/inferenced"
+    elif [ -f "./build/inferenced" ]; then
+        export APP_NAME="./build/inferenced"
+    else
+        export APP_NAME="inferenced"
+    fi
 fi
 
-KEY_DIR="$BASE_DIR/.inference"
+export KEY_DIR="$BASE_DIR/.inference"
+export CHAIN_ID="gonka-testnet"
+export KEY_NAME="${KEY_NAME:-gonka-account-key}"
 
-CHAIN_ID="gonka-testnet"
-KEY_NAME="${KEY_NAME:-gonka-account-key}"
+# Port 26657 is closed on host; node is running in Docker, protecting its RPC endpoint behind proxy on port 8000.
+export NODE_OPTS="--node http://localhost:8000/chain-rpc/"
 
-# Port 26657 is closed on host, but 8000 is open (likely proxy)
-NODE_OPTS="--node http://localhost:8000/chain-rpc/"
+# Function to verify key exists and determine its backend
+# Usage:
+#   if get_keyring_backend "12345678"; then
+#       echo "Found in $KEYRING_BACKEND"
+#   else
+#       exit 1
+#   fi
+get_keyring_backend() {
+    local pass=$1
+    export KEYRING_BACKEND=""
+    
+    # Try 'file' backend first
+    if printf "%s\n" "$pass" | $APP_NAME keys show "$KEY_NAME" --keyring-backend "file" --keyring-dir "$KEY_DIR" >/dev/null 2>&1; then
+        export KEYRING_BACKEND="file"
+        echo "Found key '$KEY_NAME' in 'file' backend."
+        return 0
+    fi
+    
+    # Try 'test' backend second
+    if printf "%s\n" "$pass" | $APP_NAME keys show "$KEY_NAME" --keyring-backend "test" --keyring-dir "$KEY_DIR" >/dev/null 2>&1; then
+        export KEYRING_BACKEND="test"
+        echo "Found key '$KEY_NAME' in 'test' backend."
+        return 0
+    fi
+    
+    echo "Error: Key '$KEY_NAME' not found in $KEY_DIR (checked both 'file' and 'test' backends)."
+    return 1
+}
 
 echo "=================================================="
 echo "Registering Wrapped Token CW20 on Gonka (Host Binary Mode)"
@@ -47,23 +95,28 @@ while [[ $# -gt 0 ]]; do
       USE_REPO_WASM=true
       shift
       ;;
-    --password)
-      PASSWORD="$2"
-      shift # past argument
-      shift # past value
-      ;;
-    --proposal)
-      PROPOSAL_ID_ARG="$2"
-      shift # past argument
-      shift # past value
-      ;;
+    --password) PASSWORD="$2"; shift 2 ;;
+    --proposal) PROPOSAL_ID_ARG="$2"; shift 2 ;;
+    --key-string) KEY_STRING="$2"; shift 2 ;;
+    --local) LOCAL_MODE=true; shift ;;
     *)
       echo "Error: Unknown option $1"
-      echo "Usage: ssh user@host \"bash -s\" -- < script.sh [--code-id ID | --wasm PATH] [--password PASS] [--proposal ID]"
+      echo "Usage: ssh user@host \"bash -s\" -- < script.sh [--code-id ID | --wasm PATH] [--password PASS] [--proposal ID] [--key-string STR] [--local]"
       exit 1
       ;;
   esac
 done
+
+if [ "$LOCAL_MODE" = true ]; then
+    export KEY_DIR="${HOME}/.inference"
+    export NODE_OPTS=""
+fi
+
+if [ -n "$KEY_STRING" ]; then
+    echo "Importing key from string..."
+    printf "%s\n%s\n%s\n" "$KEY_STRING" "$PASSWORD" "$PASSWORD" | $APP_NAME keys add "$KEY_NAME" --recover --keyring-backend "test" --home "$KEY_DIR"
+    export KEYRING_BACKEND="test"
+fi
 
 # Validation
 if [ -z "$PROPOSAL_ID_ARG" ] && [ -z "$CODE_ID" ] && [ -z "$WASM_PATH" ] && [ "$USE_REPO_WASM" = false ]; then
@@ -99,23 +152,7 @@ run_keys_cmd() {
     printf "%s\n%s\n" "$PASSWORD" "$PASSWORD" | $APP_NAME keys $cmd_args
 }
 
-# 1. Verify Key Exists locally
-check_key() {
-    local backend=$1
-    if printf "%s\n" "$PASSWORD" | $APP_NAME keys show "$KEY_NAME" --keyring-backend "$backend" --keyring-dir "$KEY_DIR" >/dev/null 2>&1; then
-        return 0
-    fi
-    return 1
-}
-
-if check_key "file"; then
-    KEYRING_BACKEND="file"
-elif check_key "test"; then
-    KEYRING_BACKEND="test"
-else
-    echo "Error: Key '$KEY_NAME' not found in $KEY_DIR"
-    exit 1
-fi
+get_keyring_backend "$PASSWORD" || exit 1
 
 # Get Key Address
 MY_ADDR=$(run_keys_cmd show "$KEY_NAME" -a --keyring-backend "$KEYRING_BACKEND" --home "$BASE_DIR/.inference" 2>/dev/null)

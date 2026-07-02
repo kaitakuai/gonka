@@ -4,6 +4,7 @@ import groovy.lang.Closure
 
 plugins {
     kotlin("jvm") version "2.0.10"
+    id("com.google.protobuf") version "0.9.4"
 }
 
 group = "com.productscience"
@@ -82,15 +83,19 @@ tasks.register("listAllTestClasses") {
 }
 
 /**
- * Helper function to extract class definitions from a Kotlin file
- * 
- * This function parses the file content to identify individual class definitions,
- * returning a list of pairs where each pair contains:
+ * Helper function to extract top-level test class definitions from a Kotlin file.
+ *
+ * Only plain `class` declarations are matched -- `data class`, `enum class`,
+ * `sealed class`, `inner class`, `value class`, and `annotation class` are
+ * excluded because they are never test classes and their presence (e.g. as
+ * local data classes inside a test method) would create spurious matrix entries.
+ *
+ * Returns a list of pairs where each pair contains:
  * 1. The class name (or null if it couldn't be determined)
  * 2. The full class content including annotations and methods
  */
 fun extractClassDefinitions(fileContent: String): List<Pair<String?, String>> {
-    val classRegex = Regex("""(?:@\w+(?:\(.*?\))?[\s\n]*)*class\s+(\w+)""", RegexOption.DOT_MATCHES_ALL)
+    val classRegex = Regex("""(?:@\w+(?:\(.*?\))?[\s\n]*)*(?<!data )(?<!enum )(?<!inner )(?<!sealed )(?<!value )(?<!annotation )class\s+(\w+)""", RegexOption.DOT_MATCHES_ALL)
     val matches = classRegex.findAll(fileContent)
     
     val classes = mutableListOf<Pair<String?, String>>()
@@ -255,6 +260,31 @@ dependencies {
     // Jackson for YAML parsing with Kotlin data class support
     implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.15.2")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.15.2")
+    implementation("io.grpc:grpc-stub:1.70.0")
+    implementation("io.grpc:grpc-protobuf:1.70.0")
+    implementation("io.grpc:grpc-netty-shaded:1.70.0")
+    implementation("com.google.protobuf:protobuf-java:4.29.3")
+    implementation("javax.annotation:javax.annotation-api:1.3.2")
+    // PostgreSQL JDBC for DevshardPostgresStorageTests (gated by -PusePostgres).
+    implementation("org.postgresql:postgresql:42.7.4")
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:4.29.3"
+    }
+    plugins {
+        create("grpc") {
+            artifact = "io.grpc:protoc-gen-grpc-java:1.70.0"
+        }
+    }
+    generateProtoTasks {
+        all().forEach {
+            it.plugins {
+                create("grpc")
+            }
+        }
+    }
 }
 
 tasks.withType<JavaExec>().configureEach {
@@ -265,16 +295,22 @@ tasks.test {
     filter {
         isFailOnNoMatchingTests = false
     }
-    
+
     outputs.upToDateWhen { false }
     useJUnitPlatform {
-        val includeTags = System.getProperty("includeTags")
-        val excludeTags = System.getProperty("excludeTags")
-        if (includeTags != null) {
-            includeTags(*includeTags.split(",").toTypedArray())
+        val includeTags = System.getProperty("includeTags")?.trim()
+        val excludeTags = System.getProperty("excludeTags")?.trim()
+        if (!includeTags.isNullOrEmpty()) {
+            val tags = includeTags.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            if (tags.isNotEmpty()) {
+                includeTags(*tags.toTypedArray())
+            }
         }
-        if (excludeTags != null) {
-            excludeTags(*excludeTags.split(",").toTypedArray())
+        if (!excludeTags.isNullOrEmpty()) {
+            val tags = excludeTags.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            if (tags.isNotEmpty()) {
+                excludeTags(*tags.toTypedArray())
+            }
         }
     }
     systemProperty("java.net.preferIPv6Addresses", "true")
