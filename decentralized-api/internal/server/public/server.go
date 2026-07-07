@@ -11,7 +11,6 @@ import (
 	"decentralized-api/payloadstorage"
 	"decentralized-api/poc/artifacts"
 	"decentralized-api/statsstorage"
-	"devshard"
 	"net/http"
 	"time"
 
@@ -21,7 +20,10 @@ import (
 	echomw "github.com/labstack/echo/v4/middleware"
 )
 
-const httpClientTimeout = 30 * time.Minute
+const (
+	httpClientTimeout          = 30 * time.Minute
+	deprecatedDevshardV1Prefix = "/v1/devshard"
+)
 
 type Server struct {
 	e                   *echo.Echo
@@ -99,9 +101,9 @@ func NewServer(
 	g.GET("status", s.getStatus)
 	g.GET("identity", s.getIdentity)
 
-	g.POST("chat/completions", s.postChat)
-	g.POST("completions", s.postCompletions)
-	g.GET("chat/completions", s.getChatById)
+	g.POST("chat/completions", classicInferenceDeprecated)
+	g.POST("completions", classicInferenceDeprecated)
+	g.GET("chat/completions", classicInferenceDeprecated)
 	g.GET("inference/payloads", s.getInferencePayloads)
 
 	g.GET("participants/:address", s.getAccountByAddress)
@@ -165,13 +167,27 @@ func NewServer(
 	v2 := e.Group("/v2/")
 	v2.GET("participants/:address", s.getParticipantByAddress)
 	v2.GET("accounts/:address", s.getAccountByAddress)
+	e.Any(deprecatedDevshardV1Prefix, legacyDevshardDeprecated)
+	e.Any(deprecatedDevshardV1Prefix+"/*", legacyDevshardDeprecated)
 	return s
 }
 
-// DevshardGroup returns an echo group for mounting devshard routes.
-// Mounted under /v1/devshard so nginx's existing /v1/ location proxies it.
-func (s *Server) DevshardGroup() *echo.Group {
-	return s.e.Group(devshard.LegacyRoutePrefix)
+func legacyDevshardDeprecated(c echo.Context) error {
+	c.Response().Header().Set("Deprecation", "true")
+	c.Response().Header().Set("Link", `</devshard/{version}>; rel="successor-version"`)
+	return c.JSON(http.StatusGone, map[string]string{
+		"error":   "deprecated",
+		"message": "/v1/devshard is deprecated; use /devshard/{version}",
+	})
+}
+
+func classicInferenceDeprecated(c echo.Context) error {
+	c.Response().Header().Set("Deprecation", "true")
+	c.Response().Header().Set("Link", `</devshard/{version}>; rel="successor-version"`)
+	return c.JSON(http.StatusGone, map[string]string{
+		"error":   "deprecated",
+		"message": "classic inference is deprecated; use devshard",
+	})
 }
 
 func (s *Server) Start(addr string) {
