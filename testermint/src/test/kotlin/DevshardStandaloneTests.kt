@@ -378,7 +378,10 @@ class DevshardStandaloneTests : TestermintTest() {
                     .isEqualTo(session.escrowId.toString())
                 assertThat(result.parsed.stateRootAndProtocolVersion).isEqualTo(devshardStateRootProtocolVersion())
                 assertThat(result.parsed.hostStats).isNotEmpty()
-                assertThat(result.parsed.hostStats.sumOf { it.completedValidations ?: 0 }).isGreaterThan(0)
+                // Settlement host_stats validation counters are always zero on this
+                // branch: the reveal-based recomputeCompliance was removed with seed
+                // reveal (see devshard/docs/inference-lifecycle.md). Validation
+                // coverage is asserted via validationObservability below instead.
                 assertThat(result.parsed.signatures).isNotEmpty()
                 val obs = genesis.getDevshardShardStatsDetail(session.escrowId, routePrefix = overrideRoutePrefix)
                 assertThat(obs.validationObservability.totals.completedValidations)
