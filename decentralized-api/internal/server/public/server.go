@@ -8,10 +8,12 @@ import (
 	"decentralized-api/internal"
 	"decentralized-api/internal/authzcache"
 	"decentralized-api/internal/server/middleware"
+	"decentralized-api/observability"
 	"decentralized-api/payloadstorage"
 	"decentralized-api/poc/artifacts"
 	"decentralized-api/statsstorage"
 	"devshard"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -158,6 +160,31 @@ func NewServer(
 	// PoC artifact state endpoint (for testermint/validators to get real count and root_hash)
 	g.GET("poc/artifacts/state", s.getPocArtifactsState)
 
+	// Public mlnode metrics federation: one endpoint that merges the schema v1
+	// metrics of every mlnode this participant runs, each series labelled with
+	// its node_id (plus mlnode_up per reachable node). The mlnodes stay
+	// private — only this api reaches them (their /api/v1/metrics exporter,
+	// which owns allowlist filtering). Cached (10s, single-flighted) so public
+	// scrapes cost the mlnodes at most one fan-out per TTL; IP rate limited
+	// per contract D6. Publicly reachable at /v1/mlnodes/metrics via nginx's
+	// existing /v1/ proxy. Kill switch: DAPI_API__MLNODE_METRICS_DISABLED=true.
+	if !configManager.GetApiConfig().MLNodeMetricsDisabled {
+		mlnodeMetricsRateLimiter := echomw.RateLimiter(echomw.NewRateLimiterMemoryStoreWithConfig(
+			echomw.RateLimiterMemoryStoreConfig{
+				Rate:      1, // per-IP; contract D6: 1 req/s, burst 5
+				Burst:     5,
+				ExpiresIn: 3 * time.Minute,
+			},
+		))
+		g.GET("mlnodes/metrics",
+			echo.WrapHandler(observability.MLNodeMetricsHandler(s.mlNodeMetricsTargets, observability.MLNodeMetricsConfig{
+				CacheTTL:      10 * time.Second,
+				ScrapeTimeout: 5 * time.Second,
+			})),
+			mlnodeMetricsRateLimiter,
+		)
+	}
+
 	v2 := e.Group("/v2/")
 	v2.GET("participants/:address", s.getParticipantByAddress)
 	v2.GET("accounts/:address", s.getAccountByAddress)
@@ -178,4 +205,25 @@ func (s *Server) getStatus(ctx echo.Context) error {
 	return ctx.JSON(http.StatusOK, struct {
 		Status string `json:"status"`
 	}{Status: "ok"})
+}
+
+// mlNodeMetricsTargets snapshots the participant's current mlnodes and where
+// to scrape each one: the mlnode API exporter (GET /api/v1/metrics on the PoC
+// port) — NOT raw vLLM /metrics. The exporter owns the schema v1 allowlist
+// filtering and label normalization, and answers 404 when metrics are
+// disabled (GONKA_METRICS=off) or the image predates them, which excludes
+// the node from the federation output.
+func (s *Server) mlNodeMetricsTargets() ([]observability.MLNodeTarget, error) {
+	nodes, err := s.nodeBroker.GetNodes()
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]observability.MLNodeTarget, 0, len(nodes))
+	for _, n := range nodes {
+		targets = append(targets, observability.MLNodeTarget{
+			ID:  n.Node.Id,
+			URL: fmt.Sprintf("%s/api/v1/metrics", n.Node.PoCUrl()),
+		})
+	}
+	return targets, nil
 }
