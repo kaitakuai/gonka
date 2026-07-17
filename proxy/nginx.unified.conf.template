@@ -171,7 +171,7 @@ http {
             set $$limit_zone_name "METRICS";
             ${LIMIT_REQ_RULE_METRICS}
             ${LIMIT_CONN_RULE_METRICS}
-            ${API_STATUS}
+            ${CORS_CONFIG}
             proxy_pass http://api_backend/v1/mlnodes/metrics;
             proxy_set_header Host $$host;
             proxy_set_header X-Real-IP $$remote_addr;
@@ -184,7 +184,7 @@ http {
             set $$limit_zone_name "METRICS";
             ${LIMIT_REQ_RULE_METRICS}
             ${LIMIT_CONN_RULE_METRICS}
-            ${API_STATUS}
+            ${CORS_CONFIG}
             proxy_pass http://api_backend/v1/mlnodes/metrics;
             proxy_set_header Host $$host;
             proxy_set_header X-Real-IP $$remote_addr;
