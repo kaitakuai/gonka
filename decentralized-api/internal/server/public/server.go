@@ -165,12 +165,14 @@ func NewServer(
 	// decision: one source of truth); compute stays bounded regardless via
 	// the cached single-flight fan-out. Kill switch:
 	// DAPI_API__MLNODE_METRICS_DISABLED=true.
-	if !configManager.GetApiConfig().MLNodeMetricsDisabled {
-		g.GET("mlnodes/metrics",
-			echo.WrapHandler(observability.MLNodeMetricsHandler(s.mlNodeMetricsTargets, observability.MLNodeMetricsConfig{})),
-			echomw.Gzip(),
-		)
-	}
+	mlnodeMetricsHandler := echo.WrapHandler(observability.MLNodeMetricsHandler(s.mlNodeMetricsTargets, observability.MLNodeMetricsConfig{}))
+	g.GET("mlnodes/metrics", func(c echo.Context) error {
+		// evaluated per request so the kill switch works without a restart
+		if configManager.GetApiConfig().MLNodeMetricsDisabled {
+			return c.NoContent(http.StatusNotFound)
+		}
+		return mlnodeMetricsHandler(c)
+	}, echomw.Gzip())
 
 	v2 := e.Group("/v2/")
 	v2.GET("participants/:address", s.getParticipantByAddress)

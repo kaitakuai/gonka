@@ -353,3 +353,55 @@ func TestMLNodeMetricsHandler_ReservedUpFamilyIgnored(t *testing.T) {
 		t.Fatalf("aggregator's own up series missing:\n%s", body)
 	}
 }
+
+// A node smuggling its own node_id label must not produce duplicate label
+// names (which invalidate the entire merged exposition).
+func TestMLNodeMetricsHandler_NodeSuppliedNodeIDLabelStripped(t *testing.T) {
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("# TYPE m gauge\nm{node_id=\"evil\"} 1\n"))
+	}))
+	defer node.Close()
+	list := func() ([]MLNodeTarget, error) {
+		return []MLNodeTarget{{ID: "real", URL: node.URL}}, nil
+	}
+	rr := httptest.NewRecorder()
+	MLNodeMetricsHandler(list, MLNodeMetricsConfig{}).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rr.Body.String()
+	if strings.Contains(body, `node_id="evil"`) {
+		t.Fatalf("node-supplied node_id must be stripped:\n%s", body)
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	if _, err := parser.TextToMetricFamilies(strings.NewReader(body)); err != nil {
+		t.Fatalf("merged output must stay parseable: %v\n%s", err, body)
+	}
+	if !strings.Contains(body, `m{node_id="real"} 1`) {
+		t.Fatalf("series lost its aggregator-owned node_id:\n%s", body)
+	}
+}
+
+// Two nodes disagreeing on a family's type must not merge into one invalid
+// family; the later node's family is dropped.
+func TestMLNodeMetricsHandler_TypeMismatchDropped(t *testing.T) {
+	gaugeNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("# TYPE m gauge\nm 1\n"))
+	}))
+	defer gaugeNode.Close()
+	counterNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("# TYPE m counter\nm 2\n"))
+	}))
+	defer counterNode.Close()
+	list := func() ([]MLNodeTarget, error) {
+		return []MLNodeTarget{
+			{ID: "a", URL: gaugeNode.URL}, {ID: "b", URL: counterNode.URL}}, nil
+	}
+	rr := httptest.NewRecorder()
+	MLNodeMetricsHandler(list, MLNodeMetricsConfig{}).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rr.Body.String()
+	if strings.Count(body, "\nm{") != 1 {
+		t.Fatalf("exactly one node's family must survive a type mismatch:\n%s", body)
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	if _, err := parser.TextToMetricFamilies(strings.NewReader(body)); err != nil {
+		t.Fatalf("merged output must stay parseable: %v\n%s", err, body)
+	}
+}

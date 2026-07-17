@@ -148,7 +148,13 @@ func (a *mlnodeAggregator) render(ctx context.Context, format expfmt.Format) ([]
 	for _, f := range responseFormats {
 		encoded, encErr := encodeExposition(fams, up, f)
 		if encErr != nil {
-			return nil, encErr
+			// only the requested format's failure is the caller's problem;
+			// the other format simply stays uncached
+			if f == format {
+				return nil, encErr
+			}
+			delete(a.cached, f)
+			continue
 		}
 		a.cached[f] = encoded
 	}
@@ -204,6 +210,15 @@ func (a *mlnodeAggregator) build(ctx context.Context) (map[string]*dto.MetricFam
 					continue
 				}
 				if existing, ok := merged[name]; ok {
+					if existing.GetType() != fam.GetType() {
+						// mixed image versions can disagree on a family's
+						// type; concatenating under one header would make
+						// the family invalid for strict consumers
+						_ = logObservabilityError("mlnode_metrics_type_mismatch",
+							"family type mismatch across nodes, dropping later node's family",
+							nil, "family", name, "node_id", t.ID)
+						continue
+					}
 					// same family from another node: HELP/TYPE written once
 					existing.Metric = append(existing.Metric, fam.Metric...)
 				} else {
@@ -285,7 +300,15 @@ func (a *mlnodeAggregator) scrapeOne(ctx context.Context, t MLNodeTarget) (map[s
 	}
 	for _, fam := range fams {
 		for _, m := range fam.Metric {
-			m.Label = append(m.Label, &dto.LabelPair{Name: strp("node_id"), Value: strp(t.ID)})
+			// node_id is reserved: a node-supplied copy would create
+			// duplicate label names and invalidate the whole exposition
+			kept := m.Label[:0]
+			for _, l := range m.Label {
+				if l.GetName() != "node_id" {
+					kept = append(kept, l)
+				}
+			}
+			m.Label = append(kept, &dto.LabelPair{Name: strp("node_id"), Value: strp(t.ID)})
 		}
 	}
 	return fams, nil
