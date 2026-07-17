@@ -448,7 +448,7 @@ GONKA_API_RATE_LIMIT_VAL=${GONKA_API_RATE_LIMIT_RPS:-10}
 # Dedicated budget for the public mlnode metrics federation endpoint:
 # separated from api_zone so scraping consumers (Prometheus/Grafana) do not
 # compete with inference/API clients for the same bucket.
-METRICS_RATE_LIMIT_VAL=${METRICS_RATE_LIMIT_RPM:-60}
+METRICS_RATE_LIMIT_VAL=${METRICS_RATE_LIMIT_RPM:-10}
 METRICS_RATE_UNIT=${METRICS_RATE_UNIT:-m}
 METRICS_BURST=${METRICS_BURST:-30}
 METRICS_CONN_LIMIT=${METRICS_CONN_LIMIT:-20}
