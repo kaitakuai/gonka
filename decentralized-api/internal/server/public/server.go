@@ -12,7 +12,6 @@ import (
 	"decentralized-api/payloadstorage"
 	"decentralized-api/poc/artifacts"
 	"decentralized-api/statsstorage"
-	"devshard"
 	"net/http"
 	"net/url"
 	"time"
@@ -23,7 +22,10 @@ import (
 	echomw "github.com/labstack/echo/v4/middleware"
 )
 
-const httpClientTimeout = 30 * time.Minute
+const (
+	httpClientTimeout          = 30 * time.Minute
+	deprecatedDevshardV1Prefix = "/v1/devshard"
+)
 
 type Server struct {
 	e                   *echo.Echo
@@ -33,6 +35,7 @@ type Server struct {
 	blockQueue          *BridgeQueue
 	bandwidthLimiter    *internal.BandwidthLimiter
 	identityCache       *identityCache
+	versionsCache       *versionsCache
 	payloadStorage      payloadstorage.PayloadStorage
 	phaseTracker        *chainphase.ChainPhaseTracker
 	epochGroupDataCache *internal.EpochGroupDataCache
@@ -68,6 +71,9 @@ func NewServer(
 	opts ...ServerOption) *Server {
 	e := echo.New()
 	e.HTTPErrorHandler = middleware.TransparentErrorHandler
+	// Avoid Echo's legacy RealIP behavior, which trusts the left-most XFF value.
+	// This extracts the nearest untrusted hop from XFF (falling back to RemoteAddr).
+	e.IPExtractor = echo.ExtractIPFromXFFHeader()
 
 	// Set the package-level configManagerRef
 	configManagerRef = configManager
@@ -79,6 +85,7 @@ func NewServer(
 		recorder:            recorder,
 		blockQueue:          blockQueue,
 		identityCache:       newIdentityCache(),
+		versionsCache:       newVersionsCache(),
 		payloadStorage:      payloadStorage,
 		phaseTracker:        phaseTracker,
 		epochGroupDataCache: internal.NewEpochGroupDataCache(recorder),
@@ -99,9 +106,9 @@ func NewServer(
 	g.GET("status", s.getStatus)
 	g.GET("identity", s.getIdentity)
 
-	g.POST("chat/completions", s.postChat)
-	g.POST("completions", s.postCompletions)
-	g.GET("chat/completions", s.getChatById)
+	g.POST("chat/completions", classicInferenceDeprecated)
+	g.POST("completions", classicInferenceDeprecated)
+	g.GET("chat/completions", classicInferenceDeprecated)
 	g.GET("inference/payloads", s.getInferencePayloads)
 
 	g.GET("participants/:address", s.getAccountByAddress)
@@ -112,6 +119,7 @@ func NewServer(
 	g.POST("verify-block", s.postVerifyBlock)
 
 	g.GET("pricing", s.getPricing)
+	g.GET("supply/total", s.getTotalSupply)
 	g.GET("models", s.getModels)
 	g.GET("governance/pricing", s.getGovernancePricing)
 	g.GET("governance/models", s.getGovernanceModels)
@@ -132,6 +140,7 @@ func NewServer(
 
 	g.GET("bridge/status", s.getBridgeStatus)
 	g.GET("bridge/addresses", s.getBridgeAddresses)
+	g.GET("bridge/block/latest", s.getLatestBridgeBlock)
 
 	g.GET("epochs/:epoch", s.getEpochById)
 	g.GET("epochs/:epoch/participants", s.getParticipantsByEpoch)
@@ -147,15 +156,16 @@ func NewServer(
 	g.GET("restrictions/exemptions", s.getRestrictionsExemptions)
 	g.GET("restrictions/exemptions/:id/usage/:account", s.getRestrictionsExemptionUsage)
 
-	// PoC proofs endpoint with IP rate limiting (100 req/min per IP)
+	// PoC proofs endpoint with IP rate limiting (300 req/min per IP)
 	pocProofsRateLimiter := echomw.RateLimiter(echomw.NewRateLimiterMemoryStoreWithConfig(
 		echomw.RateLimiterMemoryStoreConfig{
-			Rate:      300.0 / 60.0, // 100 requests per minute
+			Rate:      300.0 / 60.0, // 300 requests per minute
 			Burst:     30,
 			ExpiresIn: 3 * time.Minute,
 		},
 	))
 	g.POST("poc/proofs", s.postPocProofs, pocProofsRateLimiter)
+	g.POST("poc/proofs/by-nonce", s.postPocProofsByNonce, pocProofsRateLimiter)
 
 	// PoC artifact state endpoint (for testermint/validators to get real count and root_hash)
 	g.GET("poc/artifacts/state", s.getPocArtifactsState)
@@ -177,13 +187,27 @@ func NewServer(
 	v2 := e.Group("/v2/")
 	v2.GET("participants/:address", s.getParticipantByAddress)
 	v2.GET("accounts/:address", s.getAccountByAddress)
+	e.Any(deprecatedDevshardV1Prefix, legacyDevshardDeprecated)
+	e.Any(deprecatedDevshardV1Prefix+"/*", legacyDevshardDeprecated)
 	return s
 }
 
-// DevshardGroup returns an echo group for mounting devshard routes.
-// Mounted under /v1/devshard so nginx's existing /v1/ location proxies it.
-func (s *Server) DevshardGroup() *echo.Group {
-	return s.e.Group(devshard.LegacyRoutePrefix)
+func legacyDevshardDeprecated(c echo.Context) error {
+	c.Response().Header().Set("Deprecation", "true")
+	c.Response().Header().Set("Link", `</devshard/{version}>; rel="successor-version"`)
+	return c.JSON(http.StatusGone, map[string]string{
+		"error":   "deprecated",
+		"message": "/v1/devshard is deprecated; use /devshard/{version}",
+	})
+}
+
+func classicInferenceDeprecated(c echo.Context) error {
+	c.Response().Header().Set("Deprecation", "true")
+	c.Response().Header().Set("Link", `</devshard/{version}>; rel="successor-version"`)
+	return c.JSON(http.StatusGone, map[string]string{
+		"error":   "deprecated",
+		"message": "classic inference is deprecated; use devshard",
+	})
 }
 
 func (s *Server) Start(addr string) {
