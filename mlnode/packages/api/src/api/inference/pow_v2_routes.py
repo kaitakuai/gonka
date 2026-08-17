@@ -25,6 +25,12 @@ class PoCParamsModel(BaseModel):
     model: str
     seq_len: int
     k_dim: int = 12
+    # Decode-PoC (the scheme of the consensus switch). max_tokens > 0 selects
+    # the decode scheme on the backend; 0 keeps the prefill-only artifact of
+    # the decode seed scheme. route_window is the consensus routing window
+    # (release value 256; recorded in the artifact encoding by the backend).
+    max_tokens: int = 0
+    route_window: int = 256
 
 
 class PoCInitGenerateRequest(BaseModel):
@@ -34,7 +40,11 @@ class PoCInitGenerateRequest(BaseModel):
     public_key: str
     node_id: int
     node_count: int
-    batch_size: int = 32
+    # None => omitted from the forwarded payload, so the BACKEND default
+    # applies (POC_BATCH_SIZE_DEFAULT env, owned by the image profile: the
+    # decode round batch must match the card's KV wall, which mlnode cannot
+    # know). An explicit value still passes through.
+    batch_size: Optional[int] = None
     params: PoCParamsModel
     url: Optional[str] = None
     poc_stronger_rng: bool = False
@@ -42,7 +52,13 @@ class PoCInitGenerateRequest(BaseModel):
 
 class ArtifactModel(BaseModel):
     nonce: int
-    vector_b64: str
+    # Prefill artifact payload; empty for decode artifacts.
+    vector_b64: str = ""
+    # Decode artifact payload: the k-id chain (max_tokens + 1 codebook indices).
+    # This is the MINIMAL decode artifact and the reference the validator
+    # teacher-forces against. Without this field the router would silently
+    # strip the trajectories and validation would compare against nothing.
+    k_points_steps: Optional[List[int]] = None
 
 
 class ValidationModel(BaseModel):
@@ -50,8 +66,14 @@ class ValidationModel(BaseModel):
 
 
 class StatTestModel(BaseModel):
+    # Prefill-scheme knob; ignored by the decode backend (kept for wire compat).
     dist_threshold: float = 0.02
-    p_mismatch: float = 0.001
+    # Decode verdict (agreed 2026-08-09, re-confirmed 2026-08-17): the backend
+    # pools all steps of the validation batch and runs a binomial test with
+    # this baseline at margin gate tau=0 (the backend default). 0.1198 sits
+    # between the measured honest (9.92%) and fraud (13.91%) step-mismatch
+    # shares on the worst hardware pair (A100 prover -> B300 validator).
+    p_mismatch: float = 0.1198
     fraud_threshold: float = 0.01
 
 
@@ -64,7 +86,7 @@ class PoCGenerateRequest(BaseModel):
     node_count: int
     nonces: List[int]
     params: PoCParamsModel
-    batch_size: int = 32
+    batch_size: Optional[int] = None
     wait: bool = False
     url: Optional[str] = None
     validation: Optional[ValidationModel] = None
@@ -86,7 +108,7 @@ async def init_generate(body: PoCInitGenerateRequest) -> dict:
     errors = []
     
     async def call_one(port: int, group_id: int):
-        payload = body.model_dump()
+        payload = body.model_dump(exclude_none=True)
         payload["group_id"] = group_id
         payload["n_groups"] = n_groups
         try:
@@ -197,7 +219,7 @@ async def generate(body: PoCGenerateRequest) -> dict:
         raise HTTPException(status_code=503, detail="No vLLM backends available")
     
     try:
-        r = await call_backend(port, "POST", "/api/v1/pow/generate", body.model_dump())
+        r = await call_backend(port, "POST", "/api/v1/pow/generate", body.model_dump(exclude_none=True))
         
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
