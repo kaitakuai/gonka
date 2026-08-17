@@ -1,6 +1,6 @@
 """PoC v2 routes for MLNode - proxies to vLLM PoC API with multi-backend support."""
 import asyncio
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -35,6 +35,10 @@ class PoCParamsModel(BaseModel):
 
 class PoCInitGenerateRequest(BaseModel):
     """MLNode /init/generate request - group_id/n_groups omitted (injected by MLNode)."""
+    # extra="forbid": an unknown field on a CONSENSUS endpoint must be a loud
+    # 422, never a silent drop — a dapi/node version skew would otherwise make
+    # the node do the wrong work and return 200 (Pasha, 2026-08-17).
+    model_config = ConfigDict(extra="forbid")
     block_hash: str
     block_height: int
     public_key: str
@@ -51,6 +55,7 @@ class PoCInitGenerateRequest(BaseModel):
 
 
 class ArtifactModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     nonce: int
     # Prefill artifact payload; empty for decode artifacts.
     vector_b64: str = ""
@@ -62,10 +67,12 @@ class ArtifactModel(BaseModel):
 
 
 class ValidationModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     artifacts: List[ArtifactModel]
 
 
 class StatTestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     # Prefill-scheme knob; ignored by the decode backend (kept for wire compat).
     dist_threshold: float = 0.02
     # Decode verdict (agreed 2026-08-09, re-confirmed 2026-08-17): the backend
@@ -79,6 +86,7 @@ class StatTestModel(BaseModel):
 
 class PoCGenerateRequest(BaseModel):
     """Request for /generate endpoint."""
+    model_config = ConfigDict(extra="forbid")
     block_hash: str
     block_height: int
     public_key: str
@@ -91,6 +99,11 @@ class PoCGenerateRequest(BaseModel):
     url: Optional[str] = None
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
+    # Teacher-forcing mode: {nonce: k-trajectory}. The backend flips into
+    # validation when this is present (verdict fields in the response,
+    # real n_sphere_mismatches). Was silently dropped before this field
+    # existed here — bug confirmed on hardware 2026-08-17.
+    enforced_k_steps: Optional[Dict[int, List[int]]] = None
     poc_stronger_rng: bool = False
 
 
